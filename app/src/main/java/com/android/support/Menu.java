@@ -510,6 +510,7 @@ public class Menu {
 
     public void setStatusHudVisible(final boolean visible) {
         showStatusHud = visible;
+        autoCount = visible;
         if (mStatusHud != null) {
             mStatusHud.post(new Runnable() {
                 @Override

@@ -27,9 +27,6 @@ public class Preferences {
     public static void changeFeatureInt(String featureName, int featureNum, int value) {
         Preferences.with(context).writeInt(featureNum, value);
         Changes(context, featureNum, featureName, value, false, null);
-        if ((featureNum == 2 || featureNum == 3) && Menu.instance != null) {
-            Menu.instance.updateStatusDisplay();
-        }
     }
 
     public static void changeFeatureString(String featureName, int featureNum, String str) {
@@ -42,8 +39,6 @@ public class Preferences {
         Changes(context, featureNum, featureName, 0, bool, null);
         if (featureNum == 0 && Menu.instance != null) {
             Menu.instance.setStatusHudVisible(bool);
-        } else if (featureNum == 1 && Menu.instance != null) {
-            Menu.instance.autoCount = bool;
         }
     }
 
