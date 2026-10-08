@@ -423,19 +423,34 @@ struct MemoryPatchItem {
 };
 
 static MemoryPatchItem g_autoHeadshotPatches[] = {
-    // 1. DamageData.get_BodyPart (0x4FC8668) -> mov w0, #0; ret
+    // 1. FirstPersonController.HitBodyPartStore (0x40961B4) -> str wzr, [sp, #0x30] (Force calculated bodyPart to Head = 0)
+    {"FPC.HitBodyPartStore", 0x40961B4, 4, "FF3300B9", {0}, false},
+
+    // 2. FirstPersonController.DamageDataBodyPart (0x409657C) -> mov w3, #0 (Force DamageData.ctor bodyPart param to Head = 0)
+    {"FPC.DamageDataBodyPart", 0x409657C, 4, "03008052", {0}, false},
+
+    // 3. FirstPersonController.ReportHitBodyPart (0x4096690) -> mov w1, #0 (Force damage network report bodyPart param to Head = 0)
+    {"FPC.ReportHitBodyPart", 0x4096690, 4, "01008052", {0}, false},
+
+    // 4. FirstPersonController.HeadshotMultiplierBranch (0x40968B8) -> NOP (Unconditionally apply Headshot Damage Multiplier at 0x24)
+    {"FPC.HeadshotMultiplierBranch", 0x40968B8, 4, "1F2003D5", {0}, false},
+
+    // 5. VehicleWeaponBehaviour.DamageData (0x4293794) -> mov w3, #0 (Force vehicle weapon damage to Head)
+    {"VehicleWeapon.DamageData", 0x4293794, 4, "03008052", {0}, false},
+
+    // 6. DamageData.get_BodyPart (0x4FC8668) -> mov w0, #0; ret
     {"DamageData.get_BodyPart", 0x4FC8668, 8, "00008052C0035FD6", {0}, false},
 
-    // 2. DamageData..ctor (0x4FC8630) -> str wzr, [x0, #0x44]
+    // 7. DamageData..ctor (0x4FC8630) -> str wzr, [x0, #0x44]
     {"DamageData..ctor (store wzr)", 0x4FC8630, 4, "1F4400B9", {0}, false},
 
-    // 3. NetworkPlayer.Damage (0x42CF248) -> mov w8, #0
+    // 8. NetworkPlayer.Damage (0x42CF248) -> mov w8, #0
     {"NetworkPlayer.Damage (force head)", 0x42CF248, 4, "08008052", {0}, false},
 
-    // 4. BodyPoint.get_BodyPointTypes (0x3F2FB54) -> mov w0, #0; ret
+    // 9. BodyPoint.get_BodyPointTypes (0x3F2FB54) -> mov w0, #0; ret
     {"BodyPoint.get_BodyPointTypes", 0x3F2FB54, 8, "00008052C0035FD6", {0}, false},
 
-    // 5-17. All other 13 BodyPoint getters returning Head (0)
+    // 10-22. All other 13 BodyPoint getters returning Head (0)
     {"BodyPoint.0x3F2FAD4", 0x3F2FAD4, 8, "00008052C0035FD6", {0}, false},
     {"BodyPoint.0x3F2FAF4", 0x3F2FAF4, 8, "00008052C0035FD6", {0}, false},
     {"BodyPoint.0x3F2FB14", 0x3F2FB14, 8, "00008052C0035FD6", {0}, false},
@@ -510,23 +525,44 @@ static MemoryPatchItem g_fastFireRatePatches[] = {
     // 1. WeaponShooterBehaviour.CanShoot (0x405BBF0) -> mov w0, #1; ret (Cooldown timer bypassed)
     {"WeaponShooterBehaviour.CanShoot", 0x405BBF0, 8, "20008052C0035FD6", {0}, false},
 
-    // 2. FirstPersonController.ShootCheck1 (0x408E8E4) -> NOP (Single/tap shoot delay check bypassed)
+    // 2. WeaponShooterBehaviour.SetCooldown (0x405D084) -> ret (Zero cooldown timer)
+    {"WeaponShooterBehaviour.SetCooldown", 0x405D084, 4, "C0035FD6", {0}, false},
+
+    // 3. WeaponShooterBehaviour.get_ShootAction (0x405C8DC) -> mov w0, #0; ret (Force full auto for all weapons)
+    {"WeaponShooterBehaviour.get_ShootAction", 0x405C8DC, 8, "00008052C0035FD6", {0}, false},
+
+    // 4. FirstPersonController.GetShotInterval (0x4090720) -> b #0x4090800 (Return 0.0f shot interval)
+    {"FirstPersonController.GetShotInterval", 0x4090720, 4, "38000014", {0}, false},
+
+    // 5. FirstPersonController.ShootCheck1 (0x408E8E4) -> NOP (Update shot interval comparison bypassed)
     {"FirstPersonController.ShootCheck1", 0x408E8E4, 4, "1F2003D5", {0}, false},
 
-    // 3. FirstPersonController.ShootCheck2 (0x40A0674) -> NOP (Tap fire delay check 2 bypassed)
+    // 6. FirstPersonController.CanShootNowCheck (0x408E93C) -> NOP (Update shoot trigger check bypassed)
+    {"FirstPersonController.CanShootNowCheck", 0x408E93C, 4, "1F2003D5", {0}, false},
+
+    // 7. FirstPersonController.ShootCheck2 (0x40A0674) -> NOP (Tap fire shot interval check bypassed)
     {"FirstPersonController.ShootCheck2", 0x40A0674, 4, "1F2003D5", {0}, false},
 
-    // 4. FirstPersonController.ShootCheck3 (0x40A1BAC) -> NOP (Auto-fire hold delay check bypassed)
+    // 8. FirstPersonController.ShootCheck3 (0x40A1BAC) -> NOP (Auto-fire shot interval check bypassed)
     {"FirstPersonController.ShootCheck3", 0x40A1BAC, 4, "1F2003D5", {0}, false},
 
-    // 5. FirstPersonController.AutoCoroutine (0x40B8E58) -> fmov s0, wzr (Zero auto-fire coroutine delay)
-    {"FirstPersonController.AutoCoroutine", 0x40B8E58, 4, "E003271E", {0}, false},
+    // 9. FirstPersonController.LaunchShootCoroutineCheck (0x4090B2C) -> b #0x4090b3c (Never block shoot launcher)
+    {"FirstPersonController.LaunchShootCoroutineCheck", 0x4090B2C, 4, "04000014", {0}, false},
 
-    // 6. FirstPersonController.BurstCoroutine (0x40B5D84) -> fmov s0, wzr (Zero burst coroutine delay)
-    {"FirstPersonController.BurstCoroutine", 0x40B5D84, 4, "E003271E", {0}, false},
+    // 10. ShootCoroutine.MoveNext_ImmediateFire (0x40B95B8) -> NOP (Instant fire without WaitForSeconds delay)
+    {"ShootCoroutine.MoveNext_ImmediateFire", 0x40B95B8, 4, "1F2003D5", {0}, false},
 
-    // 7. WeaponTemplate.ShotIntervalCalc (0x4A44A6C) -> fmov s0, wzr (Zero weapon shot interval template)
-    {"WeaponTemplate.ShotIntervalCalc", 0x4A44A6C, 4, "E003271E", {0}, false},
+    // 11. ShootCoroutine.MoveNext_ZeroDelay (0x40B9570) -> str wzr, [x20, #0x2c] (Zero coroutine wait variable)
+    {"ShootCoroutine.MoveNext_ZeroDelay", 0x40B9570, 4, "9F2E00B9", {0}, false},
+
+    // 12. FirstPersonController.ActionThrottleCheck (0x408F328) -> NOP (Zero action throttle)
+    {"FirstPersonController.ActionThrottleCheck", 0x408F328, 4, "1F2003D5", {0}, false},
+
+    // 13. WeaponShooterBehaviour.ShootAmmoDec1 (0x405AAE4) -> NOP (Infinite clip ammo during rapid fire)
+    {"WeaponShooterBehaviour.ShootAmmoDec1", 0x405AAE4, 4, "1F2003D5", {0}, false},
+
+    // 14. WeaponShooterBehaviour.ShootAmmoDec2 (0x405AB64) -> NOP (Infinite total ammo during rapid fire)
+    {"WeaponShooterBehaviour.ShootAmmoDec2", 0x405AB64, 4, "1F2003D5", {0}, false},
 };
 static const size_t NUM_FIRERATE_PATCHES = sizeof(g_fastFireRatePatches) / sizeof(g_fastFireRatePatches[0]);
 
