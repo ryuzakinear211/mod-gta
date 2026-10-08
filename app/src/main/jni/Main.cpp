@@ -528,7 +528,7 @@ static void applyAutoHeadshotPatch(bool enable) {
 // - ShootCoroutine.MoveNext (0x40B93A0): Immediate fire coroutine loop
 // - WeaponShooterBehaviour.CanShoot (0x405BBF0): Cooldown availability check
 // - WeaponShooterBehaviour.SetCooldown (0x405D084): Cooldown timer setter
-// - WeaponShooterBehaviour.get_ShootAction (0x405C8DC): Auto fire action getter
+// - WeaponShooterBehaviour._shootAction (0x150): Auto fire forced via direct memory edit (0x405C8DC getter is 12-byte stub)
 // - WeaponShooterBehaviour.SetClipAmmo (0x405A39C): Ammo replenish
 // - WeaponParameters.GetFireRate (0x49D0E90): Weapon RPM / firerate getter
 // - WeaponProfile.GetFireRate (0x4A451C0): Weapon profile firerate getter
@@ -606,11 +606,10 @@ static void updateLocalPlayerWeapon(void *fpc) {
         if (get_ShooterBehaviour != nullptr) {
             shooter = get_ShooterBehaviour(fpc, currentWeapon);
         }
-        if (shooter == nullptr) {
-            shooter = currentWeapon; // WeaponShooterBehaviour derives from ItemWeaponBehaviour
-        }
         if (shooter != nullptr && isPointerReadable(shooter)) {
             g_localPlayerShooter = shooter;
+        } else {
+            g_localPlayerShooter = nullptr;
         }
 
         // WeaponProfile at offset 0x80 of ItemBehaviour
@@ -718,17 +717,6 @@ void hook_WeaponShooterBehaviour_SetCooldown(void *instance) {
     }
 }
 
-// 4. WeaponShooterBehaviour.get_ShootAction: RVA 0x405C8DC
-int (*old_WeaponShooterBehaviour_get_ShootAction)(void *instance) = nullptr;
-int hook_WeaponShooterBehaviour_get_ShootAction(void *instance) {
-    if (g_fastFireRate && isClientWeapon(instance)) {
-        return 0; // Force AUTO for local weapon
-    }
-    if (old_WeaponShooterBehaviour_get_ShootAction != nullptr) {
-        return old_WeaponShooterBehaviour_get_ShootAction(instance);
-    }
-    return 0;
-}
 
 // 5. FirstPersonController.GetShotInterval1: RVA 0x40906CC
 ObscuredFloat (*old_FPC_GetShotInterval1)(void *fpc, void *weapon) = nullptr;
@@ -1233,8 +1221,6 @@ void *hack_thread(void *) {
     HOOK("0x405D084", hook_WeaponShooterBehaviour_SetCooldown, old_WeaponShooterBehaviour_SetCooldown);
     ModLog("[HOOK] WeaponShooterBehaviour.SetCooldown (0x405D084): %s", old_WeaponShooterBehaviour_SetCooldown ? "SUCCESS" : "FAILED/HOOKED");
 
-    HOOK("0x405C8DC", hook_WeaponShooterBehaviour_get_ShootAction, old_WeaponShooterBehaviour_get_ShootAction);
-    ModLog("[HOOK] WeaponShooterBehaviour.get_ShootAction (0x405C8DC): %s", old_WeaponShooterBehaviour_get_ShootAction ? "SUCCESS" : "FAILED/HOOKED");
 
     HOOK("0x40906CC", hook_FPC_GetShotInterval1, old_FPC_GetShotInterval1);
     ModLog("[HOOK] FirstPersonController.GetShotInterval1 (0x40906CC): %s", old_FPC_GetShotInterval1 ? "SUCCESS" : "FAILED/HOOKED");
