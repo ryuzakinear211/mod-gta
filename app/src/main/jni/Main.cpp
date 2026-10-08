@@ -159,6 +159,7 @@ static struct sigaction old_sa_trap;
 static bool g_showStatusPanel = false;
 static bool g_autoCount = false;
 static bool g_bigHead = false;
+static bool g_autoHeadshot = false;
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -195,10 +196,10 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, AutoHeadshot=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
-        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_autoHeadshot
     );
 
 #if defined(__aarch64__)
@@ -372,6 +373,7 @@ struct Vector3 {
 
 static void *(*get_transform)(void *) = nullptr;
 static void (*set_localScale_Injected)(void *, const Vector3 *) = nullptr;
+static void *(*GetBoneTransform)(void *, int) = nullptr;
 
 static void initUnityPointers() {
     setLastAction("initUnityPointers");
@@ -382,6 +384,10 @@ static void initUnityPointers() {
     if (set_localScale_Injected == nullptr) {
         set_localScale_Injected = (void (*)(void *, const Vector3 *)) getAbsoluteAddress(targetLibName, 0x85B224C);
         ModLog("[UNITY] set_localScale_Injected pointer: %p", set_localScale_Injected);
+    }
+    if (GetBoneTransform == nullptr) {
+        GetBoneTransform = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x84EBAB0);
+        ModLog("[UNITY] GetBoneTransform pointer: %p", GetBoneTransform);
     }
 }
 
@@ -403,6 +409,99 @@ static void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
 }
 
 // =========================================================================
+// Auto Headshot Memory Patch System (100% Headshot Override)
+// =========================================================================
+
+struct MemoryPatchItem {
+    const char *name;
+    uintptr_t rva;
+    size_t size;
+    const char *patchHex;
+    uint8_t origBytes[16];
+    bool initialized;
+};
+
+static MemoryPatchItem g_autoHeadshotPatches[] = {
+    // 1. DamageData.get_BodyPart (0x4FC8668) -> mov w0, #0; ret
+    {"DamageData.get_BodyPart", 0x4FC8668, 8, "00008052C0035FD6", {0}, false},
+
+    // 2. DamageData..ctor (0x4FC8630) -> str wzr, [x0, #0x44]
+    {"DamageData..ctor (store wzr)", 0x4FC8630, 4, "1F4400B9", {0}, false},
+
+    // 3. NetworkPlayer.Damage (0x42CF248) -> mov w8, #0
+    {"NetworkPlayer.Damage (force head)", 0x42CF248, 4, "08008052", {0}, false},
+
+    // 4. BodyPoint.get_BodyPointTypes (0x3F2FB54) -> mov w0, #0; ret
+    {"BodyPoint.get_BodyPointTypes", 0x3F2FB54, 8, "00008052C0035FD6", {0}, false},
+
+    // 5-17. All other 13 BodyPoint getters returning Head (0)
+    {"BodyPoint.0x3F2FAD4", 0x3F2FAD4, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FAF4", 0x3F2FAF4, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FB14", 0x3F2FB14, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FB34", 0x3F2FB34, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FB74", 0x3F2FB74, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FB94", 0x3F2FB94, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FBB4", 0x3F2FBB4, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FBD4", 0x3F2FBD4, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FBF4", 0x3F2FBF4, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FC14", 0x3F2FC14, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FC34", 0x3F2FC34, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FC54", 0x3F2FC54, 8, "00008052C0035FD6", {0}, false},
+    {"BodyPoint.0x3F2FC74", 0x3F2FC74, 8, "00008052C0035FD6", {0}, false},
+};
+static const size_t NUM_HEADSHOT_PATCHES = sizeof(g_autoHeadshotPatches) / sizeof(g_autoHeadshotPatches[0]);
+
+static void initAutoHeadshotPatches() {
+    setLastAction("initAutoHeadshotPatches");
+    size_t initCount = 0;
+    for (size_t i = 0; i < NUM_HEADSHOT_PATCHES; i++) {
+        MemoryPatchItem &item = g_autoHeadshotPatches[i];
+        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
+        if (absAddr != 0) {
+            KittyMemory::memRead(item.origBytes, (const void *)absAddr, item.size);
+            item.initialized = true;
+            initCount++;
+        } else {
+            ModLog("[HEADSHOT] Warning: Failed to get address for %s (RVA 0x%lx)", item.name, item.rva);
+        }
+    }
+    ModLog("[HEADSHOT] Auto Headshot memory patches initialized (%zu/%zu targets ready)", initCount, NUM_HEADSHOT_PATCHES);
+}
+
+static void applyAutoHeadshotPatch(bool enable) {
+    g_autoHeadshot = enable;
+    setLastAction(enable ? "applyAutoHeadshotPatch(ON)" : "applyAutoHeadshotPatch(OFF)");
+    int successCount = 0;
+    for (size_t i = 0; i < NUM_HEADSHOT_PATCHES; i++) {
+        MemoryPatchItem &item = g_autoHeadshotPatches[i];
+        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
+        if (absAddr == 0) continue;
+
+        if (enable) {
+            uint8_t patchBuf[16];
+            KittyUtils::fromHex(item.patchHex, patchBuf);
+            if (KittyMemory::memWrite((void *)absAddr, patchBuf, item.size) == KittyMemory::SUCCESS) {
+                __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
+                successCount++;
+            } else {
+                ModLog("[HEADSHOT] Error: Failed to write patch for %s at 0x%lx", item.name, absAddr);
+            }
+        } else {
+            if (item.initialized) {
+                if (KittyMemory::memWrite((void *)absAddr, item.origBytes, item.size) == KittyMemory::SUCCESS) {
+                    __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
+                    successCount++;
+                } else {
+                    ModLog("[HEADSHOT] Error: Failed to restore patch for %s at 0x%lx", item.name, absAddr);
+                }
+            }
+        }
+    }
+    ModLog("[HEADSHOT] Auto Headshot %s: %d/%zu patches successfully applied/restored.",
+           enable ? "ENABLED (Memory Edit)" : "DISABLED (Restored)", successCount, NUM_HEADSHOT_PATCHES);
+}
+
+// =========================================================================
 // Real-time Player & Bot Tracking System
 // =========================================================================
 
@@ -414,7 +513,7 @@ static std::unordered_map<void*, void*> g_botNetPlayers;     // BotPlayer* -> Ne
 static bool g_needsBigHeadReset = false;
 static int g_bigHeadResetFrames = 0;
 
-static const Vector3 BIG_HEAD_SCALE(2.5f, 2.5f, 2.5f);
+static const Vector3 BIG_HEAD_SCALE(3.0f, 3.0f, 3.0f);
 static const Vector3 NORMAL_HEAD_SCALE(1.0f, 1.0f, 1.0f);
 
 static uint64_t getCurrentTimeMs() {
@@ -527,6 +626,8 @@ static void resetEntityCounters() {
 // Safe Client-Side Big Head Logic
 // =========================================================================
 
+static uint64_t g_lastBigHeadLogMs = 0;
+
 static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
     if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return;
 
@@ -534,6 +635,36 @@ static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
     if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x88))) {
         void *dollsMgr = *(void **)((uintptr_t)netPlayer + 0x88);
         if (dollsMgr != nullptr && isPointerReadable(dollsMgr)) {
+            // Remote player: ThirdPersonController at 0x50
+            if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x50))) {
+                void *tpCtrl = *(void **)((uintptr_t)dollsMgr + 0x50);
+                if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+                    if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
+                        void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
+                        if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                            void *headBone = GetBoneTransform(animator, 10); // 10 = HumanBodyBones.Head
+                            if (headBone != nullptr && isPointerReadable(headBone)) {
+                                safeSetLocalScale(headBone, scale);
+                            }
+                        }
+                    }
+                }
+            }
+            // Bot player doll: ThirdPersonController at 0x60
+            if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x60))) {
+                void *tpBotCtrl = *(void **)((uintptr_t)dollsMgr + 0x60);
+                if (tpBotCtrl != nullptr && isPointerReadable(tpBotCtrl)) {
+                    if (isPointerReadable((void *)((uintptr_t)tpBotCtrl + 0x78))) {
+                        void *animator = *(void **)((uintptr_t)tpBotCtrl + 0x78);
+                        if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                            void *headBone = GetBoneTransform(animator, 10);
+                            if (headBone != nullptr && isPointerReadable(headBone)) {
+                                safeSetLocalScale(headBone, scale);
+                            }
+                        }
+                    }
+                }
+            }
             // 0x38: FirstPerson DollView (Local player)
             if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x38))) {
                 void *fpDoll = *(void **)((uintptr_t)dollsMgr + 0x38);
@@ -593,10 +724,32 @@ static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
             }
         }
     }
+
+    uint64_t now = getCurrentTimeMs();
+    if (scale.x > 1.5f && now - g_lastBigHeadLogMs > 10000) {
+        g_lastBigHeadLogMs = now;
+        ModLog("[BIG_HEAD] Active: Bone scaling applied to player entities (scale=%.1f)", scale.x);
+    }
 }
 
 static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
     if (botPlayer == nullptr || !isPointerReadable(botPlayer)) return;
+
+    // 0. ThirdPersonController at offset 0x58
+    if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x58))) {
+        void *tpCtrl = *(void **)((uintptr_t)botPlayer + 0x58);
+        if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+            if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
+                void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
+                if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                    void *headBone = GetBoneTransform(animator, 10);
+                    if (headBone != nullptr && isPointerReadable(headBone)) {
+                        safeSetLocalScale(headBone, scale);
+                    }
+                }
+            }
+        }
+    }
 
     // 1. BotPlayerLook at offset 0x28 -> Transform at offset 0x28 (Head look bone)
     if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x28))) {
@@ -720,6 +873,10 @@ void *hack_thread(void *) {
 
     initSafetyPipe();
     initUnityPointers();
+    initAutoHeadshotPatches();
+    if (g_autoHeadshot) {
+        applyAutoHeadshotPatch(true);
+    }
 
 #if defined(__aarch64__)
     ModLog("[HOOK] Installing hooks on libil2cpp.so (arm64-v8a)...");
@@ -761,8 +918,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Category_🎮 FITUR GTA SA FPS"),
         OBFUSCATE("Toggle_Status Panel Overlay"), // featNum 0
         OBFUSCATE("Toggle_Big Head"),             // featNum 1
+        OBFUSCATE("Toggle_Auto Headshot"),        // featNum 2
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ STATUS PANEL & BIG HEAD ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -810,6 +968,20 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
                 Toast(env, ctx, OBFUSCATE("Big Head: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Big Head: ON (Kepala Membesar)"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
+
+        case 2: { // Toggle_Auto Headshot (Memory Edit)
+            g_autoHeadshot = boolean;
+            ModLog("[TOGGLE] Feature #2 [Auto Headshot (Memory Edit)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Auto Headshot: ON" : "Toggle Auto Headshot: OFF");
+            applyAutoHeadshotPatch(boolean);
+
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("Auto Headshot: ON (100% Headshot Memory Edit)"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("Auto Headshot: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             }
             break;
         }
