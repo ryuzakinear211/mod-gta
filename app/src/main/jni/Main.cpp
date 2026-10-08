@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fstream>
 #include <iostream>
+#include <cmath>
 #include <dlfcn.h>
 #include <mutex>
 #include <unordered_map>
@@ -162,7 +163,8 @@ static bool g_bigHead = false;
 static bool g_fastFireRate = false;
 static bool g_noRecoil = false;
 static bool g_aimAssistBoost = false;
-static int g_aimSensitivity = 80; // 0 - 100 slider (default: 80)
+static int g_aimSmoothness = 80; // 0 - 100 slider (default: 80, 100 = 100% sticky lock)
+#define g_aimSensitivity g_aimSmoothness
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -199,10 +201,10 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d, AimSens=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d, AimSmooth=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
-        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_fastFireRate, (int)g_noRecoil, (int)g_aimAssistBoost, g_aimSensitivity
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_fastFireRate, (int)g_noRecoil, (int)g_aimAssistBoost, g_aimSmoothness
     );
 
 #if defined(__aarch64__)
@@ -384,6 +386,12 @@ struct Vector3 {
 static void *(*get_transform)(void *) = nullptr;
 static void (*set_localScale_Injected)(void *, const Vector3 *) = nullptr;
 static void *(*GetBoneTransform)(void *, int) = nullptr;
+static void (*get_position_Injected)(void *, Vector3 *) = nullptr;
+static void (*GetLocalEulerAngles_Injected)(void *, int, Vector3 *) = nullptr;
+static void (*SetLocalEulerAngles_Injected)(void *, const Vector3 *, int) = nullptr;
+static void (*WorldToViewportPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
+static void (*WorldToScreenPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
+static void *(*Camera_get_main)() = nullptr;
 
 static void initUnityPointers() {
     setLastAction("initUnityPointers");
@@ -398,6 +406,30 @@ static void initUnityPointers() {
     if (GetBoneTransform == nullptr) {
         GetBoneTransform = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x84EBAB0);
         ModLog("[UNITY] GetBoneTransform pointer: %p", GetBoneTransform);
+    }
+    if (get_position_Injected == nullptr) {
+        get_position_Injected = (void (*)(void *, Vector3 *)) getAbsoluteAddress(targetLibName, 0x85B1394);
+        ModLog("[UNITY] get_position_Injected pointer: %p", get_position_Injected);
+    }
+    if (GetLocalEulerAngles_Injected == nullptr) {
+        GetLocalEulerAngles_Injected = (void (*)(void *, int, Vector3 *)) getAbsoluteAddress(targetLibName, 0x85B15F4);
+        ModLog("[UNITY] GetLocalEulerAngles_Injected pointer: %p", GetLocalEulerAngles_Injected);
+    }
+    if (SetLocalEulerAngles_Injected == nullptr) {
+        SetLocalEulerAngles_Injected = (void (*)(void *, const Vector3 *, int)) getAbsoluteAddress(targetLibName, 0x85B16E8);
+        ModLog("[UNITY] SetLocalEulerAngles_Injected pointer: %p", SetLocalEulerAngles_Injected);
+    }
+    if (WorldToViewportPoint_Injected == nullptr) {
+        WorldToViewportPoint_Injected = (void (*)(void *, const Vector3 *, int, Vector3 *)) getAbsoluteAddress(targetLibName, 0x851DF1C);
+        ModLog("[UNITY] WorldToViewportPoint_Injected pointer: %p", WorldToViewportPoint_Injected);
+    }
+    if (WorldToScreenPoint_Injected == nullptr) {
+        WorldToScreenPoint_Injected = (void (*)(void *, const Vector3 *, int, Vector3 *)) getAbsoluteAddress(targetLibName, 0x851DE04);
+        ModLog("[UNITY] WorldToScreenPoint_Injected pointer: %p", WorldToScreenPoint_Injected);
+    }
+    if (Camera_get_main == nullptr) {
+        Camera_get_main = (void *(*)()) getAbsoluteAddress(targetLibName, 0x851ED38);
+        ModLog("[UNITY] Camera_get_main pointer: %p", Camera_get_main);
     }
 }
 
@@ -1086,16 +1118,25 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 }
 
 // =========================================================================
-// Native Aim Assist Boost System (Natural Movement & Team Filtering)
+// Advanced Bone-Lock Aim Assist System (dump.cs Hooked & Smoothness Sticky)
 // - Filters out teammates/allies so aim assist never targets friendly units
-// - Only engages assist when crosshair is already directed close to an enemy
-// - Preserves 100% natural, smooth camera movement in open space
-// - Reinforces friction & lock-on sensitivity for both hip-fire and scoping
-// - 100% preserves player character movement, animation, and manual weapon firing
+// - Scans active real players (NetworkPlayer) & AI bots (BotPlayer)
+// - Detects Head Bone (HumanBodyBones.Head = 10) & Body/Chest Bone (9 / 8)
+// - When crosshair is close to a bone, automatically locks/glues to the bone
+// - Smoothness Slider (0-100):
+//     * Slider = 100 (Mentok): 100% GLUED TO BONE ("selalu lengket") without delay
+//     * Slider < 100: Silky-smooth interpolation curve
+// - Compatible with Big Head: head bone scale & proximity locks headshots effortlessly
+// - Synchronizes with AimingControl nodes (_azimuthNode, _elevationNode, _target)
 // =========================================================================
 
 static bool (*get_AllyObjectToogle)(void *) = nullptr;
 static bool (*get_IsAutoAimAllowed)(void *) = nullptr;
+static void *(*NetworkPlayer_GetTargetibleObject)(void *) = nullptr;
+static void *(*BotPlayer_GetTargetibleObject)(void *) = nullptr;
+static void (*AimingControl_SetTargetibleObject)(void *, void *) = nullptr;
+static void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
+static bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
 
 static void initAimAssistPointers() {
     if (get_AllyObjectToogle == nullptr) {
@@ -1105,6 +1146,26 @@ static void initAimAssistPointers() {
     if (get_IsAutoAimAllowed == nullptr) {
         get_IsAutoAimAllowed = (bool (*)(void *)) getAbsoluteAddress(targetLibName, 0x4DED124);
         ModLog("[AIM_ASSIST] TargetibleObjectCustomSettings.get_IsAutoAimAllowed pointer: %p", get_IsAutoAimAllowed);
+    }
+    if (NetworkPlayer_GetTargetibleObject == nullptr) {
+        NetworkPlayer_GetTargetibleObject = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x42D1FBC);
+        ModLog("[AIM_ASSIST] NetworkPlayer.GetTargetibleObject pointer: %p", NetworkPlayer_GetTargetibleObject);
+    }
+    if (BotPlayer_GetTargetibleObject == nullptr) {
+        BotPlayer_GetTargetibleObject = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x444A050);
+        ModLog("[AIM_ASSIST] BotPlayer.GetTargetibleObject pointer: %p", BotPlayer_GetTargetibleObject);
+    }
+    if (AimingControl_SetTargetibleObject == nullptr) {
+        AimingControl_SetTargetibleObject = (void (*)(void *, void *)) getAbsoluteAddress(targetLibName, 0x4D287F8);
+        ModLog("[AIM_ASSIST] AimingControl.SetTargetibleObject pointer: %p", AimingControl_SetTargetibleObject);
+    }
+    if (AimingControl_AddDelta == nullptr) {
+        AimingControl_AddDelta = (void (*)(void *, Vector2)) getAbsoluteAddress(targetLibName, 0x4D281AC);
+        ModLog("[AIM_ASSIST] AimingControl.AddDelta pointer: %p", AimingControl_AddDelta);
+    }
+    if (NetworkPlayer_IsTeammate == nullptr) {
+        NetworkPlayer_IsTeammate = (bool (*)(void *, void *)) getAbsoluteAddress(targetLibName, 0x42CE9CC);
+        ModLog("[AIM_ASSIST] NetworkPlayer.IsTeammate pointer: %p", NetworkPlayer_IsTeammate);
     }
 }
 
@@ -1155,8 +1216,509 @@ static bool isTargetTeammate(void *targetibleObj) {
     return false;
 }
 
+static inline void *getNativeTransform(void *transformObj) {
+    if (transformObj == nullptr || !isPointerReadable(transformObj)) return nullptr;
+    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
+        void *nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
+        if (nativePtr != nullptr && isPointerReadable(nativePtr)) return nativePtr;
+    }
+    return transformObj;
+}
+
+static inline Vector3 getTransformPosition(void *transformObj) {
+    Vector3 pos(0.0f, 0.0f, 0.0f);
+    if (transformObj == nullptr || !isPointerReadable(transformObj)) return pos;
+    void *target = getNativeTransform(transformObj);
+    if (target != nullptr && get_position_Injected != nullptr) {
+        get_position_Injected(target, &pos);
+    }
+    return pos;
+}
+
+static inline void *getNativeCamera(void *cameraObj) {
+    if (cameraObj == nullptr || !isPointerReadable(cameraObj)) {
+        if (Camera_get_main != nullptr) {
+            cameraObj = Camera_get_main();
+        }
+    }
+    if (cameraObj == nullptr || !isPointerReadable(cameraObj)) return nullptr;
+    if (isPointerReadable((void *)((uintptr_t)cameraObj + 0x10))) {
+        void *nativePtr = *(void **)((uintptr_t)cameraObj + 0x10);
+        if (nativePtr != nullptr && isPointerReadable(nativePtr)) return nativePtr;
+    }
+    return cameraObj;
+}
+
+static inline bool worldToViewport(void *nativeCam, const Vector3 &worldPos, Vector3 &viewportPos) {
+    if (nativeCam == nullptr || WorldToViewportPoint_Injected == nullptr) return false;
+    WorldToViewportPoint_Injected(nativeCam, &worldPos, 2, &viewportPos); // 2 = Mono
+    return (viewportPos.z > 0.1f); // In front of camera
+}
+
+static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj) {
+    if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
+        // Ignore self
+        if (g_localPlayerFPC != nullptr && entityNetPlayer == g_localPlayerFPC) {
+            return false;
+        }
+        // Teammate check via NetworkPlayer method
+        if (g_localPlayerFPC != nullptr && NetworkPlayer_IsTeammate != nullptr) {
+            if (NetworkPlayer_IsTeammate(entityNetPlayer, g_localPlayerFPC)) {
+                return false;
+            }
+        }
+    }
+    // TargetibleObject check
+    if (targetibleObj != nullptr && isTargetTeammate(targetibleObj)) {
+        return false;
+    }
+    return true;
+}
+
+struct TargetBoneInfo {
+    bool found;
+    Vector3 bonePos;
+    float screenDist;
+    bool isHead;
+    void *targetibleObj;
+};
+
+static TargetBoneInfo findBestTargetBone(void *nativeCam, float maxFovRadius) {
+    TargetBoneInfo bestTarget;
+    bestTarget.found = false;
+    bestTarget.screenDist = maxFovRadius;
+    bestTarget.isHead = false;
+    bestTarget.targetibleObj = nullptr;
+
+    if (nativeCam == nullptr) return bestTarget;
+
+    std::vector<void*> candidateNetPlayers;
+    std::vector<void*> candidateBotPlayers;
+    {
+        std::lock_guard<std::mutex> lock(g_entityMutex);
+        uint64_t now = getCurrentTimeMs();
+        const uint64_t TIMEOUT_MS = 2500;
+        for (const auto &pair : g_networkPlayers) {
+            if (pair.first != nullptr && now - pair.second <= TIMEOUT_MS) {
+                candidateNetPlayers.push_back(pair.first);
+            }
+        }
+        for (const auto &pair : g_botPlayers) {
+            if (pair.first != nullptr && now - pair.second <= TIMEOUT_MS) {
+                candidateBotPlayers.push_back(pair.first);
+            }
+        }
+    }
+
+    auto evaluateCandidate = [&](void *headTransform, void *bodyTransform, void *targetibleObj, void *netPlayer) {
+        if (!isEntityEnemy(netPlayer, targetibleObj)) return;
+
+        Vector3 headPos = getTransformPosition(headTransform);
+        Vector3 bodyPos = getTransformPosition(bodyTransform);
+
+        Vector3 vpHead, vpBody;
+        bool headInFront = false;
+        bool bodyInFront = false;
+        float dHead = 999.0f;
+        float dBody = 999.0f;
+
+        if (headTransform != nullptr) {
+            headInFront = worldToViewport(nativeCam, headPos, vpHead);
+            if (headInFront) {
+                float dx = vpHead.x - 0.5f;
+                float dy = vpHead.y - 0.5f;
+                dHead = sqrtf(dx * dx + dy * dy);
+            }
+        }
+
+        if (bodyTransform != nullptr) {
+            bodyInFront = worldToViewport(nativeCam, bodyPos, vpBody);
+            if (bodyInFront) {
+                float dx = vpBody.x - 0.5f;
+                float dy = vpBody.y - 0.5f;
+                dBody = sqrtf(dx * dx + dy * dy);
+            }
+        }
+
+        if (!headInFront && !bodyInFront) return;
+
+        // Choose closer bone: head or body
+        bool pickHead = false;
+        float chosenDist = 999.0f;
+        Vector3 chosenPos;
+
+        if (headInFront && bodyInFront) {
+            if (dHead <= dBody) {
+                pickHead = true;
+                chosenDist = dHead;
+                chosenPos = headPos;
+            } else {
+                pickHead = false;
+                chosenDist = dBody;
+                chosenPos = bodyPos;
+            }
+        } else if (headInFront) {
+            pickHead = true;
+            chosenDist = dHead;
+            chosenPos = headPos;
+        } else {
+            pickHead = false;
+            chosenDist = dBody;
+            chosenPos = bodyPos;
+        }
+
+        if (chosenDist < bestTarget.screenDist) {
+            bestTarget.found = true;
+            bestTarget.screenDist = chosenDist;
+            bestTarget.bonePos = chosenPos;
+            bestTarget.isHead = pickHead;
+            bestTarget.targetibleObj = targetibleObj;
+        }
+    };
+
+    // 1. Process Real Players (NetworkPlayer)
+    for (void *netPlayer : candidateNetPlayers) {
+        if (netPlayer == nullptr || !isPointerReadable(netPlayer)) continue;
+        if (g_localPlayerFPC != nullptr && netPlayer == g_localPlayerFPC) continue;
+
+        void *headBone = nullptr;
+        void *bodyBone = nullptr;
+        void *targetibleObj = nullptr;
+
+        if (NetworkPlayer_GetTargetibleObject != nullptr) {
+            targetibleObj = NetworkPlayer_GetTargetibleObject(netPlayer);
+        }
+
+        // Check DollsManager (0x88)
+        if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x88))) {
+            void *dollsMgr = *(void **)((uintptr_t)netPlayer + 0x88);
+            if (dollsMgr != nullptr && isPointerReadable(dollsMgr)) {
+                void *tpCtrl = nullptr;
+                if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x50))) {
+                    tpCtrl = *(void **)((uintptr_t)dollsMgr + 0x50);
+                }
+                if (tpCtrl == nullptr && isPointerReadable((void *)((uintptr_t)dollsMgr + 0x60))) {
+                    tpCtrl = *(void **)((uintptr_t)dollsMgr + 0x60);
+                }
+                if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+                    if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
+                        void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
+                        if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                            headBone = GetBoneTransform(animator, 10); // HumanBodyBones.Head
+                            bodyBone = GetBoneTransform(animator, 9);  // HumanBodyBones.Chest
+                            if (bodyBone == nullptr) {
+                                bodyBone = GetBoneTransform(animator, 8); // Spine
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: BodyPointsManager (0xC8)
+        if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)netPlayer + 0xC8))) {
+            void *bpm = *(void **)((uintptr_t)netPlayer + 0xC8);
+            if (bpm != nullptr && isPointerReadable(bpm)) {
+                if (isPointerReadable((void *)((uintptr_t)bpm + 0x20))) {
+                    void *bodyPointsArr = *(void **)((uintptr_t)bpm + 0x20);
+                    if (bodyPointsArr != nullptr && isPointerReadable(bodyPointsArr)) {
+                        if (isPointerReadable((void *)((uintptr_t)bodyPointsArr + 0x18))) {
+                            uintptr_t length = *(uintptr_t *)((uintptr_t)bodyPointsArr + 0x18);
+                            if (length > 0 && length < 32) {
+                                void **items = (void **)((uintptr_t)bodyPointsArr + 0x20);
+                                for (uintptr_t i = 0; i < length; i++) {
+                                    if (isPointerReadable(&items[i])) {
+                                        void *bp = items[i];
+                                        if (bp != nullptr && isPointerReadable((void *)((uintptr_t)bp + 0x10))) {
+                                            void *bpView = *(void **)((uintptr_t)bp + 0x10);
+                                            if (bpView != nullptr && isPointerReadable((void *)((uintptr_t)bpView + 0x20))) {
+                                                int pType = *(int *)((uintptr_t)bpView + 0x20);
+                                                if (pType == 0 && headBone == nullptr && get_transform != nullptr) {
+                                                    headBone = get_transform(bpView);
+                                                } else if (pType != 0 && bodyBone == nullptr && get_transform != nullptr) {
+                                                    bodyBone = get_transform(bpView);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: TargetibleObject colliders
+        if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+            if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x40))) {
+                void *col = *(void **)((uintptr_t)targetibleObj + 0x40);
+                if (col != nullptr && get_transform != nullptr) headBone = get_transform(col);
+            }
+            if (bodyBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x48))) {
+                void *col = *(void **)((uintptr_t)targetibleObj + 0x48);
+                if (col != nullptr && get_transform != nullptr) bodyBone = get_transform(col);
+            }
+            if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x38))) {
+                headBone = *(void **)((uintptr_t)targetibleObj + 0x38); // botLookAtTransform
+            }
+        }
+
+        // Fallback: NetworkPlayer transform
+        if (headBone == nullptr && bodyBone == nullptr && get_transform != nullptr) {
+            bodyBone = get_transform(netPlayer);
+        }
+
+        evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer);
+    }
+
+    // 2. Process AI Bots (BotPlayer)
+    for (void *botPlayer : candidateBotPlayers) {
+        if (botPlayer == nullptr || !isPointerReadable(botPlayer)) continue;
+
+        void *headBone = nullptr;
+        void *bodyBone = nullptr;
+        void *targetibleObj = nullptr;
+        void *netPlayer = nullptr;
+
+        // BotPlayer -> NetworkPlayer at 0x50
+        if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x50))) {
+            netPlayer = *(void **)((uintptr_t)botPlayer + 0x50);
+            if (netPlayer != nullptr && g_localPlayerFPC != nullptr && netPlayer == g_localPlayerFPC) {
+                continue;
+            }
+        }
+
+        // BotPlayer -> TargetibleObject at 0x60
+        if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x60))) {
+            targetibleObj = *(void **)((uintptr_t)botPlayer + 0x60);
+        }
+        if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
+            targetibleObj = BotPlayer_GetTargetibleObject(botPlayer);
+        }
+
+        // BotPlayer -> ThirdPersonController at 0x58
+        if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x58))) {
+            void *tpCtrl = *(void **)((uintptr_t)botPlayer + 0x58);
+            if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+                if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
+                    void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
+                    if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                        headBone = GetBoneTransform(animator, 10);
+                        bodyBone = GetBoneTransform(animator, 9);
+                        if (bodyBone == nullptr) bodyBone = GetBoneTransform(animator, 8);
+                    }
+                }
+            }
+        }
+
+        // BotPlayer -> BotPlayerLook at 0x28 -> Transform at 0x28
+        if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)botPlayer + 0x28))) {
+            void *botLook = *(void **)((uintptr_t)botPlayer + 0x28);
+            if (botLook != nullptr && isPointerReadable((void *)((uintptr_t)botLook + 0x28))) {
+                headBone = *(void **)((uintptr_t)botLook + 0x28);
+            }
+        }
+
+        // BotPlayer -> TargetibleObject colliders
+        if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+            if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x40))) {
+                void *col = *(void **)((uintptr_t)targetibleObj + 0x40);
+                if (col != nullptr && get_transform != nullptr) headBone = get_transform(col);
+            }
+            if (bodyBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x48))) {
+                void *col = *(void **)((uintptr_t)targetibleObj + 0x48);
+                if (col != nullptr && get_transform != nullptr) bodyBone = get_transform(col);
+            }
+            if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x38))) {
+                headBone = *(void **)((uintptr_t)targetibleObj + 0x38);
+            }
+        }
+
+        // Fallback: BotPlayer transform
+        if (headBone == nullptr && bodyBone == nullptr && get_transform != nullptr) {
+            bodyBone = get_transform(botPlayer);
+        }
+
+        evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer);
+    }
+
+    return bestTarget;
+}
+
+static uint64_t g_lastAimAssistLogMs = 0;
+
+static void processAimAssistLock(void *aimingControl) {
+    if (aimingControl == nullptr || !isPointerReadable(aimingControl)) return;
+
+    // 1. Resolve Aiming Nodes from AimingControl
+    void *azimuthNode = nullptr;
+    void *elevationNode = nullptr;
+    void *cameraObj = nullptr;
+
+    if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x28))) {
+        azimuthNode = *(void **)((uintptr_t)aimingControl + 0x28);
+    }
+    if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x30))) {
+        elevationNode = *(void **)((uintptr_t)aimingControl + 0x30);
+    }
+    if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x20))) {
+        cameraObj = *(void **)((uintptr_t)aimingControl + 0x20);
+    }
+
+    if (azimuthNode == nullptr || elevationNode == nullptr) return;
+
+    void *nativeAzimuth = getNativeTransform(azimuthNode);
+    void *nativeElevation = getNativeTransform(elevationNode);
+    void *nativeCam = getNativeCamera(cameraObj);
+
+    if (nativeAzimuth == nullptr || nativeElevation == nullptr || nativeCam == nullptr) return;
+
+    // 2. Define Capture Radius
+    float captureRadius = 0.28f;
+
+    // 3. Search Best Enemy Bone (Player or Bot)
+    TargetBoneInfo targetInfo = findBestTargetBone(nativeCam, captureRadius);
+    if (!targetInfo.found) {
+        // Clear locked target if no enemy is in radius
+        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
+            void *currTarget = *(void **)((uintptr_t)aimingControl + 0xC8);
+            if (currTarget != nullptr) {
+                if (AimingControl_SetTargetibleObject != nullptr) {
+                    AimingControl_SetTargetibleObject(aimingControl, nullptr);
+                }
+                *(void **)((uintptr_t)aimingControl + 0xC8) = nullptr;
+            }
+        }
+        return;
+    }
+
+    // 4. Calculate 3D Direction Vector from Camera to Target Bone
+    Vector3 camPos = getTransformPosition(nativeElevation);
+    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
+        camPos = getTransformPosition(nativeCam);
+    }
+
+    Vector3 dir(targetInfo.bonePos.x - camPos.x,
+                targetInfo.bonePos.y - camPos.y,
+                targetInfo.bonePos.z - camPos.z);
+
+    float distXZ = sqrtf(dir.x * dir.x + dir.z * dir.z);
+    if (distXZ < 0.001f) return;
+
+    float targetYaw = atan2f(dir.x, dir.z) * 180.0f / (float)M_PI;
+    if (targetYaw < 0.0f) targetYaw += 360.0f;
+
+    float targetPitch = -atan2f(dir.y, distXZ) * 180.0f / (float)M_PI;
+    if (targetPitch < 0.0f) targetPitch += 360.0f;
+
+    // 5. Read Current Local Euler Angles
+    Vector3 azEuler(0.0f, 0.0f, 0.0f);
+    Vector3 elEuler(0.0f, 0.0f, 0.0f);
+
+    if (GetLocalEulerAngles_Injected != nullptr) {
+        GetLocalEulerAngles_Injected(nativeAzimuth, 4, &azEuler);   // 4 = OrderZXY
+        GetLocalEulerAngles_Injected(nativeElevation, 4, &elEuler); // 4 = OrderZXY
+    } else {
+        return;
+    }
+
+    float currentYaw = azEuler.y;
+    float currentPitch = elEuler.x;
+
+    // 6. Angular Delta Calculation
+    float diffYaw = targetYaw - currentYaw;
+    while (diffYaw > 180.0f) diffYaw -= 360.0f;
+    while (diffYaw < -180.0f) diffYaw += 360.0f;
+
+    float diffPitch = targetPitch - currentPitch;
+    while (diffPitch > 180.0f) diffPitch -= 360.0f;
+    while (diffPitch < -180.0f) diffPitch += 360.0f;
+
+    // 7. Apply Smoothness & Sticky Lock
+    // When value is MAXED OUT (100 / mentok): 100% GLUED TO BONE ("selalu lengket")
+    // When value is lower: smooth interpolation
+    float smoothFactor = 1.0f;
+    int sliderVal = g_aimSmoothness;
+    if (sliderVal < 0) sliderVal = 0;
+    if (sliderVal > 100) sliderVal = 100;
+
+    if (sliderVal >= 100) {
+        smoothFactor = 1.0f; // 100% instant magnetic lock
+    } else {
+        float s = (float)sliderVal / 100.0f;
+        smoothFactor = 0.06f + 0.84f * (s * s);
+    }
+
+    float applyYaw = diffYaw * smoothFactor;
+    float applyPitch = diffPitch * smoothFactor;
+
+    // 8. Update Euler Angles
+    azEuler.y = fmodf(azEuler.y + applyYaw + 360.0f, 360.0f);
+
+    float pitch180 = (elEuler.x > 180.0f) ? (elEuler.x - 360.0f) : elEuler.x;
+    pitch180 += applyPitch;
+
+    // Read pitch limits from AimingControl if readable
+    float minPitch = -85.0f;
+    float maxPitch = 85.0f;
+    if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x38))) {
+        float pMin = *(float *)((uintptr_t)aimingControl + 0x38);
+        if (pMin >= -90.0f && pMin < 0.0f) minPitch = pMin;
+    }
+    if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x3C))) {
+        float pMax = *(float *)((uintptr_t)aimingControl + 0x3C);
+        if (pMax > 0.0f && pMax <= 90.0f) maxPitch = pMax;
+    }
+
+    if (pitch180 < minPitch) pitch180 = minPitch;
+    if (pitch180 > maxPitch) pitch180 = maxPitch;
+
+    elEuler.x = (pitch180 < 0.0f) ? (pitch180 + 360.0f) : pitch180;
+
+    if (SetLocalEulerAngles_Injected != nullptr) {
+        SetLocalEulerAngles_Injected(nativeAzimuth, &azEuler, 4);
+        SetLocalEulerAngles_Injected(nativeElevation, &elEuler, 4);
+    }
+
+    // 9. Sync TargetibleObject and Internal Delta in AimingControl
+    if (targetInfo.targetibleObj != nullptr && isPointerReadable(targetInfo.targetibleObj)) {
+        if (AimingControl_SetTargetibleObject != nullptr) {
+            AimingControl_SetTargetibleObject(aimingControl, targetInfo.targetibleObj);
+        }
+        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
+            *(void **)((uintptr_t)aimingControl + 0xC8) = targetInfo.targetibleObj;
+        }
+    }
+
+    if (AimingControl_AddDelta != nullptr) {
+        AimingControl_AddDelta(aimingControl, Vector2(applyYaw, applyPitch));
+    }
+
+    uint64_t nowMs = getCurrentTimeMs();
+    if (nowMs - g_lastAimAssistLogMs > 6000) {
+        g_lastAimAssistLogMs = nowMs;
+        ModLog("[AIM_ASSIST] Sticky Bone Lock Active -> Target: %s | Dist: %.2f | Smooth: %d%% | TargetYaw: %.2f | TargetPitch: %.2f",
+               targetInfo.isHead ? "HEAD BONE" : "BODY BONE",
+               targetInfo.screenDist,
+               sliderVal,
+               targetYaw, targetPitch);
+    }
+}
+
+// 0. AimingControl.Update: RVA 0x4D27294
+void (*old_AimingControl_Update)(void *instance) = nullptr;
+void hook_AimingControl_Update(void *instance) {
+    if (old_AimingControl_Update != nullptr) {
+        old_AimingControl_Update(instance);
+    }
+    if (g_aimAssistBoost && instance != nullptr) {
+        processAimAssistLock(instance);
+    }
+}
+
 static inline float getAimSensitivityFactor() {
-    int val = g_aimSensitivity;
+    int val = g_aimSmoothness;
     if (val < 0) val = 0;
     if (val > 100) val = 100;
     return (float)val / 100.0f;
@@ -1168,7 +1730,6 @@ float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
     float power = old_StrafeRotationConfig_get_MaxRotationPower ? old_StrafeRotationConfig_get_MaxRotationPower(instance) : 0.2f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        // Dynamic rotational power scaled by slider (0.4f up to 2.8f)
         return 0.4f + 2.4f * factor;
     }
     return power;
@@ -1179,8 +1740,6 @@ float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
     float fov = old_StrafeRotationConfig_get_FOVAreaMultiplier ? old_StrafeRotationConfig_get_FOVAreaMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        // Dynamic FOV capture radius: when crosshair sweeps into enemy radius,
-        // it immediately detects and locks the target (1.10f up to 1.70f)
         return 1.10f + 0.60f * factor;
     }
     return fov;
@@ -1191,7 +1750,7 @@ float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
     float dist = old_StrafeRotationConfig_get_DefaultStateMaxDistance ? old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 70.0f + 50.0f * factor; // 70m to 120m for hip fire
+        return 70.0f + 50.0f * factor;
     }
     return dist;
 }
@@ -1201,7 +1760,7 @@ float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
     float dist = old_StrafeRotationConfig_get_ZoomedStateMaxDistance ? old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 140.0f + 110.0f * factor; // 140m to 250m for scope
+        return 140.0f + 110.0f * factor;
     }
     return dist;
 }
@@ -1222,8 +1781,6 @@ float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
     float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.5f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        // High sticky crosshair friction on target:
-        // 0.65f up to 0.95f (at 95%, crosshair acts like a strong magnet glued to the enemy!)
         return 0.65f + 0.30f * factor;
     }
     return val;
@@ -1270,7 +1827,6 @@ float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
 }
 
 // 3. StrafeRotationAimAssist.Calculate (0x4F0E254)
-// Proportional assist: 100% natural when in open space, magnetic lock when inside enemy radius
 Vector2 (*old_StrafeRotation_Calculate)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
 Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vector2 smoothed) {
     if (old_StrafeRotation_Calculate == nullptr) return currentDelta;
@@ -1281,22 +1837,15 @@ Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vect
     float assistY = result.y - currentDelta.y;
     float assistMag = sqrtf(assistX * assistX + assistY * assistY);
 
-    // Natural camera movement: if no target is within the enemy radius,
-    // return native delta untouched (100% free & natural camera motion)!
     if (assistMag < 0.0001f) {
         return currentDelta;
     }
 
     float factor = getAimSensitivityFactor();
-
-    // Dynamic magnetic boost (1.5x up to 4.5x):
-    // Directly pulls crosshair into the center of the enemy when in radius
     float boost = 1.5f + 3.0f * factor;
     assistX *= boost;
     assistY *= boost;
 
-    // Dynamic safety clamp (8.0f up to 24.0f):
-    // Allows snappy lock-on while preventing 360-degree camera disorientation
     float maxStep = 8.0f + 16.0f * factor;
     float boostedMag = sqrtf(assistX * assistX + assistY * assistY);
     if (boostedMag > maxStep) {
@@ -1314,7 +1863,7 @@ Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vect
 void (*old_AimAssistManager_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
     if (g_aimAssistBoost) {
-        enabled = true; // Keep enabled in hip fire and scope
+        enabled = true;
     }
     if (old_AimAssistManager_SetEnabled != nullptr) {
         old_AimAssistManager_SetEnabled(instance, enabled);
@@ -1344,7 +1893,6 @@ void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
 }
 
 // 7. BaseAimAssist.IsValidTarget (0x4478A70) & NewAutoAim.IsValidTarget (0x421C254)
-// Filters out teammates and allies so aim assist is NEVER distracted by friendly players
 bool (*old_BaseAimAssist_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
     if (old_BaseAimAssist_IsValidTarget == nullptr) return false;
@@ -1575,6 +2123,9 @@ void *hack_thread(void *) {
     HOOK("0x529060C", hook_AimAssistManager_SetEnabled, old_AimAssistManager_SetEnabled);
     ModLog("[HOOK] AimAssistManager.SetEnabled (0x529060C): %s", old_AimAssistManager_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
 
+    HOOK("0x4D27294", hook_AimingControl_Update, old_AimingControl_Update);
+    ModLog("[HOOK] AimingControl.Update (0x4D27294): %s", old_AimingControl_Update ? "SUCCESS" : "FAILED/HOOKED");
+
     HOOK("0x421C470", hook_NewAutoAim_SetEnabled, old_NewAutoAim_SetEnabled);
     ModLog("[HOOK] NewAutoAim.SetEnabled (0x421C470): %s", old_NewAutoAim_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
 
@@ -1611,9 +2162,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 2
         OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
         OBFUSCATE("Toggle_Aim Assist (Auto-Lock Radius)"), // featNum 4
-        OBFUSCATE("SeekBar_Aim Sensitivity (Sticky Lock)_0_100"), // featNum 5
+        OBFUSCATE("SeekBar_Aim Smoothness (Sticky Lock)_0_100"), // featNum 5
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook sistem Aim Assist bawaan game; otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan masuk radius musuh.<br><br>• <b>Aim Sensitivity Slider (0-100):</b> Menyesuaikan daya kuncian & gesekan perlambatan (friction). Semakin tinggi nilai slider, semakin lengket (magnetic lock) crosshair menempel pada target musuh.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian. Saat nilai di-mentokkan (100), bidikan akan selalu lengket (100% magnetic sticky lock) pada bone body atau head musuh (seperti Big Head). Nilai rendah memberikan assist natural.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1705,10 +2256,10 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 5: { // SeekBar_Aim Sensitivity (Sticky Lock)_0_100
-            g_aimSensitivity = value;
-            ModLog("[SLIDER] Feature #5 [Aim Sensitivity] set to: %d", value);
-            setLastAction("Slider Aim Sensitivity changed");
+        case 5: { // SeekBar_Aim Smoothness (Sticky Lock)_0_100
+            g_aimSmoothness = value;
+            ModLog("[SLIDER] Feature #5 [Aim Smoothness] set to: %d", value);
+            setLastAction("Slider Aim Smoothness changed");
             break;
         }
 
