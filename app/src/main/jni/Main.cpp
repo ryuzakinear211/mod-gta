@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <set>
 #include <chrono>
+#include <cctype>
 
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
@@ -36,15 +37,32 @@ struct Vector3 {
     Vector3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
 };
 
+// Unity Engine C++ internal bindings
 static void *(*get_transform)(void *) = nullptr;
-static void (*set_localScale)(void *, Vector3) = nullptr;
+static void (*set_localScale_Injected)(void *, const Vector3 *) = nullptr;
+static void *(*GetBoneTransformInternal_Injected)(void *, int) = nullptr;
+static int (*GetChildCount)(void *) = nullptr;
+static void *(*GetChild)(void *, int) = nullptr;
+static void *(*get_name)(void *) = nullptr;
 
 static void initUnityPointers() {
     if (get_transform == nullptr) {
         get_transform = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x8597C20);
     }
-    if (set_localScale == nullptr) {
-        set_localScale = (void (*)(void *, Vector3)) getAbsoluteAddress(targetLibName, 0x85B21BC);
+    if (set_localScale_Injected == nullptr) {
+        set_localScale_Injected = (void (*)(void *, const Vector3 *)) getAbsoluteAddress(targetLibName, 0x85B224C);
+    }
+    if (GetBoneTransformInternal_Injected == nullptr) {
+        GetBoneTransformInternal_Injected = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x84EBEF4);
+    }
+    if (GetChildCount == nullptr) {
+        GetChildCount = (int (*)(void *)) getAbsoluteAddress(targetLibName, 0x85B5CDC);
+    }
+    if (GetChild == nullptr) {
+        GetChild = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x85B5BEC);
+    }
+    if (get_name == nullptr) {
+        get_name = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x85A392C);
     }
 }
 
@@ -56,11 +74,17 @@ static std::unordered_map<void*, uint64_t> g_networkPlayers; // NetworkPlayer* -
 static std::unordered_map<void*, uint64_t> g_botPlayers;     // BotPlayer* -> last seen ms
 static std::unordered_map<void*, void*> g_botNetPlayers;     // BotPlayer* -> NetworkPlayer*
 
+static std::mutex g_headMutex;
+static std::unordered_map<void*, void*> g_cachedHeadBones;   // Target object -> Head Transform*
+
 static bool g_showStatusPanel = false;
 static bool g_autoCount = false;
 static bool g_bigHead = false;
 static bool g_needsBigHeadReset = false;
 static int g_bigHeadResetFrames = 0;
+
+static const Vector3 BIG_HEAD_SCALE(2.5f, 2.5f, 2.5f);
+static const Vector3 NORMAL_HEAD_SCALE(1.0f, 1.0f, 1.0f);
 
 static uint64_t getCurrentTimeMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -170,38 +194,207 @@ static void resetEntityCounters() {
 }
 
 // =========================================================================
-// Big Head Implementation
+// Big Head Implementation (Robust Client-Side Head Bone & Hitbox Scaling)
 // =========================================================================
-static void applyBigHead(void *playerInstance, bool enabled) {
-    if (playerInstance == nullptr) return;
 
-    initUnityPointers();
-    if (get_transform == nullptr || set_localScale == nullptr) return;
+static std::string il2cppStringToStdString(void *il2cppStrObj) {
+    if (il2cppStrObj == nullptr) return "";
+    int32_t len = *(int32_t *)((uintptr_t)il2cppStrObj + 0x10);
+    if (len <= 0 || len > 256) return "";
+    const uint16_t *chars = (const uint16_t *)((uintptr_t)il2cppStrObj + 0x14);
+    std::string result;
+    result.reserve((size_t)len);
+    for (int32_t i = 0; i < len; i++) {
+        uint16_t c = chars[i];
+        if (c < 128) {
+            result.push_back((char)tolower(c));
+        } else {
+            result.push_back('?');
+        }
+    }
+    return result;
+}
 
-    Vector3 targetScale = enabled ? Vector3(2.3f, 2.3f, 2.3f) : Vector3(1.0f, 1.0f, 1.0f);
+static bool isLikelyHeadBoneName(const std::string &name) {
+    if (name.empty()) return false;
+    if (name.find("head") == std::string::npos) return false;
 
-    // Access BodyPointsManager at offset 0xC8 of NetworkPlayer
-    void *bpm = *(void **)((uintptr_t)playerInstance + 0xC8);
+    // Filter out non-bone utility objects
+    if (name.find("hitbox") != std::string::npos ||
+        name.find("collider") != std::string::npos ||
+        name.find("trigger") != std::string::npos ||
+        name.find("camera") != std::string::npos ||
+        name.find("cam") != std::string::npos ||
+        name.find("ui") != std::string::npos ||
+        name.find("sound") != std::string::npos ||
+        name.find("audio") != std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
+static void* findHeadBoneRecursive(void *transform, int depth = 0) {
+    if (transform == nullptr || depth > 12) return nullptr;
+
+    if (get_name != nullptr) {
+        void *nameObj = get_name(transform);
+        if (nameObj != nullptr) {
+            std::string nameStr = il2cppStringToStdString(nameObj);
+            if (isLikelyHeadBoneName(nameStr)) {
+                return transform;
+            }
+        }
+    }
+
+    if (GetChildCount == nullptr || GetChild == nullptr) return nullptr;
+    int childCount = GetChildCount(transform);
+    if (childCount <= 0 || childCount > 64) return nullptr;
+
+    for (int i = 0; i < childCount; i++) {
+        void *child = GetChild(transform, i);
+        if (child != nullptr) {
+            void *found = findHeadBoneRecursive(child, depth + 1);
+            if (found != nullptr) return found;
+        }
+    }
+
+    return nullptr;
+}
+
+static void scaleTransform(void *transform, const Vector3 &scale) {
+    if (transform == nullptr || set_localScale_Injected == nullptr) return;
+    set_localScale_Injected(transform, &scale);
+}
+
+static void* resolveHeadBoneFromThirdPerson(void *tpc) {
+    if (tpc == nullptr) return nullptr;
+
+    // Strategy 1: Animator at 0x78 of ThirdPersonController (HumanBodyBones.Head = 10)
+    void *animator = *(void **)((uintptr_t)tpc + 0x78);
+    if (animator != nullptr && GetBoneTransformInternal_Injected != nullptr) {
+        void *bone = GetBoneTransformInternal_Injected(animator, 10);
+        if (bone != nullptr) return bone;
+    }
+
+    // Strategy 2: ThirdSkinController at 0x58 -> _dollChanger at 0x28
+    void *skinCtrl = *(void **)((uintptr_t)tpc + 0x58);
+    if (skinCtrl != nullptr) {
+        void *dollChanger = *(void **)((uintptr_t)skinCtrl + 0x28);
+        if (dollChanger != nullptr) {
+            void *dcAnim = *(void **)((uintptr_t)dollChanger + 0x50);
+            if (dcAnim != nullptr && GetBoneTransformInternal_Injected != nullptr) {
+                void *bone = GetBoneTransformInternal_Injected(dcAnim, 10);
+                if (bone != nullptr) return bone;
+            }
+            void *rootBones = *(void **)((uintptr_t)dollChanger + 0x20);
+            if (rootBones != nullptr) {
+                void *bone = findHeadBoneRecursive(rootBones, 0);
+                if (bone != nullptr) return bone;
+            }
+        }
+    }
+
+    // Strategy 3: AimIkController at 0x118 -> _animator (0x20)
+    void *aimIk = *(void **)((uintptr_t)tpc + 0x118);
+    if (aimIk != nullptr) {
+        void *ikAnim = *(void **)((uintptr_t)aimIk + 0x20);
+        if (ikAnim != nullptr && GetBoneTransformInternal_Injected != nullptr) {
+            void *bone = GetBoneTransformInternal_Injected(ikAnim, 10);
+            if (bone != nullptr) return bone;
+        }
+    }
+
+    // Strategy 4: Recursive search from ThirdPersonController's own Transform
+    if (get_transform != nullptr) {
+        void *rootTransform = get_transform(tpc);
+        if (rootTransform != nullptr) {
+            void *bone = findHeadBoneRecursive(rootTransform, 0);
+            if (bone != nullptr) return bone;
+        }
+    }
+
+    return nullptr;
+}
+
+static void applyHeadScaleToThirdPerson(void *tpc, const Vector3 &scale) {
+    if (tpc == nullptr) return;
+
+    void *headBone = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_headMutex);
+        auto it = g_cachedHeadBones.find(tpc);
+        if (it != g_cachedHeadBones.end()) {
+            headBone = it->second;
+        }
+    }
+
+    if (headBone == nullptr) {
+        headBone = resolveHeadBoneFromThirdPerson(tpc);
+        if (headBone != nullptr) {
+            std::lock_guard<std::mutex> lock(g_headMutex);
+            g_cachedHeadBones[tpc] = headBone;
+        }
+    }
+
+    if (headBone != nullptr) {
+        scaleTransform(headBone, scale);
+    }
+}
+
+static void resolveAndScaleNetworkPlayer(void *netPlayer, const Vector3 &scale) {
+    if (netPlayer == nullptr) return;
+
+    // 1. DollsManager at offset 0x88
+    void *dollsMgr = *(void **)((uintptr_t)netPlayer + 0x88);
+    if (dollsMgr != nullptr) {
+        // ThirdPersonController at 0x50
+        void *tpc = *(void **)((uintptr_t)dollsMgr + 0x50);
+        if (tpc != nullptr) {
+            applyHeadScaleToThirdPerson(tpc, scale);
+        }
+        // Bot ThirdPersonController at 0x60
+        void *botTpc = *(void **)((uintptr_t)dollsMgr + 0x60);
+        if (botTpc != nullptr) {
+            applyHeadScaleToThirdPerson(botTpc, scale);
+        }
+        // Third person doll view at 0x48
+        void *tpDoll = *(void **)((uintptr_t)dollsMgr + 0x48);
+        if (tpDoll != nullptr && get_transform != nullptr) {
+            void *t = get_transform(tpDoll);
+            if (t != nullptr) {
+                void *head = findHeadBoneRecursive(t, 0);
+                if (head != nullptr) scaleTransform(head, scale);
+            }
+        }
+        // First person doll view at 0x38 (Local player model)
+        void *fpDoll = *(void **)((uintptr_t)dollsMgr + 0x38);
+        if (fpDoll != nullptr && get_transform != nullptr) {
+            void *t = get_transform(fpDoll);
+            if (t != nullptr) {
+                void *head = findHeadBoneRecursive(t, 0);
+                if (head != nullptr) scaleTransform(head, scale);
+            }
+        }
+    }
+
+    // 2. Head Hitbox in BodyPointsManager at offset 0xC8
+    void *bpm = *(void **)((uintptr_t)netPlayer + 0xC8);
     if (bpm != nullptr) {
-        // _bodyPoints array at offset 0x20
         void *bodyPointsArr = *(void **)((uintptr_t)bpm + 0x20);
         if (bodyPointsArr != nullptr) {
-            // Read array length at offset 0x18 in Il2Cpp array
             uintptr_t length = *(uintptr_t *)((uintptr_t)bodyPointsArr + 0x18);
             if (length > 0 && length < 32) {
                 void **items = (void **)((uintptr_t)bodyPointsArr + 0x20);
                 for (uintptr_t i = 0; i < length; i++) {
                     void *bodyPoint = items[i];
                     if (bodyPoint != nullptr) {
-                        // BodyPointView at offset 0x10 of BodyPoint
                         void *bpView = *(void **)((uintptr_t)bodyPoint + 0x10);
                         if (bpView != nullptr) {
-                            // BodyPointType at offset 0x20 of BodyPointView (0 = Head)
                             int pointType = *(int *)((uintptr_t)bpView + 0x20);
-                            if (pointType == 0) {
-                                void *headTransform = get_transform(bpView);
-                                if (headTransform != nullptr) {
-                                    set_localScale(headTransform, targetScale);
+                            if (pointType == 0) { // Head hitbox
+                                void *headHitbox = get_transform ? get_transform(bpView) : nullptr;
+                                if (headHitbox != nullptr) {
+                                    scaleTransform(headHitbox, scale);
                                 }
                             }
                         }
@@ -212,8 +405,24 @@ static void applyBigHead(void *playerInstance, bool enabled) {
     }
 }
 
+static void resolveAndScaleBotPlayer(void *botPlayer, const Vector3 &scale) {
+    if (botPlayer == nullptr) return;
+
+    // ThirdPersonController at offset 0x58
+    void *tpc = *(void **)((uintptr_t)botPlayer + 0x58);
+    if (tpc != nullptr) {
+        applyHeadScaleToThirdPerson(tpc, scale);
+    }
+
+    // NetworkPlayer at offset 0x50
+    void *netPlayer = *(void **)((uintptr_t)botPlayer + 0x50);
+    if (netPlayer != nullptr) {
+        resolveAndScaleNetworkPlayer(netPlayer, scale);
+    }
+}
+
 // =========================================================================
-// Il2Cpp Hooks for NetworkPlayer & BotPlayer
+// Il2Cpp Hooks for NetworkPlayer, BotPlayer, ThirdPersonController & AimIK
 // =========================================================================
 
 // NetworkPlayer.Update: RVA 0x42CC8C8
@@ -224,9 +433,9 @@ void hook_NetworkPlayer_Update(void *instance) {
             onNetworkPlayerUpdate(instance);
         }
         if (g_bigHead) {
-            applyBigHead(instance, true);
+            resolveAndScaleNetworkPlayer(instance, BIG_HEAD_SCALE);
         } else if (g_needsBigHeadReset) {
-            applyBigHead(instance, false);
+            resolveAndScaleNetworkPlayer(instance, NORMAL_HEAD_SCALE);
             if (g_bigHeadResetFrames > 0) {
                 g_bigHeadResetFrames--;
                 if (g_bigHeadResetFrames == 0) {
@@ -245,6 +454,10 @@ void (*old_NetworkPlayer_OnDestroy)(void *instance) = nullptr;
 void hook_NetworkPlayer_OnDestroy(void *instance) {
     if (instance != nullptr) {
         onNetworkPlayerDestroy(instance);
+        {
+            std::lock_guard<std::mutex> lock(g_headMutex);
+            g_cachedHeadBones.erase(instance);
+        }
     }
     if (old_NetworkPlayer_OnDestroy != nullptr) {
         old_NetworkPlayer_OnDestroy(instance);
@@ -265,8 +478,15 @@ void hook_BotPlayer_Start(void *instance) {
 // BotPlayer.Update: RVA 0x444A310
 void (*old_BotPlayer_Update)(void *instance) = nullptr;
 void hook_BotPlayer_Update(void *instance) {
-    if (instance != nullptr && g_autoCount) {
-        onBotPlayerUpdate(instance);
+    if (instance != nullptr) {
+        if (g_autoCount) {
+            onBotPlayerUpdate(instance);
+        }
+        if (g_bigHead) {
+            resolveAndScaleBotPlayer(instance, BIG_HEAD_SCALE);
+        } else if (g_needsBigHeadReset) {
+            resolveAndScaleBotPlayer(instance, NORMAL_HEAD_SCALE);
+        }
     }
     if (old_BotPlayer_Update != nullptr) {
         old_BotPlayer_Update(instance);
@@ -278,9 +498,59 @@ void (*old_BotPlayer_OnDestroy)(void *instance) = nullptr;
 void hook_BotPlayer_OnDestroy(void *instance) {
     if (instance != nullptr) {
         onBotPlayerDestroy(instance);
+        {
+            std::lock_guard<std::mutex> lock(g_headMutex);
+            g_cachedHeadBones.erase(instance);
+        }
     }
     if (old_BotPlayer_OnDestroy != nullptr) {
         old_BotPlayer_OnDestroy(instance);
+    }
+}
+
+// ThirdPersonController.Update: RVA 0x43607BC
+void (*old_ThirdPersonController_Update)(void *instance) = nullptr;
+void hook_ThirdPersonController_Update(void *instance) {
+    if (old_ThirdPersonController_Update != nullptr) {
+        old_ThirdPersonController_Update(instance);
+    }
+    if (instance != nullptr) {
+        if (g_bigHead) {
+            applyHeadScaleToThirdPerson(instance, BIG_HEAD_SCALE);
+        } else if (g_needsBigHeadReset) {
+            applyHeadScaleToThirdPerson(instance, NORMAL_HEAD_SCALE);
+        }
+    }
+}
+
+// ThirdPersonController.OnDestroy: RVA 0x4360FB8
+void (*old_ThirdPersonController_OnDestroy)(void *instance) = nullptr;
+void hook_ThirdPersonController_OnDestroy(void *instance) {
+    if (instance != nullptr) {
+        std::lock_guard<std::mutex> lock(g_headMutex);
+        g_cachedHeadBones.erase(instance);
+    }
+    if (old_ThirdPersonController_OnDestroy != nullptr) {
+        old_ThirdPersonController_OnDestroy(instance);
+    }
+}
+
+// AimIkController.LateUpdate: RVA 0x407C85C
+void (*old_AimIkController_LateUpdate)(void *instance) = nullptr;
+void hook_AimIkController_LateUpdate(void *instance) {
+    if (old_AimIkController_LateUpdate != nullptr) {
+        old_AimIkController_LateUpdate(instance);
+    }
+    if (instance != nullptr) {
+        // Offset 0x60 in AimIkController is ThirdPersonController
+        void *tpc = *(void **)((uintptr_t)instance + 0x60);
+        if (tpc != nullptr) {
+            if (g_bigHead) {
+                applyHeadScaleToThirdPerson(tpc, BIG_HEAD_SCALE);
+            } else if (g_needsBigHeadReset) {
+                applyHeadScaleToThirdPerson(tpc, NORMAL_HEAD_SCALE);
+            }
+        }
     }
 }
 
@@ -295,6 +565,8 @@ void *hack_thread(void *) {
 
     LOGI(OBFUSCATE("%s has been loaded"), (const char *) targetLibName);
 
+    initUnityPointers();
+
 #if defined(__aarch64__)
     // Hook NetworkPlayer lifecycle
     HOOK("0x42CC8C8", hook_NetworkPlayer_Update, old_NetworkPlayer_Update);
@@ -304,6 +576,13 @@ void *hack_thread(void *) {
     HOOK("0x44493F4", hook_BotPlayer_Start, old_BotPlayer_Start);
     HOOK("0x444A310", hook_BotPlayer_Update, old_BotPlayer_Update);
     HOOK("0x4449EB0", hook_BotPlayer_OnDestroy, old_BotPlayer_OnDestroy);
+
+    // Hook ThirdPersonController (3D character models in scene)
+    HOOK("0x43607BC", hook_ThirdPersonController_Update, old_ThirdPersonController_Update);
+    HOOK("0x4360FB8", hook_ThirdPersonController_OnDestroy, old_ThirdPersonController_OnDestroy);
+
+    // Hook AimIkController (LateUpdate after animation / IK evaluation)
+    HOOK("0x407C85C", hook_AimIkController_LateUpdate, old_AimIkController_LateUpdate);
 
     LOGI(OBFUSCATE("Player, Bot, and Big Head hooks installed successfully!"));
 #else
@@ -323,9 +602,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
         OBFUSCATE("Category_🎮 FITUR GTA SA FPS"),
         OBFUSCATE("Toggle_Status Panel Overlay"), // featNum 0: Panel HUD & Auto Hitung Player/Bot
-        OBFUSCATE("Toggle_Big Head"),             // featNum 1: Ukuran kepala player & bot membesar
+        OBFUSCATE("Toggle_Big Head"),             // featNum 1: Ukuran kepala player & bot membesar (Client-side)
         OBFUSCATE("Category_📊 STATUS PANEL INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ STATUS PANEL & BIG HEAD ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> Cukup aktifkan toggle ini untuk menampilkan HUD dan otomatis menghitung jumlah Player & Bot secara real-time.<br><br>• <b>Big Head:</b> Memperbesar ukuran kepala (body part) Player & Bot saat di game.</font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ STATUS PANEL & BIG HEAD ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> Cukup aktifkan toggle ini untuk menampilkan HUD dan otomatis menghitung jumlah Player & Bot secara real-time.<br><br>• <b>Big Head:</b> Memperbesar ukuran kepala (body part) Player & Bot secara client-side (hanya di sisi client/layar Anda).</font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -360,7 +639,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             g_bigHead = boolean;
             if (!boolean) {
                 g_needsBigHeadReset = true;
-                g_bigHeadResetFrames = 60; // Reset scale back across next 60 frames
+                g_bigHeadResetFrames = 120; // Reset scale back across next 120 frames
                 Toast(env, ctx, OBFUSCATE("Big Head: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Big Head: ON (Kepala Membesar)"), ToastLength::LENGTH_SHORT);
