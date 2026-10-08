@@ -161,6 +161,7 @@ static bool g_autoCount = false;
 static bool g_bigHead = false;
 static bool g_autoHeadshot = false;
 static bool g_fastFireRate = false;
+static bool g_noRecoil = false;
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -197,10 +198,10 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, AutoHeadshot=%d, FastFireRate=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, AutoHeadshot=%d, FastFireRate=%d, NoRecoil=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
-        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_autoHeadshot, (int)g_fastFireRate
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_autoHeadshot, (int)g_fastFireRate, (int)g_noRecoil
     );
 
 #if defined(__aarch64__)
@@ -361,8 +362,15 @@ static bool isPointerReadable(const void *ptr) {
 }
 
 // =========================================================================
-// Unity Vector3 & Pointers
+// Unity Vector2, Vector3 & Pointers
 // =========================================================================
+
+struct Vector2 {
+    float x;
+    float y;
+    Vector2() : x(0.0f), y(0.0f) {}
+    Vector2(float _x, float _y) : x(_x), y(_y) {}
+};
 
 struct Vector3 {
     float x;
@@ -678,6 +686,43 @@ static void resetFpcShotTimers(void *fpc) {
 // Client-Side Fast FireRate Hooks (Strictly Client-Only)
 // =========================================================================
 
+static void applyNoRecoilMemoryEdits(void *fpc) {
+    if (fpc == nullptr || !isPointerReadable(fpc)) return;
+
+    // 1. AnimController at offset 0xB8
+    if (isPointerReadable((void *)((uintptr_t)fpc + 0xB8))) {
+        void *animCtrl = *(void **)((uintptr_t)fpc + 0xB8);
+        if (animCtrl != nullptr && isPointerReadable(animCtrl)) {
+            // AnimEffectList at offset 0x30
+            if (isPointerReadable((void *)((uintptr_t)animCtrl + 0x30))) {
+                void *animList = *(void **)((uintptr_t)animCtrl + 0x30);
+                if (animList != nullptr && isPointerReadable(animList)) {
+                    // AttackAnimEffect at offset 0x38
+                    if (isPointerReadable((void *)((uintptr_t)animList + 0x38))) {
+                        void *attackAnim = *(void **)((uintptr_t)animList + 0x38);
+                        if (attackAnim != nullptr && isPointerReadable(attackAnim)) {
+                            // Zero current weapon/camera recoil vectors
+                            // 0x1F0: _currentWeaponRecoilPosition (Vector3)
+                            // 0x1FC: _currentWeaponRecoilRotation (Vector3)
+                            // 0x208: _currentCameraRecoilRotation (Vector3)
+                            // 0x214: _weaponRotationOutput (Vector3)
+                            // 0x220: _cameraRotationOutput (Vector3)
+                            if (isPointerReadable((void *)((uintptr_t)attackAnim + 0x1F0))) {
+                                memset((void *)((uintptr_t)attackAnim + 0x1F0), 0, 0x22C - 0x1F0);
+                            }
+                            // 0x244: _sumShift (Vector2)
+                            if (isPointerReadable((void *)((uintptr_t)attackAnim + 0x244))) {
+                                *(float *)((uintptr_t)attackAnim + 0x244) = 0.0f;
+                                *(float *)((uintptr_t)attackAnim + 0x248) = 0.0f;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // 1. FirstPersonController.Update: RVA 0x40A1BF4
 void (*old_FirstPersonController_Update)(void *instance) = nullptr;
 void hook_FirstPersonController_Update(void *instance) {
@@ -687,6 +732,9 @@ void hook_FirstPersonController_Update(void *instance) {
         if (g_fastFireRate) {
             applyPlayerWeaponMemoryEdits();
             resetFpcShotTimers(instance);
+        }
+        if (g_noRecoil) {
+            applyNoRecoilMemoryEdits(instance);
         }
     }
     if (old_FirstPersonController_Update != nullptr) {
@@ -799,6 +847,70 @@ float hook_WeaponProfile_GetFireRate(void *instance) {
         return old_WeaponProfile_GetFireRate(instance);
     }
     return 600.0f;
+}
+
+// =========================================================================
+// Client-Side No Recoil Hooks (100% Recoil & Aim Kick Elimination)
+// =========================================================================
+
+// 1. FirstPersonController.RecoilShift: RVA 0x40A4420
+void (*old_FPC_Recoil)(void *fpc, Vector2 recoil, float smooth, float returnSpeed, float resistance) = nullptr;
+void hook_FPC_Recoil(void *fpc, Vector2 recoil, float smooth, float returnSpeed, float resistance) {
+    if (g_noRecoil && (fpc == g_localPlayerFPC || fpc != nullptr)) {
+        Vector2 zeroRecoil(0.0f, 0.0f);
+        if (old_FPC_Recoil != nullptr) {
+            old_FPC_Recoil(fpc, zeroRecoil, smooth, returnSpeed, resistance);
+        }
+        return;
+    }
+    if (old_FPC_Recoil != nullptr) {
+        old_FPC_Recoil(fpc, recoil, smooth, returnSpeed, resistance);
+    }
+}
+
+// 2. AimingControl.RecoilShift1: RVA 0x4D27AB8
+void (*old_AimingControl_Recoil1)(void *instance, Vector2 recoil, float smooth, float returnSpeed, float resistance) = nullptr;
+void hook_AimingControl_Recoil1(void *instance, Vector2 recoil, float smooth, float returnSpeed, float resistance) {
+    if (g_noRecoil) {
+        Vector2 zeroRecoil(0.0f, 0.0f);
+        if (old_AimingControl_Recoil1 != nullptr) {
+            old_AimingControl_Recoil1(instance, zeroRecoil, smooth, returnSpeed, resistance);
+        }
+        return;
+    }
+    if (old_AimingControl_Recoil1 != nullptr) {
+        old_AimingControl_Recoil1(instance, recoil, smooth, returnSpeed, resistance);
+    }
+}
+
+// 3. AimingControl.RecoilShift2: RVA 0x4D27E20
+void (*old_AimingControl_Recoil2)(void *instance, Vector2 recoil, float smooth, float returnSpeed, float resistance) = nullptr;
+void hook_AimingControl_Recoil2(void *instance, Vector2 recoil, float smooth, float returnSpeed, float resistance) {
+    if (g_noRecoil) {
+        Vector2 zeroRecoil(0.0f, 0.0f);
+        if (old_AimingControl_Recoil2 != nullptr) {
+            old_AimingControl_Recoil2(instance, zeroRecoil, smooth, returnSpeed, resistance);
+        }
+        return;
+    }
+    if (old_AimingControl_Recoil2 != nullptr) {
+        old_AimingControl_Recoil2(instance, recoil, smooth, returnSpeed, resistance);
+    }
+}
+
+// 4. AimingControl.RecoilShift3: RVA 0x4D284B0
+void (*old_AimingControl_Recoil3)(void *instance, Vector2 recoil, float smooth, float returnSpeed, float resistance) = nullptr;
+void hook_AimingControl_Recoil3(void *instance, Vector2 recoil, float smooth, float returnSpeed, float resistance) {
+    if (g_noRecoil) {
+        Vector2 zeroRecoil(0.0f, 0.0f);
+        if (old_AimingControl_Recoil3 != nullptr) {
+            old_AimingControl_Recoil3(instance, zeroRecoil, smooth, returnSpeed, resistance);
+        }
+        return;
+    }
+    if (old_AimingControl_Recoil3 != nullptr) {
+        old_AimingControl_Recoil3(instance, recoil, smooth, returnSpeed, resistance);
+    }
 }
 
 static void initFastFireRateSystem() {
@@ -1237,6 +1349,19 @@ void *hack_thread(void *) {
     HOOK("0x4A451C0", hook_WeaponProfile_GetFireRate, old_WeaponProfile_GetFireRate);
     ModLog("[HOOK] WeaponProfile.GetFireRate (0x4A451C0): %s", old_WeaponProfile_GetFireRate ? "SUCCESS" : "FAILED/HOOKED");
 
+    // Client-Side No Recoil Hooks (Client Only)
+    HOOK("0x40A4420", hook_FPC_Recoil, old_FPC_Recoil);
+    ModLog("[HOOK] FirstPersonController.RecoilShift (0x40A4420): %s", old_FPC_Recoil ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4D27AB8", hook_AimingControl_Recoil1, old_AimingControl_Recoil1);
+    ModLog("[HOOK] AimingControl.RecoilShift1 (0x4D27AB8): %s", old_AimingControl_Recoil1 ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4D27E20", hook_AimingControl_Recoil2, old_AimingControl_Recoil2);
+    ModLog("[HOOK] AimingControl.RecoilShift2 (0x4D27E20): %s", old_AimingControl_Recoil2 ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4D284B0", hook_AimingControl_Recoil3, old_AimingControl_Recoil3);
+    ModLog("[HOOK] AimingControl.RecoilShift3 (0x4D284B0): %s", old_AimingControl_Recoil3 ? "SUCCESS" : "FAILED/HOOKED");
+
     // NetworkPlayer hooks
     HOOK("0x42CC8C8", hook_NetworkPlayer_Update, old_NetworkPlayer_Update);
     ModLog("[HOOK] NetworkPlayer.Update (0x42CC8C8): %s", old_NetworkPlayer_Update ? "SUCCESS" : "FAILED/HOOKED");
@@ -1276,8 +1401,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_Big Head"),             // featNum 1
         OBFUSCATE("Toggle_Auto Headshot"),        // featNum 2
         OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 3
+        OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 4
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1353,6 +1479,22 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
                 Toast(env, ctx, OBFUSCATE("Fast FireRate: ON (Tembakan Berkecepatan Tinggi - Client Side)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Fast FireRate: OFF (Normal)"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
+
+        case 4: { // Toggle_No Recoil (Client-Side)
+            g_noRecoil = boolean;
+            ModLog("[TOGGLE] Feature #4 [No Recoil (Client-Side)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle No Recoil: ON" : "Toggle No Recoil: OFF");
+
+            if (boolean) {
+                if (g_localPlayerFPC != nullptr) {
+                    applyNoRecoilMemoryEdits(g_localPlayerFPC);
+                }
+                Toast(env, ctx, OBFUSCATE("No Recoil: ON (Senjata Tanpa Recoil - Client Side)"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("No Recoil: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             }
             break;
         }
