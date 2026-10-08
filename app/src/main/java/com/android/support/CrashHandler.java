@@ -69,15 +69,14 @@ public final class CrashHandler {
 
                 final String time = new SimpleDateFormat("yyyy_MM_dd-HH_mm_ss").format(new Date());
                 String fileName = "mod_menu_crash_" + time + ".txt";
-                String dirName;
 
-                if (Build.VERSION.SDK_INT >= 30) { //Android R. AIDE didn't support Build.VERSION_CODES.R
-                    dirName = "/storage/emulated/0/Documents/";
-                } else {
-                    dirName = String.valueOf(app.getExternalFilesDir(null));
-                }
-
-                File crashFile = new File(dirName, fileName);
+                String[] candidateDirs = new String[] {
+                    "/storage/0/emulated/Document/",
+                    "/storage/emulated/0/Documents/",
+                    "/storage/emulated/0/Document/",
+                    "/sdcard/Documents/",
+                    String.valueOf(app.getExternalFilesDir(null))
+                };
 
                 String versionName = "unknown";
                 long versionCode = 0;
@@ -112,13 +111,20 @@ public final class CrashHandler {
 
                 String errorLog = devInfo.toString();
 
-                try {
-                    writeFile(crashFile, errorLog);
-                } catch (IOException ignored) {
+                File savedFile = null;
+                for (String dir : candidateDirs) {
+                    try {
+                        File targetFile = new File(dir, fileName);
+                        writeFile(targetFile, errorLog);
+                        if (savedFile == null) savedFile = targetFile;
+                    } catch (Exception ignored) {
+                    }
                 }
 
                 Toast.makeText(app, "Game has crashed unexpectedly", Toast.LENGTH_LONG).show();
-                Toast.makeText(app, "Log saved to: " + String.valueOf(crashFile).replace("/storage/emulated/0/", ""), Toast.LENGTH_LONG).show();
+                if (savedFile != null) {
+                    Toast.makeText(app, "Log saved to: " + savedFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
+                }
 
                 Log.e("AppCrash", "Done");
 

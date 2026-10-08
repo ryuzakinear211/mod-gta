@@ -14,6 +14,14 @@
 #include <set>
 #include <chrono>
 #include <cctype>
+#include <signal.h>
+#include <ucontext.h>
+#include <unwind.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <time.h>
+#include <errno.h>
 
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
@@ -27,8 +35,333 @@
 #include "Includes/Macros.h"
 
 // =========================================================================
-// Unity Vector3 & Utility Structures
+// Advanced Debug Logger & Crash Handler
+// Target Log Paths: /storage/0/emulated/Document/mod_gta_debug.log, etc.
 // =========================================================================
+
+static const char *const DEBUG_LOG_PATHS[] = {
+    "/storage/0/emulated/Document/mod_gta_debug.log",
+    "/storage/0/emulated/Document/crash.log",
+    "/storage/emulated/0/Documents/mod_gta_debug.log",
+    "/storage/emulated/0/Document/mod_gta_debug.log",
+    "/sdcard/Documents/mod_gta_debug.log",
+    "/sdcard/mod_gta_debug.log",
+    "/data/data/com.gamedevltd.wwh/files/mod_gta_debug.log"
+};
+static const size_t NUM_LOG_PATHS = sizeof(DEBUG_LOG_PATHS) / sizeof(DEBUG_LOG_PATHS[0]);
+
+static std::mutex g_logMutex;
+static char g_lastAction[256] = "Initialized";
+
+static void setLastAction(const char *action) {
+    if (action != nullptr) {
+        strncpy(g_lastAction, action, sizeof(g_lastAction) - 1);
+        g_lastAction[sizeof(g_lastAction) - 1] = '\0';
+    }
+}
+
+static void ensureDirectoryForPath(const char *filePath) {
+    char dir[512];
+    strncpy(dir, filePath, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = '\0';
+    char *slash = strrchr(dir, '/');
+    if (slash != nullptr) {
+        *slash = '\0';
+        for (char *p = dir + 1; *p; p++) {
+            if (*p == '/') {
+                *p = '\0';
+                mkdir(dir, 0777);
+                *p = '/';
+            }
+        }
+        mkdir(dir, 0777);
+    }
+}
+
+static void rawWriteToAllLogs(const char *buffer, size_t len) {
+    // 1. Android Logcat
+    __android_log_write(ANDROID_LOG_INFO, "Mod_GTA_Debug", buffer);
+
+    // 2. Write to each candidate path
+    for (size_t i = 0; i < NUM_LOG_PATHS; i++) {
+        const char *path = DEBUG_LOG_PATHS[i];
+        ensureDirectoryForPath(path);
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd >= 0) {
+            write(fd, buffer, len);
+            fsync(fd);
+            close(fd);
+        }
+    }
+}
+
+static void ModLog(const char *fmt, ...) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    char timeStr[64];
+    time_t rawtime;
+    time(&rawtime);
+    struct tm *timeinfo = localtime(&rawtime);
+    if (timeinfo) {
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", timeinfo);
+    } else {
+        snprintf(timeStr, sizeof(timeStr), "UnknownTime");
+    }
+
+    char msgBuf[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msgBuf, sizeof(msgBuf), fmt, args);
+    va_end(args);
+
+    char fullLine[2560];
+    int lineLen = snprintf(fullLine, sizeof(fullLine), "[%s] %s\n", timeStr, msgBuf);
+    if (lineLen > 0) {
+        rawWriteToAllLogs(fullLine, (size_t)lineLen);
+    }
+}
+
+// =========================================================================
+// Native Crash Handler (Signal Interceptor with Tombstone Backtrace)
+// =========================================================================
+
+struct BacktraceState {
+    void **current;
+    void **end;
+};
+
+static _Unwind_Reason_Code unwindCallback(struct _Unwind_Context *context, void *arg) {
+    BacktraceState *state = (BacktraceState *)arg;
+    uintptr_t ip = _Unwind_GetIP(context);
+    if (ip != 0) {
+        if (state->current < state->end) {
+            *state->current++ = (void *)ip;
+        } else {
+            return _URC_END_OF_STACK;
+        }
+    }
+    return _URC_NO_REASON;
+}
+
+static size_t captureBacktrace(void **buffer, size_t max) {
+    BacktraceState state = { buffer, buffer + max };
+    _Unwind_Backtrace(unwindCallback, &state);
+    return state.current - buffer;
+}
+
+static struct sigaction old_sa_segv;
+static struct sigaction old_sa_abrt;
+static struct sigaction old_sa_bus;
+static struct sigaction old_sa_fpe;
+static struct sigaction old_sa_ill;
+static struct sigaction old_sa_trap;
+
+static bool g_showStatusPanel = false;
+static bool g_autoCount = false;
+static bool g_bigHead = false;
+
+static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
+    char crashBuf[8192];
+    size_t off = 0;
+
+    const char *sigName = "UNKNOWN";
+    switch (sig) {
+        case SIGSEGV: sigName = "SIGSEGV (Segmentation Fault - Invalid Memory Access)"; break;
+        case SIGABRT: sigName = "SIGABRT (Abort)"; break;
+        case SIGBUS:  sigName = "SIGBUS (Bus Error - Alignment or Bad Phys Address)"; break;
+        case SIGFPE:  sigName = "SIGFPE (Floating Point Exception)"; break;
+        case SIGILL:  sigName = "SIGILL (Illegal Instruction)"; break;
+        case SIGTRAP: sigName = "SIGTRAP (Trace/Breakpoint Trap)"; break;
+    }
+
+    time_t rawtime;
+    time(&rawtime);
+    struct tm *timeinfo = localtime(&rawtime);
+    char timeStr[64];
+    if (timeinfo) {
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", timeinfo);
+    } else {
+        snprintf(timeStr, sizeof(timeStr), "UnknownTime");
+    }
+
+    off += snprintf(crashBuf + off, sizeof(crashBuf) - off,
+        "\n"
+        "=================================================================\n"
+        "                  [CRASH REPORT] GTA SA FPS MOD                  \n"
+        "=================================================================\n"
+        "Time of Crash : %s\n"
+        "Signal        : %d (%s)\n"
+        "Signal Code   : %d\n"
+        "Fault Address : %p\n"
+        "Thread TID    : %d\n"
+        "Last Action   : %s\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d\n"
+        "-----------------------------------------------------------------\n",
+        timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead
+    );
+
+#if defined(__aarch64__)
+    ucontext_t *uc = (ucontext_t *)ucontext;
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc;
+    uintptr_t lr = (uintptr_t)uc->uc_mcontext.regs[30];
+    uintptr_t sp = (uintptr_t)uc->uc_mcontext.sp;
+
+    Dl_info pcInfo, lrInfo;
+    const char *pcLib = (dladdr((void*)pc, &pcInfo) && pcInfo.dli_fname) ? pcInfo.dli_fname : "unknown";
+    uintptr_t pcOff = pcInfo.dli_fbase ? (pc - (uintptr_t)pcInfo.dli_fbase) : 0;
+
+    const char *lrLib = (dladdr((void*)lr, &lrInfo) && lrInfo.dli_fname) ? lrInfo.dli_fname : "unknown";
+    uintptr_t lrOff = lrInfo.dli_fbase ? (lr - (uintptr_t)lrInfo.dli_fbase) : 0;
+
+    off += snprintf(crashBuf + off, sizeof(crashBuf) - off,
+        "PC: 0x%016lx (%s + 0x%lx)\n"
+        "LR: 0x%016lx (%s + 0x%lx)\n"
+        "SP: 0x%016lx\n\n"
+        "ARM64 Registers:\n"
+        "  x0:  0x%016llx  x1:  0x%016llx\n"
+        "  x2:  0x%016llx  x3:  0x%016llx\n"
+        "  x4:  0x%016llx  x5:  0x%016llx\n"
+        "  x6:  0x%016llx  x7:  0x%016llx\n"
+        "  x8:  0x%016llx  x9:  0x%016llx\n"
+        "  x10: 0x%016llx  x11: 0x%016llx\n"
+        "  x12: 0x%016llx  x13: 0x%016llx\n"
+        "  x14: 0x%016llx  x15: 0x%016llx\n"
+        "  x16: 0x%016llx  x17: 0x%016llx\n"
+        "  x18: 0x%016llx  x19: 0x%016llx\n"
+        "  x20: 0x%016llx  x21: 0x%016llx\n"
+        "  x22: 0x%016llx  x23: 0x%016llx\n"
+        "  x24: 0x%016llx  x25: 0x%016llx\n"
+        "  x26: 0x%016llx  x27: 0x%016llx\n"
+        "  x28: 0x%016llx  x29: 0x%016llx\n"
+        "  lr:  0x%016llx  sp:  0x%016llx\n"
+        "  pc:  0x%016llx\n"
+        "-----------------------------------------------------------------\n",
+        pc, pcLib, pcOff,
+        lr, lrLib, lrOff,
+        sp,
+        (unsigned long long)uc->uc_mcontext.regs[0], (unsigned long long)uc->uc_mcontext.regs[1],
+        (unsigned long long)uc->uc_mcontext.regs[2], (unsigned long long)uc->uc_mcontext.regs[3],
+        (unsigned long long)uc->uc_mcontext.regs[4], (unsigned long long)uc->uc_mcontext.regs[5],
+        (unsigned long long)uc->uc_mcontext.regs[6], (unsigned long long)uc->uc_mcontext.regs[7],
+        (unsigned long long)uc->uc_mcontext.regs[8], (unsigned long long)uc->uc_mcontext.regs[9],
+        (unsigned long long)uc->uc_mcontext.regs[10], (unsigned long long)uc->uc_mcontext.regs[11],
+        (unsigned long long)uc->uc_mcontext.regs[12], (unsigned long long)uc->uc_mcontext.regs[13],
+        (unsigned long long)uc->uc_mcontext.regs[14], (unsigned long long)uc->uc_mcontext.regs[15],
+        (unsigned long long)uc->uc_mcontext.regs[16], (unsigned long long)uc->uc_mcontext.regs[17],
+        (unsigned long long)uc->uc_mcontext.regs[18], (unsigned long long)uc->uc_mcontext.regs[19],
+        (unsigned long long)uc->uc_mcontext.regs[20], (unsigned long long)uc->uc_mcontext.regs[21],
+        (unsigned long long)uc->uc_mcontext.regs[22], (unsigned long long)uc->uc_mcontext.regs[23],
+        (unsigned long long)uc->uc_mcontext.regs[24], (unsigned long long)uc->uc_mcontext.regs[25],
+        (unsigned long long)uc->uc_mcontext.regs[26], (unsigned long long)uc->uc_mcontext.regs[27],
+        (unsigned long long)uc->uc_mcontext.regs[28], (unsigned long long)uc->uc_mcontext.regs[29],
+        (unsigned long long)uc->uc_mcontext.regs[30], (unsigned long long)uc->uc_mcontext.sp,
+        (unsigned long long)uc->uc_mcontext.pc
+    );
+#endif
+
+    // Backtrace Frames
+    off += snprintf(crashBuf + off, sizeof(crashBuf) - off, "Backtrace:\n");
+    void *btBuffer[32];
+    size_t count = captureBacktrace(btBuffer, 32);
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t addr = (uintptr_t)btBuffer[i];
+        Dl_info dlinfo;
+        if (dladdr((void*)addr, &dlinfo) && dlinfo.dli_fname) {
+            uintptr_t libOffset = dlinfo.dli_fbase ? (addr - (uintptr_t)dlinfo.dli_fbase) : 0;
+            const char *sym = dlinfo.dli_sname ? dlinfo.dli_sname : "";
+            off += snprintf(crashBuf + off, sizeof(crashBuf) - off,
+                "  #%02zu pc 0x%016lx  %s (%s+0x%lx)\n",
+                i, addr, dlinfo.dli_fname, sym, libOffset);
+        } else {
+            off += snprintf(crashBuf + off, sizeof(crashBuf) - off,
+                "  #%02zu pc 0x%016lx\n", i, addr);
+        }
+        if (off >= sizeof(crashBuf) - 256) break;
+    }
+
+    off += snprintf(crashBuf + off, sizeof(crashBuf) - off,
+        "=================================================================\n\n");
+
+    // Write crash dump to all log files immediately
+    rawWriteToAllLogs(crashBuf, off);
+
+    // Call default handler or previous handler
+    struct sigaction *oldSa = nullptr;
+    switch (sig) {
+        case SIGSEGV: oldSa = &old_sa_segv; break;
+        case SIGABRT: oldSa = &old_sa_abrt; break;
+        case SIGBUS:  oldSa = &old_sa_bus; break;
+        case SIGFPE:  oldSa = &old_sa_fpe; break;
+        case SIGILL:  oldSa = &old_sa_ill; break;
+        case SIGTRAP: oldSa = &old_sa_trap; break;
+    }
+
+    if (oldSa && oldSa->sa_sigaction && oldSa->sa_sigaction != crashSignalHandler) {
+        oldSa->sa_sigaction(sig, info, ucontext);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+static void installCrashHandler() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crashSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+
+    sigaction(SIGSEGV, &sa, &old_sa_segv);
+    sigaction(SIGABRT, &sa, &old_sa_abrt);
+    sigaction(SIGBUS,  &sa, &old_sa_bus);
+    sigaction(SIGFPE,  &sa, &old_sa_fpe);
+    sigaction(SIGILL,  &sa, &old_sa_ill);
+    sigaction(SIGTRAP, &sa, &old_sa_trap);
+
+    ModLog("[CRASH_HANDLER] Native Crash Handler installed successfully for SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGTRAP.");
+}
+
+// =========================================================================
+// Memory Safety & Safe Pointer Validation
+// =========================================================================
+
+static int g_safetyPipe[2] = {-1, -1};
+
+static void initSafetyPipe() {
+    if (g_safetyPipe[0] == -1) {
+        if (pipe(g_safetyPipe) == 0) {
+            fcntl(g_safetyPipe[0], F_SETFL, O_NONBLOCK);
+            fcntl(g_safetyPipe[1], F_SETFL, O_NONBLOCK);
+            ModLog("[SAFETY] Memory inspection pipe initialized successfully.");
+        } else {
+            ModLog("[WARN] Failed to initialize safety pipe: errno=%d", errno);
+        }
+    }
+}
+
+static bool isPointerReadable(const void *ptr) {
+    if (ptr == nullptr) return false;
+    uintptr_t addr = (uintptr_t)ptr;
+    if (addr < 0x10000 || addr >= 0x0080000000000000ULL) return false;
+    if ((addr & 0x7) != 0) return false; // Pointers must be 8-byte aligned on aarch64
+
+    if (g_safetyPipe[1] != -1) {
+        char dummy;
+        while (read(g_safetyPipe[0], &dummy, 1) > 0); // Drain pipe
+        ssize_t written = write(g_safetyPipe[1], ptr, 1);
+        if (written == 1) {
+            read(g_safetyPipe[0], &dummy, 1);
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+// =========================================================================
+// Unity Vector3 & Pointers
+// =========================================================================
+
 struct Vector3 {
     float x;
     float y;
@@ -37,49 +370,47 @@ struct Vector3 {
     Vector3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
 };
 
-// Unity Engine C++ internal bindings
 static void *(*get_transform)(void *) = nullptr;
 static void (*set_localScale_Injected)(void *, const Vector3 *) = nullptr;
-static void *(*GetBoneTransformInternal_Injected)(void *, int) = nullptr;
-static int (*GetChildCount)(void *) = nullptr;
-static void *(*GetChild)(void *, int) = nullptr;
-static void *(*get_name)(void *) = nullptr;
 
 static void initUnityPointers() {
+    setLastAction("initUnityPointers");
     if (get_transform == nullptr) {
         get_transform = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x8597C20);
+        ModLog("[UNITY] get_transform pointer: %p", get_transform);
     }
     if (set_localScale_Injected == nullptr) {
         set_localScale_Injected = (void (*)(void *, const Vector3 *)) getAbsoluteAddress(targetLibName, 0x85B224C);
+        ModLog("[UNITY] set_localScale_Injected pointer: %p", set_localScale_Injected);
     }
-    if (GetBoneTransformInternal_Injected == nullptr) {
-        GetBoneTransformInternal_Injected = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x84EBEF4);
+}
+
+static void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
+    if (transformObj == nullptr || set_localScale_Injected == nullptr) return;
+    if (!isPointerReadable(transformObj)) return;
+
+    // In Unity, managed Component/Transform has native C++ pointer at offset 0x10 (m_CachedPtr)
+    void *nativePtr = nullptr;
+    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
+        nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
     }
-    if (GetChildCount == nullptr) {
-        GetChildCount = (int (*)(void *)) getAbsoluteAddress(targetLibName, 0x85B5CDC);
-    }
-    if (GetChild == nullptr) {
-        GetChild = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x85B5BEC);
-    }
-    if (get_name == nullptr) {
-        get_name = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x85A392C);
+
+    if (nativePtr != nullptr && isPointerReadable(nativePtr)) {
+        set_localScale_Injected(nativePtr, &scale);
+    } else {
+        set_localScale_Injected(transformObj, &scale);
     }
 }
 
 // =========================================================================
 // Real-time Player & Bot Tracking System
 // =========================================================================
+
 static std::mutex g_entityMutex;
 static std::unordered_map<void*, uint64_t> g_networkPlayers; // NetworkPlayer* -> last seen ms
 static std::unordered_map<void*, uint64_t> g_botPlayers;     // BotPlayer* -> last seen ms
 static std::unordered_map<void*, void*> g_botNetPlayers;     // BotPlayer* -> NetworkPlayer*
 
-static std::mutex g_headMutex;
-static std::unordered_map<void*, void*> g_cachedHeadBones;   // Target object -> Head Transform*
-
-static bool g_showStatusPanel = false;
-static bool g_autoCount = false;
-static bool g_bigHead = false;
 static bool g_needsBigHeadReset = false;
 static int g_bigHeadResetFrames = 0;
 
@@ -109,10 +440,11 @@ static void onBotPlayerUpdate(void *instance) {
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_botPlayers[instance] = getCurrentTimeMs();
 
-    // Read NetworkPlayer field at offset 0x50 in BotPlayer struct
-    void *netPlayer = *(void **)((uintptr_t)instance + 0x50);
-    if (netPlayer != nullptr) {
-        g_botNetPlayers[instance] = netPlayer;
+    if (isPointerReadable((void *)((uintptr_t)instance + 0x50))) {
+        void *netPlayer = *(void **)((uintptr_t)instance + 0x50);
+        if (netPlayer != nullptr) {
+            g_botNetPlayers[instance] = netPlayer;
+        }
     }
 }
 
@@ -133,9 +465,8 @@ struct EntityStats {
 static EntityStats getEntityStats() {
     std::lock_guard<std::mutex> lock(g_entityMutex);
     uint64_t now = getCurrentTimeMs();
-    const uint64_t TIMEOUT_MS = 2500; // 2.5 seconds timeout
+    const uint64_t TIMEOUT_MS = 2500;
 
-    // 1. Purge stale bots
     std::set<void*> activeBotNets;
     for (auto it = g_botPlayers.begin(); it != g_botPlayers.end(); ) {
         if (now - it->second > TIMEOUT_MS) {
@@ -150,7 +481,6 @@ static EntityStats getEntityStats() {
         }
     }
 
-    // 2. Purge stale network players
     int totalNetPlayers = 0;
     int realCount = 0;
     for (auto it = g_networkPlayers.begin(); it != g_networkPlayers.end(); ) {
@@ -167,7 +497,6 @@ static EntityStats getEntityStats() {
 
     int botCount = (int)g_botPlayers.size();
 
-    // Fallback adjustment
     if (totalNetPlayers >= botCount) {
         if (realCount == 0 && totalNetPlayers > botCount) {
             realCount = totalNetPlayers - botCount;
@@ -191,210 +520,71 @@ static void resetEntityCounters() {
     g_networkPlayers.clear();
     g_botPlayers.clear();
     g_botNetPlayers.clear();
+    ModLog("[STATS] Entity counters reset manually.");
 }
 
 // =========================================================================
-// Big Head Implementation (Robust Client-Side Head Bone & Hitbox Scaling)
+// Safe Client-Side Big Head Logic
 // =========================================================================
 
-static std::string il2cppStringToStdString(void *il2cppStrObj) {
-    if (il2cppStrObj == nullptr) return "";
-    int32_t len = *(int32_t *)((uintptr_t)il2cppStrObj + 0x10);
-    if (len <= 0 || len > 256) return "";
-    const uint16_t *chars = (const uint16_t *)((uintptr_t)il2cppStrObj + 0x14);
-    std::string result;
-    result.reserve((size_t)len);
-    for (int32_t i = 0; i < len; i++) {
-        uint16_t c = chars[i];
-        if (c < 128) {
-            result.push_back((char)tolower(c));
-        } else {
-            result.push_back('?');
-        }
-    }
-    return result;
-}
-
-static bool isLikelyHeadBoneName(const std::string &name) {
-    if (name.empty()) return false;
-    if (name.find("head") == std::string::npos) return false;
-
-    // Filter out non-bone utility objects
-    if (name.find("hitbox") != std::string::npos ||
-        name.find("collider") != std::string::npos ||
-        name.find("trigger") != std::string::npos ||
-        name.find("camera") != std::string::npos ||
-        name.find("cam") != std::string::npos ||
-        name.find("ui") != std::string::npos ||
-        name.find("sound") != std::string::npos ||
-        name.find("audio") != std::string::npos) {
-        return false;
-    }
-    return true;
-}
-
-static void* findHeadBoneRecursive(void *transform, int depth = 0) {
-    if (transform == nullptr || depth > 12) return nullptr;
-
-    if (get_name != nullptr) {
-        void *nameObj = get_name(transform);
-        if (nameObj != nullptr) {
-            std::string nameStr = il2cppStringToStdString(nameObj);
-            if (isLikelyHeadBoneName(nameStr)) {
-                return transform;
-            }
-        }
-    }
-
-    if (GetChildCount == nullptr || GetChild == nullptr) return nullptr;
-    int childCount = GetChildCount(transform);
-    if (childCount <= 0 || childCount > 64) return nullptr;
-
-    for (int i = 0; i < childCount; i++) {
-        void *child = GetChild(transform, i);
-        if (child != nullptr) {
-            void *found = findHeadBoneRecursive(child, depth + 1);
-            if (found != nullptr) return found;
-        }
-    }
-
-    return nullptr;
-}
-
-static void scaleTransform(void *transform, const Vector3 &scale) {
-    if (transform == nullptr || set_localScale_Injected == nullptr) return;
-    set_localScale_Injected(transform, &scale);
-}
-
-static void* resolveHeadBoneFromThirdPerson(void *tpc) {
-    if (tpc == nullptr) return nullptr;
-
-    // Strategy 1: Animator at 0x78 of ThirdPersonController (HumanBodyBones.Head = 10)
-    void *animator = *(void **)((uintptr_t)tpc + 0x78);
-    if (animator != nullptr && GetBoneTransformInternal_Injected != nullptr) {
-        void *bone = GetBoneTransformInternal_Injected(animator, 10);
-        if (bone != nullptr) return bone;
-    }
-
-    // Strategy 2: ThirdSkinController at 0x58 -> _dollChanger at 0x28
-    void *skinCtrl = *(void **)((uintptr_t)tpc + 0x58);
-    if (skinCtrl != nullptr) {
-        void *dollChanger = *(void **)((uintptr_t)skinCtrl + 0x28);
-        if (dollChanger != nullptr) {
-            void *dcAnim = *(void **)((uintptr_t)dollChanger + 0x50);
-            if (dcAnim != nullptr && GetBoneTransformInternal_Injected != nullptr) {
-                void *bone = GetBoneTransformInternal_Injected(dcAnim, 10);
-                if (bone != nullptr) return bone;
-            }
-            void *rootBones = *(void **)((uintptr_t)dollChanger + 0x20);
-            if (rootBones != nullptr) {
-                void *bone = findHeadBoneRecursive(rootBones, 0);
-                if (bone != nullptr) return bone;
-            }
-        }
-    }
-
-    // Strategy 3: AimIkController at 0x118 -> _animator (0x20)
-    void *aimIk = *(void **)((uintptr_t)tpc + 0x118);
-    if (aimIk != nullptr) {
-        void *ikAnim = *(void **)((uintptr_t)aimIk + 0x20);
-        if (ikAnim != nullptr && GetBoneTransformInternal_Injected != nullptr) {
-            void *bone = GetBoneTransformInternal_Injected(ikAnim, 10);
-            if (bone != nullptr) return bone;
-        }
-    }
-
-    // Strategy 4: Recursive search from ThirdPersonController's own Transform
-    if (get_transform != nullptr) {
-        void *rootTransform = get_transform(tpc);
-        if (rootTransform != nullptr) {
-            void *bone = findHeadBoneRecursive(rootTransform, 0);
-            if (bone != nullptr) return bone;
-        }
-    }
-
-    return nullptr;
-}
-
-static void applyHeadScaleToThirdPerson(void *tpc, const Vector3 &scale) {
-    if (tpc == nullptr) return;
-
-    void *headBone = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_headMutex);
-        auto it = g_cachedHeadBones.find(tpc);
-        if (it != g_cachedHeadBones.end()) {
-            headBone = it->second;
-        }
-    }
-
-    if (headBone == nullptr) {
-        headBone = resolveHeadBoneFromThirdPerson(tpc);
-        if (headBone != nullptr) {
-            std::lock_guard<std::mutex> lock(g_headMutex);
-            g_cachedHeadBones[tpc] = headBone;
-        }
-    }
-
-    if (headBone != nullptr) {
-        scaleTransform(headBone, scale);
-    }
-}
-
-static void resolveAndScaleNetworkPlayer(void *netPlayer, const Vector3 &scale) {
-    if (netPlayer == nullptr) return;
+static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
+    if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return;
 
     // 1. DollsManager at offset 0x88
-    void *dollsMgr = *(void **)((uintptr_t)netPlayer + 0x88);
-    if (dollsMgr != nullptr) {
-        // ThirdPersonController at 0x50
-        void *tpc = *(void **)((uintptr_t)dollsMgr + 0x50);
-        if (tpc != nullptr) {
-            applyHeadScaleToThirdPerson(tpc, scale);
-        }
-        // Bot ThirdPersonController at 0x60
-        void *botTpc = *(void **)((uintptr_t)dollsMgr + 0x60);
-        if (botTpc != nullptr) {
-            applyHeadScaleToThirdPerson(botTpc, scale);
-        }
-        // Third person doll view at 0x48
-        void *tpDoll = *(void **)((uintptr_t)dollsMgr + 0x48);
-        if (tpDoll != nullptr && get_transform != nullptr) {
-            void *t = get_transform(tpDoll);
-            if (t != nullptr) {
-                void *head = findHeadBoneRecursive(t, 0);
-                if (head != nullptr) scaleTransform(head, scale);
+    if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x88))) {
+        void *dollsMgr = *(void **)((uintptr_t)netPlayer + 0x88);
+        if (dollsMgr != nullptr && isPointerReadable(dollsMgr)) {
+            // 0x38: FirstPerson DollView (Local player)
+            if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x38))) {
+                void *fpDoll = *(void **)((uintptr_t)dollsMgr + 0x38);
+                if (fpDoll != nullptr && isPointerReadable(fpDoll) && get_transform != nullptr) {
+                    void *t = get_transform(fpDoll);
+                    if (t != nullptr) safeSetLocalScale(t, scale);
+                }
             }
-        }
-        // First person doll view at 0x38 (Local player model)
-        void *fpDoll = *(void **)((uintptr_t)dollsMgr + 0x38);
-        if (fpDoll != nullptr && get_transform != nullptr) {
-            void *t = get_transform(fpDoll);
-            if (t != nullptr) {
-                void *head = findHeadBoneRecursive(t, 0);
-                if (head != nullptr) scaleTransform(head, scale);
+            // 0x48: ThirdPerson DollView (Remote player)
+            if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x48))) {
+                void *tpDoll = *(void **)((uintptr_t)dollsMgr + 0x48);
+                if (tpDoll != nullptr && isPointerReadable(tpDoll) && get_transform != nullptr) {
+                    void *t = get_transform(tpDoll);
+                    if (t != nullptr) safeSetLocalScale(t, scale);
+                }
             }
         }
     }
 
     // 2. Head Hitbox in BodyPointsManager at offset 0xC8
-    void *bpm = *(void **)((uintptr_t)netPlayer + 0xC8);
-    if (bpm != nullptr) {
-        void *bodyPointsArr = *(void **)((uintptr_t)bpm + 0x20);
-        if (bodyPointsArr != nullptr) {
-            uintptr_t length = *(uintptr_t *)((uintptr_t)bodyPointsArr + 0x18);
-            if (length > 0 && length < 32) {
-                void **items = (void **)((uintptr_t)bodyPointsArr + 0x20);
-                for (uintptr_t i = 0; i < length; i++) {
-                    void *bodyPoint = items[i];
-                    if (bodyPoint != nullptr) {
-                        void *bpView = *(void **)((uintptr_t)bodyPoint + 0x10);
-                        if (bpView != nullptr) {
-                            int pointType = *(int *)((uintptr_t)bpView + 0x20);
-                            if (pointType == 0) { // Head hitbox
-                                void *headHitbox = get_transform ? get_transform(bpView) : nullptr;
-                                if (headHitbox != nullptr) {
-                                    scaleTransform(headHitbox, scale);
+    if (isPointerReadable((void *)((uintptr_t)netPlayer + 0xC8))) {
+        void *bpm = *(void **)((uintptr_t)netPlayer + 0xC8);
+        if (bpm != nullptr && isPointerReadable(bpm)) {
+            if (isPointerReadable((void *)((uintptr_t)bpm + 0x20))) {
+                void *bodyPointsArr = *(void **)((uintptr_t)bpm + 0x20);
+                if (bodyPointsArr != nullptr && isPointerReadable(bodyPointsArr)) {
+                    if (isPointerReadable((void *)((uintptr_t)bodyPointsArr + 0x18))) {
+                        uintptr_t length = *(uintptr_t *)((uintptr_t)bodyPointsArr + 0x18);
+                        if (length > 0 && length < 32) {
+                            void **items = (void **)((uintptr_t)bodyPointsArr + 0x20);
+                            for (uintptr_t i = 0; i < length; i++) {
+                                if (isPointerReadable(&items[i])) {
+                                    void *bodyPoint = items[i];
+                                    if (bodyPoint != nullptr && isPointerReadable(bodyPoint)) {
+                                        if (isPointerReadable((void *)((uintptr_t)bodyPoint + 0x10))) {
+                                            void *bpView = *(void **)((uintptr_t)bodyPoint + 0x10);
+                                            if (bpView != nullptr && isPointerReadable(bpView)) {
+                                                if (isPointerReadable((void *)((uintptr_t)bpView + 0x20))) {
+                                                    int pointType = *(int *)((uintptr_t)bpView + 0x20);
+                                                    if (pointType == 0) { // Head
+                                                        if (get_transform != nullptr) {
+                                                            void *headHitbox = get_transform(bpView);
+                                                            if (headHitbox != nullptr) {
+                                                                safeSetLocalScale(headHitbox, scale);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -405,41 +595,52 @@ static void resolveAndScaleNetworkPlayer(void *netPlayer, const Vector3 &scale) 
     }
 }
 
-static void resolveAndScaleBotPlayer(void *botPlayer, const Vector3 &scale) {
-    if (botPlayer == nullptr) return;
+static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
+    if (botPlayer == nullptr || !isPointerReadable(botPlayer)) return;
 
-    // ThirdPersonController at offset 0x58
-    void *tpc = *(void **)((uintptr_t)botPlayer + 0x58);
-    if (tpc != nullptr) {
-        applyHeadScaleToThirdPerson(tpc, scale);
+    // 1. BotPlayerLook at offset 0x28 -> Transform at offset 0x28 (Head look bone)
+    if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x28))) {
+        void *botLook = *(void **)((uintptr_t)botPlayer + 0x28);
+        if (botLook != nullptr && isPointerReadable(botLook)) {
+            if (isPointerReadable((void *)((uintptr_t)botLook + 0x28))) {
+                void *headBone = *(void **)((uintptr_t)botLook + 0x28);
+                if (headBone != nullptr && isPointerReadable(headBone)) {
+                    safeSetLocalScale(headBone, scale);
+                }
+            }
+        }
     }
 
-    // NetworkPlayer at offset 0x50
-    void *netPlayer = *(void **)((uintptr_t)botPlayer + 0x50);
-    if (netPlayer != nullptr) {
-        resolveAndScaleNetworkPlayer(netPlayer, scale);
+    // 2. NetworkPlayer at offset 0x50
+    if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x50))) {
+        void *netPlayer = *(void **)((uintptr_t)botPlayer + 0x50);
+        if (netPlayer != nullptr && isPointerReadable(netPlayer)) {
+            applyBigHeadToNetworkPlayer(netPlayer, scale);
+        }
     }
 }
 
 // =========================================================================
-// Il2Cpp Hooks for NetworkPlayer, BotPlayer, ThirdPersonController & AimIK
+// Il2Cpp Lifecycle Hooks
 // =========================================================================
 
 // NetworkPlayer.Update: RVA 0x42CC8C8
 void (*old_NetworkPlayer_Update)(void *instance) = nullptr;
 void hook_NetworkPlayer_Update(void *instance) {
     if (instance != nullptr) {
+        setLastAction("NetworkPlayer_Update");
         if (g_autoCount) {
             onNetworkPlayerUpdate(instance);
         }
         if (g_bigHead) {
-            resolveAndScaleNetworkPlayer(instance, BIG_HEAD_SCALE);
+            applyBigHeadToNetworkPlayer(instance, BIG_HEAD_SCALE);
         } else if (g_needsBigHeadReset) {
-            resolveAndScaleNetworkPlayer(instance, NORMAL_HEAD_SCALE);
+            applyBigHeadToNetworkPlayer(instance, NORMAL_HEAD_SCALE);
             if (g_bigHeadResetFrames > 0) {
                 g_bigHeadResetFrames--;
                 if (g_bigHeadResetFrames == 0) {
                     g_needsBigHeadReset = false;
+                    ModLog("[BIG_HEAD] Reset frames completed. Restored normal head scale.");
                 }
             }
         }
@@ -453,11 +654,8 @@ void hook_NetworkPlayer_Update(void *instance) {
 void (*old_NetworkPlayer_OnDestroy)(void *instance) = nullptr;
 void hook_NetworkPlayer_OnDestroy(void *instance) {
     if (instance != nullptr) {
+        setLastAction("NetworkPlayer_OnDestroy");
         onNetworkPlayerDestroy(instance);
-        {
-            std::lock_guard<std::mutex> lock(g_headMutex);
-            g_cachedHeadBones.erase(instance);
-        }
     }
     if (old_NetworkPlayer_OnDestroy != nullptr) {
         old_NetworkPlayer_OnDestroy(instance);
@@ -468,6 +666,7 @@ void hook_NetworkPlayer_OnDestroy(void *instance) {
 void (*old_BotPlayer_Start)(void *instance) = nullptr;
 void hook_BotPlayer_Start(void *instance) {
     if (instance != nullptr && g_autoCount) {
+        setLastAction("BotPlayer_Start");
         onBotPlayerUpdate(instance);
     }
     if (old_BotPlayer_Start != nullptr) {
@@ -479,13 +678,14 @@ void hook_BotPlayer_Start(void *instance) {
 void (*old_BotPlayer_Update)(void *instance) = nullptr;
 void hook_BotPlayer_Update(void *instance) {
     if (instance != nullptr) {
+        setLastAction("BotPlayer_Update");
         if (g_autoCount) {
             onBotPlayerUpdate(instance);
         }
         if (g_bigHead) {
-            resolveAndScaleBotPlayer(instance, BIG_HEAD_SCALE);
+            applyBigHeadToBotPlayer(instance, BIG_HEAD_SCALE);
         } else if (g_needsBigHeadReset) {
-            resolveAndScaleBotPlayer(instance, NORMAL_HEAD_SCALE);
+            applyBigHeadToBotPlayer(instance, NORMAL_HEAD_SCALE);
         }
     }
     if (old_BotPlayer_Update != nullptr) {
@@ -497,96 +697,54 @@ void hook_BotPlayer_Update(void *instance) {
 void (*old_BotPlayer_OnDestroy)(void *instance) = nullptr;
 void hook_BotPlayer_OnDestroy(void *instance) {
     if (instance != nullptr) {
+        setLastAction("BotPlayer_OnDestroy");
         onBotPlayerDestroy(instance);
-        {
-            std::lock_guard<std::mutex> lock(g_headMutex);
-            g_cachedHeadBones.erase(instance);
-        }
     }
     if (old_BotPlayer_OnDestroy != nullptr) {
         old_BotPlayer_OnDestroy(instance);
     }
 }
 
-// ThirdPersonController.Update: RVA 0x43607BC
-void (*old_ThirdPersonController_Update)(void *instance) = nullptr;
-void hook_ThirdPersonController_Update(void *instance) {
-    if (old_ThirdPersonController_Update != nullptr) {
-        old_ThirdPersonController_Update(instance);
-    }
-    if (instance != nullptr) {
-        if (g_bigHead) {
-            applyHeadScaleToThirdPerson(instance, BIG_HEAD_SCALE);
-        } else if (g_needsBigHeadReset) {
-            applyHeadScaleToThirdPerson(instance, NORMAL_HEAD_SCALE);
-        }
-    }
-}
-
-// ThirdPersonController.OnDestroy: RVA 0x4360FB8
-void (*old_ThirdPersonController_OnDestroy)(void *instance) = nullptr;
-void hook_ThirdPersonController_OnDestroy(void *instance) {
-    if (instance != nullptr) {
-        std::lock_guard<std::mutex> lock(g_headMutex);
-        g_cachedHeadBones.erase(instance);
-    }
-    if (old_ThirdPersonController_OnDestroy != nullptr) {
-        old_ThirdPersonController_OnDestroy(instance);
-    }
-}
-
-// AimIkController.LateUpdate: RVA 0x407C85C
-void (*old_AimIkController_LateUpdate)(void *instance) = nullptr;
-void hook_AimIkController_LateUpdate(void *instance) {
-    if (old_AimIkController_LateUpdate != nullptr) {
-        old_AimIkController_LateUpdate(instance);
-    }
-    if (instance != nullptr) {
-        // Offset 0x60 in AimIkController is ThirdPersonController
-        void *tpc = *(void **)((uintptr_t)instance + 0x60);
-        if (tpc != nullptr) {
-            if (g_bigHead) {
-                applyHeadScaleToThirdPerson(tpc, BIG_HEAD_SCALE);
-            } else if (g_needsBigHeadReset) {
-                applyHeadScaleToThirdPerson(tpc, NORMAL_HEAD_SCALE);
-            }
-        }
-    }
-}
-
-// Thread to hook functions once libil2cpp.so is loaded
+// Background thread waiting for libil2cpp.so
 void *hack_thread(void *) {
-    LOGI(OBFUSCATE("hack_thread started for GTA SA FPS"));
+    ModLog("[THREAD] hack_thread started for GTA SA FPS. Waiting for %s...", (const char *)targetLibName);
+    setLastAction("Waiting for libil2cpp.so");
 
-    // Check if target lib is loaded
     do {
         sleep(1);
     } while (!isLibraryLoaded(targetLibName));
 
-    LOGI(OBFUSCATE("%s has been loaded"), (const char *) targetLibName);
+    uintptr_t base = findLibrary(targetLibName);
+    ModLog("[THREAD] %s loaded successfully at base: 0x%lx", (const char *)targetLibName, base);
+    setLastAction("libil2cpp.so loaded");
 
+    initSafetyPipe();
     initUnityPointers();
 
 #if defined(__aarch64__)
-    // Hook NetworkPlayer lifecycle
+    ModLog("[HOOK] Installing hooks on libil2cpp.so (arm64-v8a)...");
+
+    // NetworkPlayer hooks
     HOOK("0x42CC8C8", hook_NetworkPlayer_Update, old_NetworkPlayer_Update);
+    ModLog("[HOOK] NetworkPlayer.Update (0x42CC8C8): %s", old_NetworkPlayer_Update ? "SUCCESS" : "FAILED/HOOKED");
+
     HOOK("0x42C9540", hook_NetworkPlayer_OnDestroy, old_NetworkPlayer_OnDestroy);
+    ModLog("[HOOK] NetworkPlayer.OnDestroy (0x42C9540): %s", old_NetworkPlayer_OnDestroy ? "SUCCESS" : "FAILED/HOOKED");
 
-    // Hook BotPlayer lifecycle
+    // BotPlayer hooks
     HOOK("0x44493F4", hook_BotPlayer_Start, old_BotPlayer_Start);
+    ModLog("[HOOK] BotPlayer.Start (0x44493F4): %s", old_BotPlayer_Start ? "SUCCESS" : "FAILED/HOOKED");
+
     HOOK("0x444A310", hook_BotPlayer_Update, old_BotPlayer_Update);
+    ModLog("[HOOK] BotPlayer.Update (0x444A310): %s", old_BotPlayer_Update ? "SUCCESS" : "FAILED/HOOKED");
+
     HOOK("0x4449EB0", hook_BotPlayer_OnDestroy, old_BotPlayer_OnDestroy);
+    ModLog("[HOOK] BotPlayer.OnDestroy (0x4449EB0): %s", old_BotPlayer_OnDestroy ? "SUCCESS" : "FAILED/HOOKED");
 
-    // Hook ThirdPersonController (3D character models in scene)
-    HOOK("0x43607BC", hook_ThirdPersonController_Update, old_ThirdPersonController_Update);
-    HOOK("0x4360FB8", hook_ThirdPersonController_OnDestroy, old_ThirdPersonController_OnDestroy);
-
-    // Hook AimIkController (LateUpdate after animation / IK evaluation)
-    HOOK("0x407C85C", hook_AimIkController_LateUpdate, old_AimIkController_LateUpdate);
-
-    LOGI(OBFUSCATE("Player, Bot, and Big Head hooks installed successfully!"));
+    ModLog("[THREAD] All core hooks installed successfully!");
+    setLastAction("Hooks installed and ready");
 #else
-    LOGI(OBFUSCATE("GTA SA FPS 64-bit target only."));
+    ModLog("[WARN] Target is arm64-v8a only. 32-bit not supported.");
 #endif
 
     return NULL;
@@ -601,10 +759,10 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
 
     const char *features[] = {
         OBFUSCATE("Category_🎮 FITUR GTA SA FPS"),
-        OBFUSCATE("Toggle_Status Panel Overlay"), // featNum 0: Panel HUD & Auto Hitung Player/Bot
-        OBFUSCATE("Toggle_Big Head"),             // featNum 1: Ukuran kepala player & bot membesar (Client-side)
-        OBFUSCATE("Category_📊 STATUS PANEL INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ STATUS PANEL & BIG HEAD ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> Cukup aktifkan toggle ini untuk menampilkan HUD dan otomatis menghitung jumlah Player & Bot secara real-time.<br><br>• <b>Big Head:</b> Memperbesar ukuran kepala (body part) Player & Bot secara client-side (hanya di sisi client/layar Anda).</font></div>")
+        OBFUSCATE("Toggle_Status Panel Overlay"), // featNum 0
+        OBFUSCATE("Toggle_Big Head"),             // featNum 1
+        OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ STATUS PANEL & BIG HEAD ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -624,26 +782,40 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
 
     LOGD(OBFUSCATE("Changes: featNum=%d, val=%d, bool=%d"), featNum, value, boolean);
 
+    const char *stateStr = boolean ? "ON (ACTIVE)" : "OFF (INACTIVE)";
+
     switch (featNum) {
-        case 0: // Toggle_Status Panel Overlay (Sekaligus Auto Count Player & Bot)
+        case 0: { // Toggle_Status Panel Overlay (Auto Count Player & Bot)
             g_showStatusPanel = boolean;
             g_autoCount = boolean;
+            ModLog("[TOGGLE] Feature #0 [Status Panel Overlay & Auto Count] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Status Panel: ON" : "Toggle Status Panel: OFF");
+
             if (boolean) {
                 Toast(env, ctx, OBFUSCATE("Status Panel & Auto Counter: ON"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Status Panel & Auto Counter: OFF"), ToastLength::LENGTH_SHORT);
             }
             break;
+        }
 
-        case 1: // Toggle_Big Head
+        case 1: { // Toggle_Big Head
             g_bigHead = boolean;
+            ModLog("[TOGGLE] Feature #1 [Big Head (Client-Side)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Big Head: ON" : "Toggle Big Head: OFF");
+
             if (!boolean) {
                 g_needsBigHeadReset = true;
-                g_bigHeadResetFrames = 120; // Reset scale back across next 120 frames
+                g_bigHeadResetFrames = 120;
                 Toast(env, ctx, OBFUSCATE("Big Head: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Big Head: ON (Kepala Membesar)"), ToastLength::LENGTH_SHORT);
             }
+            break;
+        }
+
+        default:
+            ModLog("[TOGGLE] Unknown Feature #%d changed to: val=%d, bool=%d", featNum, value, (int)boolean);
             break;
     }
 }
@@ -682,6 +854,12 @@ void ResetEntityCounters(JNIEnv *env, jobject thiz) {
 
 __attribute__((constructor))
 void lib_main() {
+    installCrashHandler();
+    ModLog("=================================================================");
+    ModLog("        GTA SA FPS MOD MENU LOADED (libModMenu.so)              ");
+    ModLog("=================================================================");
+    ModLog("[INIT] Native constructor executed. Primary log: %s", DEBUG_LOG_PATHS[0]);
+
     pthread_t ptid;
     pthread_create(&ptid, NULL, hack_thread, NULL);
 }
