@@ -1085,19 +1085,82 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 }
 
 // =========================================================================
-// Native Aim Assist Boost System
-// - Hooks game's built-in Aim Assist & Auto Aim pipeline
-// - Drastically amplifies sensitivity, max rotation power, and lock-on range
-// - Forces Aim Assist to stay active for both hip-fire and scoping
+// Native Aim Assist Boost System (Natural Movement & Team Filtering)
+// - Filters out teammates/allies so aim assist never targets friendly units
+// - Only engages assist when crosshair is already directed close to an enemy
+// - Preserves 100% natural, smooth camera movement in open space
+// - Reinforces friction & lock-on sensitivity for both hip-fire and scoping
 // - 100% preserves player character movement, animation, and manual weapon firing
 // =========================================================================
+
+static bool (*get_AllyObjectToogle)(void *) = nullptr;
+static bool (*get_IsAutoAimAllowed)(void *) = nullptr;
+
+static void initAimAssistPointers() {
+    if (get_AllyObjectToogle == nullptr) {
+        get_AllyObjectToogle = (bool (*)(void *)) getAbsoluteAddress(targetLibName, 0x4DED164);
+        ModLog("[AIM_ASSIST] TargetibleObjectCustomSettings.get_AllyObjectToogle pointer: %p", get_AllyObjectToogle);
+    }
+    if (get_IsAutoAimAllowed == nullptr) {
+        get_IsAutoAimAllowed = (bool (*)(void *)) getAbsoluteAddress(targetLibName, 0x4DED124);
+        ModLog("[AIM_ASSIST] TargetibleObjectCustomSettings.get_IsAutoAimAllowed pointer: %p", get_IsAutoAimAllowed);
+    }
+}
+
+// Check if a TargetibleObject is an ally / teammate or self
+static bool isTargetTeammate(void *targetibleObj) {
+    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) {
+        return false;
+    }
+
+    // 1. Check TargetibleObjectCustomSettings at offset 0x90
+    if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0x90))) {
+        void *customSettings = *(void **)((uintptr_t)targetibleObj + 0x90);
+        if (customSettings != nullptr && isPointerReadable(customSettings)) {
+            // Direct memory check for backing field <AllyObjectToogle>k__BackingField at offset 0x20
+            if (isPointerReadable((void *)((uintptr_t)customSettings + 0x20))) {
+                bool isAllyField = *(bool *)((uintptr_t)customSettings + 0x20);
+                if (isAllyField) {
+                    return true; // Marked as ally -> Ignore!
+                }
+            }
+
+            // Method call check: TargetibleObjectCustomSettings.get_AllyObjectToogle (0x4DED164)
+            if (get_AllyObjectToogle != nullptr) {
+                if (get_AllyObjectToogle(customSettings)) {
+                    return true;
+                }
+            }
+
+            // Check if game explicitly disallows auto aim for this object: TargetibleObjectCustomSettings.get_IsAutoAimAllowed (0x4DED124)
+            if (get_IsAutoAimAllowed != nullptr) {
+                if (!get_IsAutoAimAllowed(customSettings)) {
+                    return true; // Not an allowed aim target (e.g. ally) -> Ignore!
+                }
+            }
+        }
+    }
+
+    // 2. Ignore self if targetibleObject belongs to local player
+    if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0xD8))) {
+        void *targetNetPlayer = *(void **)((uintptr_t)targetibleObj + 0xD8);
+        if (targetNetPlayer != nullptr && isPointerReadable(targetNetPlayer)) {
+            if (g_localPlayerFPC != nullptr && targetNetPlayer == g_localPlayerFPC) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
 
 // 1. StrafeRotationConfig (0x52A6264, 0x52A6210, 0x52A624C, 0x52A65A4, 0x52A6598)
 float (*old_StrafeRotationConfig_get_MaxRotationPower)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
     float power = old_StrafeRotationConfig_get_MaxRotationPower ? old_StrafeRotationConfig_get_MaxRotationPower(instance) : 0.2f;
     if (g_aimAssistBoost) {
-        return (power > 0.0f) ? (power * 4.5f) : 2.5f;
+        // Controlled rotation power: firm stickiness without violent jerking (default is ~0.2f)
+        return (power > 0.0f) ? (power * 2.0f) : 0.65f;
     }
     return power;
 }
@@ -1106,7 +1169,9 @@ float (*old_StrafeRotationConfig_get_FOVAreaMultiplier)(void *instance) = nullpt
 float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
     float fov = old_StrafeRotationConfig_get_FOVAreaMultiplier ? old_StrafeRotationConfig_get_FOVAreaMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        return (fov > 0.0f) ? (fov * 2.5f) : 2.5f;
+        // Controlled FOV: only engages when crosshair is already close to enemy,
+        // avoiding spinning or grabbing targets in peripheral vision
+        return 1.15f;
     }
     return fov;
 }
@@ -1115,7 +1180,7 @@ float (*old_StrafeRotationConfig_get_DefaultStateMaxDistance)(void *instance) = 
 float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
     float dist = old_StrafeRotationConfig_get_DefaultStateMaxDistance ? old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
     if (g_aimAssistBoost) {
-        return 150.0f; // Long range aim assist for hip fire
+        return 80.0f; // Reliable distance for hip fire
     }
     return dist;
 }
@@ -1124,7 +1189,7 @@ float (*old_StrafeRotationConfig_get_ZoomedStateMaxDistance)(void *instance) = n
 float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
     float dist = old_StrafeRotationConfig_get_ZoomedStateMaxDistance ? old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
     if (g_aimAssistBoost) {
-        return 250.0f; // Long range aim assist for scope
+        return 180.0f; // Long range aim assist for scope
     }
     return dist;
 }
@@ -1133,7 +1198,7 @@ float (*old_StrafeRotationConfig_get_FOVPowerMultiplier)(void *instance) = nullp
 float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
     float fov = old_StrafeRotationConfig_get_FOVPowerMultiplier ? old_StrafeRotationConfig_get_FOVPowerMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        return (fov > 0.0f) ? (fov * 2.5f) : 2.5f;
+        return 1.25f;
     }
     return fov;
 }
@@ -1143,7 +1208,7 @@ float (*old_SpinSlowdownConfig_get_MaxSlowdownValue)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
     float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.5f;
     if (g_aimAssistBoost) {
-        return 0.85f; // Strong sticky crosshair friction on target
+        return 0.78f; // Strong sticky crosshair friction on target ("langsung nempel")
     }
     return val;
 }
@@ -1152,7 +1217,7 @@ float (*old_SpinSlowdownConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
     float fov = old_SpinSlowdownConfig_get_FOVAreaMultiplier ? old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        return (fov > 0.0f) ? (fov * 2.5f) : 2.5f;
+        return 1.15f; // Only slows down when crosshair is on/near target
     }
     return fov;
 }
@@ -1161,7 +1226,7 @@ float (*old_SpinSlowdownConfig_get_Radius)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_Radius(void *instance) {
     float r = old_SpinSlowdownConfig_get_Radius ? old_SpinSlowdownConfig_get_Radius(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        return (r > 0.0f) ? (r * 2.0f) : 2.0f;
+        return (r > 0.0f) ? (r * 1.25f) : 1.25f;
     }
     return r;
 }
@@ -1170,7 +1235,7 @@ float (*old_SpinSlowdownConfig_get_DefaultStateMaxDistance)(void *instance) = nu
 float hook_SpinSlowdownConfig_get_DefaultStateMaxDistance(void *instance) {
     float dist = old_SpinSlowdownConfig_get_DefaultStateMaxDistance ? old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
     if (g_aimAssistBoost) {
-        return 150.0f;
+        return 80.0f;
     }
     return dist;
 }
@@ -1179,39 +1244,48 @@ float (*old_SpinSlowdownConfig_get_ZoomedStateMaxDistance)(void *instance) = nul
 float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
     float dist = old_SpinSlowdownConfig_get_ZoomedStateMaxDistance ? old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
     if (g_aimAssistBoost) {
-        return 250.0f;
+        return 180.0f;
     }
     return dist;
 }
 
 // 3. StrafeRotationAimAssist.Calculate (0x4F0E254)
+// Proportional assist: 100% natural when in open space, smooth sticky boost when close to enemy
 Vector2 (*old_StrafeRotation_Calculate)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
 Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vector2 smoothed) {
     if (old_StrafeRotation_Calculate == nullptr) return currentDelta;
     Vector2 result = old_StrafeRotation_Calculate(instance, currentDelta, smoothed);
-    if (g_aimAssistBoost) {
-        float assistX = result.x - currentDelta.x;
-        float assistY = result.y - currentDelta.y;
-        result.x = currentDelta.x + assistX * 4.0f;
-        result.y = currentDelta.y + assistY * 4.0f;
+    if (!g_aimAssistBoost) return result;
+
+    float assistX = result.x - currentDelta.x;
+    float assistY = result.y - currentDelta.y;
+    float assistMag = sqrtf(assistX * assistX + assistY * assistY);
+
+    // Natural camera movement: if no target is near the crosshair, return native delta untouched!
+    if (assistMag < 0.0001f) {
+        return currentDelta;
     }
+
+    // Boost assist smoothly when crosshair is already directed close to enemy
+    float boost = 1.8f;
+    assistX *= boost;
+    assistY *= boost;
+
+    // Safety clamp: cap maximum rotational delta step per frame (prevents camera spinning/whipping)
+    const float MAX_ASSIST_STEP = 8.0f;
+    float boostedMag = sqrtf(assistX * assistX + assistY * assistY);
+    if (boostedMag > MAX_ASSIST_STEP) {
+        float scale = MAX_ASSIST_STEP / boostedMag;
+        assistX *= scale;
+        assistY *= scale;
+    }
+
+    result.x = currentDelta.x + assistX;
+    result.y = currentDelta.y + assistY;
     return result;
 }
 
-// 4. AimAssistManager.Update (0x5290E40) & SetEnabled (0x529060C)
-Vector2 (*old_AimAssistManager_Update)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
-Vector2 hook_AimAssistManager_Update(void *instance, Vector2 currentDelta, Vector2 smoothed) {
-    if (old_AimAssistManager_Update == nullptr) return currentDelta;
-    Vector2 result = old_AimAssistManager_Update(instance, currentDelta, smoothed);
-    if (g_aimAssistBoost) {
-        float assistX = result.x - currentDelta.x;
-        float assistY = result.y - currentDelta.y;
-        result.x = currentDelta.x + assistX * 4.0f;
-        result.y = currentDelta.y + assistY * 4.0f;
-    }
-    return result;
-}
-
+// 4. AimAssistManager.SetEnabled (0x529060C)
 void (*old_AimAssistManager_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
     if (g_aimAssistBoost) {
@@ -1222,20 +1296,7 @@ void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
     }
 }
 
-// 5. NewAutoAim.Update (0x421CC44) & SetEnabled (0x421C470)
-Vector2 (*old_NewAutoAim_Update)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
-Vector2 hook_NewAutoAim_Update(void *instance, Vector2 currentDelta, Vector2 smoothed) {
-    if (old_NewAutoAim_Update == nullptr) return currentDelta;
-    Vector2 result = old_NewAutoAim_Update(instance, currentDelta, smoothed);
-    if (g_aimAssistBoost) {
-        float assistX = result.x - currentDelta.x;
-        float assistY = result.y - currentDelta.y;
-        result.x = currentDelta.x + assistX * 4.0f;
-        result.y = currentDelta.y + assistY * 4.0f;
-    }
-    return result;
-}
-
+// 5. NewAutoAim.SetEnabled (0x421C470)
 void (*old_NewAutoAim_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_NewAutoAim_SetEnabled(void *instance, bool enabled) {
     if (g_aimAssistBoost) {
@@ -1257,31 +1318,34 @@ void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
     }
 }
 
-// 7. AimingControlHelper.ProcessAimAssist1 (0x453E3D8) & ProcessAimAssist2 (0x453EBBC)
-Vector2 (*old_AimingControlHelper_Process1)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
-Vector2 hook_AimingControlHelper_Process1(void *instance, Vector2 currentDelta, Vector2 smoothed) {
-    if (old_AimingControlHelper_Process1 == nullptr) return currentDelta;
-    Vector2 result = old_AimingControlHelper_Process1(instance, currentDelta, smoothed);
+// 7. BaseAimAssist.IsValidTarget (0x4478A70) & NewAutoAim.IsValidTarget (0x421C254)
+// Filters out teammates and allies so aim assist is NEVER distracted by friendly players
+bool (*old_BaseAimAssist_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
+bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
+    if (old_BaseAimAssist_IsValidTarget == nullptr) return false;
+    bool valid = old_BaseAimAssist_IsValidTarget(instance, targetibleObject);
+    if (!valid) return false;
+
     if (g_aimAssistBoost) {
-        float assistX = result.x - currentDelta.x;
-        float assistY = result.y - currentDelta.y;
-        result.x = currentDelta.x + assistX * 4.0f;
-        result.y = currentDelta.y + assistY * 4.0f;
+        if (isTargetTeammate(targetibleObject)) {
+            return false; // Ignore teammates!
+        }
     }
-    return result;
+    return true;
 }
 
-Vector2 (*old_AimingControlHelper_Process2)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
-Vector2 hook_AimingControlHelper_Process2(void *instance, Vector2 currentDelta, Vector2 smoothed) {
-    if (old_AimingControlHelper_Process2 == nullptr) return currentDelta;
-    Vector2 result = old_AimingControlHelper_Process2(instance, currentDelta, smoothed);
+bool (*old_NewAutoAim_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
+bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
+    if (old_NewAutoAim_IsValidTarget == nullptr) return false;
+    bool valid = old_NewAutoAim_IsValidTarget(instance, targetibleObject);
+    if (!valid) return false;
+
     if (g_aimAssistBoost) {
-        float assistX = result.x - currentDelta.x;
-        float assistY = result.y - currentDelta.y;
-        result.x = currentDelta.x + assistX * 4.0f;
-        result.y = currentDelta.y + assistY * 4.0f;
+        if (isTargetTeammate(targetibleObject)) {
+            return false; // Ignore teammates!
+        }
     }
-    return result;
+    return true;
 }
 
 // =========================================================================
@@ -1384,6 +1448,7 @@ void *hack_thread(void *) {
 
     initSafetyPipe();
     initUnityPointers();
+    initAimAssistPointers();
     initFastFireRateSystem();
     if (g_fastFireRate) {
         applyFastFireRateToggle(true);
@@ -1482,14 +1547,8 @@ void *hack_thread(void *) {
     HOOK("0x4F0E254", hook_StrafeRotation_Calculate, old_StrafeRotation_Calculate);
     ModLog("[HOOK] StrafeRotationAimAssist.Calculate (0x4F0E254): %s", old_StrafeRotation_Calculate ? "SUCCESS" : "FAILED/HOOKED");
 
-    HOOK("0x5290E40", hook_AimAssistManager_Update, old_AimAssistManager_Update);
-    ModLog("[HOOK] AimAssistManager.Update (0x5290E40): %s", old_AimAssistManager_Update ? "SUCCESS" : "FAILED/HOOKED");
-
     HOOK("0x529060C", hook_AimAssistManager_SetEnabled, old_AimAssistManager_SetEnabled);
     ModLog("[HOOK] AimAssistManager.SetEnabled (0x529060C): %s", old_AimAssistManager_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
-
-    HOOK("0x421CC44", hook_NewAutoAim_Update, old_NewAutoAim_Update);
-    ModLog("[HOOK] NewAutoAim.Update (0x421CC44): %s", old_NewAutoAim_Update ? "SUCCESS" : "FAILED/HOOKED");
 
     HOOK("0x421C470", hook_NewAutoAim_SetEnabled, old_NewAutoAim_SetEnabled);
     ModLog("[HOOK] NewAutoAim.SetEnabled (0x421C470): %s", old_NewAutoAim_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
@@ -1497,11 +1556,12 @@ void *hack_thread(void *) {
     HOOK("0x4478A30", hook_BaseAimAssist_SetEnabled, old_BaseAimAssist_SetEnabled);
     ModLog("[HOOK] BaseAimAssist.SetEnabled (0x4478A30): %s", old_BaseAimAssist_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
 
-    HOOK("0x453E3D8", hook_AimingControlHelper_Process1, old_AimingControlHelper_Process1);
-    ModLog("[HOOK] AimingControlHelper.Process1 (0x453E3D8): %s", old_AimingControlHelper_Process1 ? "SUCCESS" : "FAILED/HOOKED");
+    // Target Filtering Hooks (Ignore Teammates & Allies)
+    HOOK("0x4478A70", hook_BaseAimAssist_IsValidTarget, old_BaseAimAssist_IsValidTarget);
+    ModLog("[HOOK] BaseAimAssist.IsValidTarget (0x4478A70): %s", old_BaseAimAssist_IsValidTarget ? "SUCCESS" : "FAILED/HOOKED");
 
-    HOOK("0x453EBBC", hook_AimingControlHelper_Process2, old_AimingControlHelper_Process2);
-    ModLog("[HOOK] AimingControlHelper.Process2 (0x453EBBC): %s", old_AimingControlHelper_Process2 ? "SUCCESS" : "FAILED/HOOKED");
+    HOOK("0x421C254", hook_NewAutoAim_IsValidTarget, old_NewAutoAim_IsValidTarget);
+    ModLog("[HOOK] NewAutoAim.IsValidTarget (0x421C254): %s", old_NewAutoAim_IsValidTarget ? "SUCCESS" : "FAILED/HOOKED");
 
     ModLog("[THREAD] All core hooks installed successfully!");
     setLastAction("Hooks installed and ready");
@@ -1527,7 +1587,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
         OBFUSCATE("Toggle_Aim Assist (Enhanced Sensitivity)"), // featNum 4
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Enhanced):</b> Hook sistem Aim Assist bawaan game dengan sensivitas & jangkauan kuncian maksimal untuk Hip-fire dan Scope tanpa mengganggu pergerakan atau penembakan karakter.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Enhanced):</b> Hook sistem Aim Assist bawaan game dengan fitur abaikan rekan tim otomatis & pergerakan kamera alami (asistensi kuncian presisi & friction hanya aktif menempel saat bidikan dekat musuh).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
