@@ -159,9 +159,9 @@ static struct sigaction old_sa_trap;
 static bool g_showStatusPanel = false;
 static bool g_autoCount = false;
 static bool g_bigHead = false;
-static bool g_autoHeadshot = false;
 static bool g_fastFireRate = false;
 static bool g_noRecoil = false;
+static bool g_weaponAimbot = false;
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -198,10 +198,10 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, AutoHeadshot=%d, FastFireRate=%d, NoRecoil=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, WeaponAimbot=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
-        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_autoHeadshot, (int)g_fastFireRate, (int)g_noRecoil
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_fastFireRate, (int)g_noRecoil, (int)g_weaponAimbot
     );
 
 #if defined(__aarch64__)
@@ -380,9 +380,23 @@ struct Vector3 {
     Vector3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
 };
 
+struct Quaternion {
+    float x;
+    float y;
+    float z;
+    float w;
+    Quaternion() : x(0.0f), y(0.0f), z(0.0f), w(1.0f) {}
+    Quaternion(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
+};
+
 static void *(*get_transform)(void *) = nullptr;
 static void (*set_localScale_Injected)(void *, const Vector3 *) = nullptr;
 static void *(*GetBoneTransform)(void *, int) = nullptr;
+static void (*get_position_Injected)(void *, Vector3 &) = nullptr;
+static void (*get_rotation_Injected)(void *, Quaternion &) = nullptr;
+static void (*set_rotation_Injected)(void *, const Quaternion &) = nullptr;
+static void (*aim_SetTarget)(void *, void *) = nullptr;
+static void *(*get_MuzzleTransform)(void *) = nullptr;
 
 static void initUnityPointers() {
     setLastAction("initUnityPointers");
@@ -397,6 +411,26 @@ static void initUnityPointers() {
     if (GetBoneTransform == nullptr) {
         GetBoneTransform = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x84EBAB0);
         ModLog("[UNITY] GetBoneTransform pointer: %p", GetBoneTransform);
+    }
+    if (get_position_Injected == nullptr) {
+        get_position_Injected = (void (*)(void *, Vector3 &)) getAbsoluteAddress(targetLibName, 0x85B1394);
+        ModLog("[UNITY] get_position_Injected pointer: %p", get_position_Injected);
+    }
+    if (get_rotation_Injected == nullptr) {
+        get_rotation_Injected = (void (*)(void *, Quaternion &)) getAbsoluteAddress(targetLibName, 0x85B1E10);
+        ModLog("[UNITY] get_rotation_Injected pointer: %p", get_rotation_Injected);
+    }
+    if (set_rotation_Injected == nullptr) {
+        set_rotation_Injected = (void (*)(void *, const Quaternion &)) getAbsoluteAddress(targetLibName, 0x85B1E5C);
+        ModLog("[UNITY] set_rotation_Injected pointer: %p", set_rotation_Injected);
+    }
+    if (aim_SetTarget == nullptr) {
+        aim_SetTarget = (void (*)(void *, void *)) getAbsoluteAddress(targetLibName, 0x4D287F8);
+        ModLog("[UNITY] AimingControl.SetTarget pointer: %p", aim_SetTarget);
+    }
+    if (get_MuzzleTransform == nullptr) {
+        get_MuzzleTransform = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x405C050);
+        ModLog("[UNITY] WeaponShooterBehaviour.GetMuzzleTransform pointer: %p", get_MuzzleTransform);
     }
 }
 
@@ -417,112 +451,106 @@ static void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
     }
 }
 
-// =========================================================================
-// Auto Headshot Memory Patch System (100% Headshot Override)
-// =========================================================================
+static bool safeGetPosition(void *transformObj, Vector3 *outPos) {
+    if (transformObj == nullptr || get_position_Injected == nullptr || outPos == nullptr) return false;
+    if (!isPointerReadable(transformObj)) return false;
 
-struct MemoryPatchItem {
-    const char *name;
-    uintptr_t rva;
-    size_t size;
-    const char *patchHex;
-    uint8_t origBytes[16];
-    bool initialized;
-};
-
-static MemoryPatchItem g_autoHeadshotPatches[] = {
-    // 1. FirstPersonController.HitBodyPartStore (0x40961B4) -> str wzr, [sp, #0x30] (Force calculated bodyPart to Head = 0)
-    {"FPC.HitBodyPartStore", 0x40961B4, 4, "FF3300B9", {0}, false},
-
-    // 2. FirstPersonController.DamageDataBodyPart (0x409657C) -> mov w3, #0 (Force DamageData.ctor bodyPart param to Head = 0)
-    {"FPC.DamageDataBodyPart", 0x409657C, 4, "03008052", {0}, false},
-
-    // 3. FirstPersonController.ReportHitBodyPart (0x4096690) -> mov w1, #0 (Force damage network report bodyPart param to Head = 0)
-    {"FPC.ReportHitBodyPart", 0x4096690, 4, "01008052", {0}, false},
-
-    // 4. FirstPersonController.HeadshotMultiplierBranch (0x40968B8) -> NOP (Unconditionally apply Headshot Damage Multiplier at 0x24)
-    {"FPC.HeadshotMultiplierBranch", 0x40968B8, 4, "1F2003D5", {0}, false},
-
-    // 5. VehicleWeaponBehaviour.DamageData (0x4293794) -> mov w3, #0 (Force vehicle weapon damage to Head)
-    {"VehicleWeapon.DamageData", 0x4293794, 4, "03008052", {0}, false},
-
-    // 6. DamageData.get_BodyPart (0x4FC8668) -> mov w0, #0; ret
-    {"DamageData.get_BodyPart", 0x4FC8668, 8, "00008052C0035FD6", {0}, false},
-
-    // 7. DamageData..ctor (0x4FC8630) -> str wzr, [x0, #0x44]
-    {"DamageData..ctor (store wzr)", 0x4FC8630, 4, "1F4400B9", {0}, false},
-
-    // 8. NetworkPlayer.Damage (0x42CF248) -> mov w8, #0
-    {"NetworkPlayer.Damage (force head)", 0x42CF248, 4, "08008052", {0}, false},
-
-    // 9. BodyPoint.get_BodyPointTypes (0x3F2FB54) -> mov w0, #0; ret
-    {"BodyPoint.get_BodyPointTypes", 0x3F2FB54, 8, "00008052C0035FD6", {0}, false},
-
-    // 10-22. All other 13 BodyPoint getters returning Head (0)
-    {"BodyPoint.0x3F2FAD4", 0x3F2FAD4, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FAF4", 0x3F2FAF4, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FB14", 0x3F2FB14, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FB34", 0x3F2FB34, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FB74", 0x3F2FB74, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FB94", 0x3F2FB94, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FBB4", 0x3F2FBB4, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FBD4", 0x3F2FBD4, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FBF4", 0x3F2FBF4, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FC14", 0x3F2FC14, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FC34", 0x3F2FC34, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FC54", 0x3F2FC54, 8, "00008052C0035FD6", {0}, false},
-    {"BodyPoint.0x3F2FC74", 0x3F2FC74, 8, "00008052C0035FD6", {0}, false},
-};
-static const size_t NUM_HEADSHOT_PATCHES = sizeof(g_autoHeadshotPatches) / sizeof(g_autoHeadshotPatches[0]);
-
-static void initAutoHeadshotPatches() {
-    setLastAction("initAutoHeadshotPatches");
-    size_t initCount = 0;
-    for (size_t i = 0; i < NUM_HEADSHOT_PATCHES; i++) {
-        MemoryPatchItem &item = g_autoHeadshotPatches[i];
-        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
-        if (absAddr != 0) {
-            KittyMemory::memRead(item.origBytes, (const void *)absAddr, item.size);
-            item.initialized = true;
-            initCount++;
-        } else {
-            ModLog("[HEADSHOT] Warning: Failed to get address for %s (RVA 0x%lx)", item.name, item.rva);
-        }
+    void *nativePtr = nullptr;
+    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
+        nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
     }
-    ModLog("[HEADSHOT] Auto Headshot memory patches initialized (%zu/%zu targets ready)", initCount, NUM_HEADSHOT_PATCHES);
+    if (nativePtr != nullptr && isPointerReadable(nativePtr)) {
+        get_position_Injected(nativePtr, *outPos);
+    } else {
+        get_position_Injected(transformObj, *outPos);
+    }
+    return true;
 }
 
-static void applyAutoHeadshotPatch(bool enable) {
-    g_autoHeadshot = enable;
-    setLastAction(enable ? "applyAutoHeadshotPatch(ON)" : "applyAutoHeadshotPatch(OFF)");
-    int successCount = 0;
-    for (size_t i = 0; i < NUM_HEADSHOT_PATCHES; i++) {
-        MemoryPatchItem &item = g_autoHeadshotPatches[i];
-        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
-        if (absAddr == 0) continue;
+static bool safeGetRotation(void *transformObj, Quaternion *outRot) {
+    if (transformObj == nullptr || get_rotation_Injected == nullptr || outRot == nullptr) return false;
+    if (!isPointerReadable(transformObj)) return false;
 
-        if (enable) {
-            uint8_t patchBuf[16];
-            KittyUtils::fromHex(item.patchHex, patchBuf);
-            if (KittyMemory::memWrite((void *)absAddr, patchBuf, item.size) == KittyMemory::SUCCESS) {
-                __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
-                successCount++;
-            } else {
-                ModLog("[HEADSHOT] Error: Failed to write patch for %s at 0x%lx", item.name, absAddr);
-            }
-        } else {
-            if (item.initialized) {
-                if (KittyMemory::memWrite((void *)absAddr, item.origBytes, item.size) == KittyMemory::SUCCESS) {
-                    __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
-                    successCount++;
-                } else {
-                    ModLog("[HEADSHOT] Error: Failed to restore patch for %s at 0x%lx", item.name, absAddr);
-                }
-            }
-        }
+    void *nativePtr = nullptr;
+    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
+        nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
     }
-    ModLog("[HEADSHOT] Auto Headshot %s: %d/%zu patches successfully applied/restored.",
-           enable ? "ENABLED (Memory Edit)" : "DISABLED (Restored)", successCount, NUM_HEADSHOT_PATCHES);
+    if (nativePtr != nullptr && isPointerReadable(nativePtr)) {
+        get_rotation_Injected(nativePtr, *outRot);
+    } else {
+        get_rotation_Injected(transformObj, *outRot);
+    }
+    return true;
+}
+
+static bool safeSetRotation(void *transformObj, const Quaternion &inRot) {
+    if (transformObj == nullptr || set_rotation_Injected == nullptr) return false;
+    if (!isPointerReadable(transformObj)) return false;
+
+    void *nativePtr = nullptr;
+    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
+        nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
+    }
+    if (nativePtr != nullptr && isPointerReadable(nativePtr)) {
+        set_rotation_Injected(nativePtr, inRot);
+    } else {
+        set_rotation_Injected(transformObj, inRot);
+    }
+    return true;
+}
+
+static Quaternion lookRotation(const Vector3 &forward, const Vector3 &up = Vector3(0.0f, 1.0f, 0.0f)) {
+    float len = sqrtf(forward.x * forward.x + forward.y * forward.y + forward.z * forward.z);
+    if (len < 0.0001f) return Quaternion(0.0f, 0.0f, 0.0f, 1.0f);
+    Vector3 f = { forward.x / len, forward.y / len, forward.z / len };
+
+    Vector3 r = {
+        up.y * f.z - up.z * f.y,
+        up.z * f.x - up.x * f.z,
+        up.x * f.y - up.y * f.x
+    };
+    float rLen = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
+    if (rLen < 0.0001f) {
+        Vector3 altUp = (fabsf(f.x) > 0.1f) ? Vector3(0.0f, 1.0f, 0.0f) : Vector3(1.0f, 0.0f, 0.0f);
+        r = { altUp.y * f.z - altUp.z * f.y, altUp.z * f.x - altUp.x * f.z, altUp.x * f.y - altUp.y * f.x };
+        rLen = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
+    }
+    r = { r.x / rLen, r.y / rLen, r.z / rLen };
+
+    Vector3 u = {
+        f.y * r.z - f.z * r.y,
+        f.z * r.x - f.x * r.z,
+        f.x * r.y - f.y * r.x
+    };
+
+    float trace = r.x + u.y + f.z;
+    Quaternion q;
+    if (trace > 0.0f) {
+        float s = 0.5f / sqrtf(trace + 1.0f);
+        q.w = 0.25f / s;
+        q.x = (u.z - f.y) * s;
+        q.y = (f.x - r.z) * s;
+        q.z = (r.y - u.x) * s;
+    } else if (r.x > u.y && r.x > f.z) {
+        float s = 2.0f * sqrtf(1.0f + r.x - u.y - f.z);
+        q.w = (u.z - f.y) / s;
+        q.x = 0.25f * s;
+        q.y = (u.x + r.y) / s;
+        q.z = (f.x + r.z) / s;
+    } else if (u.y > f.z) {
+        float s = 2.0f * sqrtf(1.0f + u.y - r.x - f.z);
+        q.w = (f.x - r.z) / s;
+        q.x = (u.x + r.y) / s;
+        q.y = 0.25f * s;
+        q.z = (f.y + u.z) / s;
+    } else {
+        float s = 2.0f * sqrtf(1.0f + f.z - r.x - u.y);
+        q.w = (r.y - u.x) / s;
+        q.x = (f.x + r.z) / s;
+        q.y = (f.y + u.z) / s;
+        q.z = 0.25f * s;
+    }
+    return q;
 }
 
 // =========================================================================
@@ -714,6 +742,8 @@ static void applyNoRecoilMemoryEdits(void *fpc) {
     }
 }
 
+static void applyWeaponAimbot(void *fpc);
+
 // 1. FirstPersonController.Update: RVA 0x40A1BF4
 void (*old_FirstPersonController_Update)(void *instance) = nullptr;
 void hook_FirstPersonController_Update(void *instance) {
@@ -731,6 +761,9 @@ void hook_FirstPersonController_Update(void *instance) {
         }
         if (g_noRecoil) {
             applyNoRecoilMemoryEdits(instance);
+        }
+        if (g_weaponAimbot) {
+            applyWeaponAimbot(instance);
         }
     }
     if (old_FirstPersonController_Update != nullptr) {
@@ -1193,6 +1226,251 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 }
 
 // =========================================================================
+// Pure Weapon Aimbot System (Weapon Aim Direction Manipulation)
+// - Focuses ONLY on weapon/muzzle aim orientation towards enemy targets
+// - Leaves camera / screen look angles 100% untouched and natural
+// - Preserves all original weapon stats and firing logic untouched
+// =========================================================================
+
+static void applyWeaponAimbot(void *fpc) {
+    if (!g_weaponAimbot || fpc == nullptr || !isPointerReadable(fpc)) return;
+
+    // 1. Get weapon transform and muzzle transform
+    if (g_localPlayerWeapon == nullptr || !isPointerReadable(g_localPlayerWeapon)) return;
+    void *weaponTransform = (get_transform != nullptr) ? get_transform(g_localPlayerWeapon) : nullptr;
+    if (weaponTransform == nullptr || !isPointerReadable(weaponTransform)) return;
+
+    void *muzzleTransform = nullptr;
+    if (g_localPlayerShooter != nullptr && isPointerReadable(g_localPlayerShooter) && get_MuzzleTransform != nullptr) {
+        muzzleTransform = get_MuzzleTransform(g_localPlayerShooter);
+    }
+
+    // 2. Resolve origin position of the weapon / muzzle
+    Vector3 weaponPos = {0.0f, 0.0f, 0.0f};
+    bool hasWeaponPos = false;
+    if (muzzleTransform != nullptr && isPointerReadable(muzzleTransform)) {
+        hasWeaponPos = safeGetPosition(muzzleTransform, &weaponPos);
+    }
+    if (!hasWeaponPos) {
+        hasWeaponPos = safeGetPosition(weaponTransform, &weaponPos);
+    }
+    if (!hasWeaponPos) return;
+
+    // 3. AimingControl at offset 0xF0 (Read ONLY for camera forward direction reference & internal target registration)
+    void *aimingControl = nullptr;
+    if (isPointerReadable((void *)((uintptr_t)fpc + 0xF0))) {
+        aimingControl = *(void **)((uintptr_t)fpc + 0xF0);
+    }
+
+    // Camera forward vector: only target enemies in front of player (~70 degree cone)
+    Vector3 camFwd = {0.0f, 0.0f, 1.0f};
+    if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
+        void *elevationNode = nullptr;
+        void *azimuthNode = nullptr;
+        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x30))) {
+            elevationNode = *(void **)((uintptr_t)aimingControl + 0x30);
+        }
+        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x28))) {
+            azimuthNode = *(void **)((uintptr_t)aimingControl + 0x28);
+        }
+        Quaternion camRot(0.0f, 0.0f, 0.0f, 1.0f);
+        if (elevationNode != nullptr && safeGetRotation(elevationNode, &camRot)) {
+            camFwd = Vector3(
+                2.0f * (camRot.x * camRot.z + camRot.w * camRot.y),
+                2.0f * (camRot.y * camRot.z - camRot.w * camRot.x),
+                1.0f - 2.0f * (camRot.x * camRot.x + camRot.y * camRot.y)
+            );
+        } else if (azimuthNode != nullptr && safeGetRotation(azimuthNode, &camRot)) {
+            camFwd = Vector3(
+                2.0f * (camRot.x * camRot.z + camRot.w * camRot.y),
+                2.0f * (camRot.y * camRot.z - camRot.w * camRot.x),
+                1.0f - 2.0f * (camRot.x * camRot.x + camRot.y * camRot.y)
+            );
+        }
+    }
+
+    // 4. Find best target among active enemies (players and bots)
+    float bestScore = 999999.0f;
+    Vector3 bestTargetPos = {0.0f, 0.0f, 0.0f};
+    void *bestTargetObj = nullptr;
+    bool foundTarget = false;
+
+    auto evaluateTargetCandidate = [&](const Vector3 &targetPos, void *tObj) {
+        float dx = targetPos.x - weaponPos.x;
+        float dy = targetPos.y - weaponPos.y;
+        float dz = targetPos.z - weaponPos.z;
+        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+        // Distance range: 1.0m to 150m (eliminates self-targeting)
+        if (dist < 1.0f || dist > 150.0f) return;
+
+        Vector3 dir = { dx / dist, dy / dist, dz / dist };
+
+        // Check if target is roughly in front (FOV cone ~70 degrees: dot > 0.34)
+        float dotFwd = dir.x * camFwd.x + dir.y * camFwd.y + dir.z * camFwd.z;
+        if (dotFwd <= 0.34f) return;
+
+        float clampedDot = std::max(-1.0f, std::min(1.0f, dotFwd));
+        float angleDeg = acosf(clampedDot) * 57.2957795f;
+
+        float score = angleDeg * 1.5f + dist * 0.5f;
+        if (score < bestScore) {
+            bestScore = score;
+            bestTargetPos = targetPos;
+            bestTargetObj = tObj;
+            foundTarget = true;
+        }
+    };
+
+    // A. Check NetworkPlayers
+    {
+        std::lock_guard<std::mutex> lock(g_entityMutex);
+        uint64_t now = getCurrentTimeMs();
+
+        void *localDoll = nullptr;
+        if (isPointerReadable((void *)((uintptr_t)fpc + 0xC8))) {
+            void *dollsMgr = *(void **)((uintptr_t)fpc + 0xC8);
+            if (dollsMgr != nullptr && isPointerReadable(dollsMgr) && isPointerReadable((void *)((uintptr_t)dollsMgr + 0x38))) {
+                localDoll = *(void **)((uintptr_t)dollsMgr + 0x38);
+            }
+        }
+
+        for (auto const &pair : g_networkPlayers) {
+            void *netPlayer = pair.first;
+            if (netPlayer == nullptr || !isPointerReadable(netPlayer)) continue;
+            if (now - pair.second > 3000) continue;
+
+            if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x90))) {
+                void *doll = *(void **)((uintptr_t)netPlayer + 0x90);
+                if (doll != nullptr && doll == localDoll) continue;
+            }
+
+            Vector3 targetPos = {0.0f, 0.0f, 0.0f};
+            bool hasPos = false;
+
+            // Head bone extraction (HumanBodyBones.Head = 10)
+            if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x78))) {
+                void *animator = *(void **)((uintptr_t)netPlayer + 0x78);
+                if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                    void *headBone = GetBoneTransform(animator, 10);
+                    if (headBone != nullptr && isPointerReadable(headBone)) {
+                        hasPos = safeGetPosition(headBone, &targetPos);
+                    }
+                }
+            }
+
+            if (!hasPos && get_transform != nullptr) {
+                void *npTransform = get_transform(netPlayer);
+                if (npTransform != nullptr) {
+                    if (safeGetPosition(npTransform, &targetPos)) {
+                        targetPos.y += 1.35f; // Center mass / upper chest
+                        hasPos = true;
+                    }
+                }
+            }
+
+            if (hasPos) {
+                evaluateTargetCandidate(targetPos, netPlayer);
+            }
+        }
+
+        // B. Check BotPlayers
+        for (auto const &pair : g_botPlayers) {
+            void *botPlayer = pair.first;
+            if (botPlayer == nullptr || !isPointerReadable(botPlayer)) continue;
+            if (now - pair.second > 3000) continue;
+
+            // Verify bot is alive (BotPlayerHealth at 0x30 -> currentHealth at 0x2C)
+            if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x30))) {
+                void *health = *(void **)((uintptr_t)botPlayer + 0x30);
+                if (health != nullptr && isPointerReadable(health) && isPointerReadable((void *)((uintptr_t)health + 0x2C))) {
+                    float curHp = *(float *)((uintptr_t)health + 0x2C);
+                    if (curHp <= 0.0f) continue;
+                }
+            }
+
+            Vector3 targetPos = {0.0f, 0.0f, 0.0f};
+            bool hasPos = false;
+
+            // Head bone via ThirdPersonController at 0x58
+            if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x58))) {
+                void *tpCtrl = *(void **)((uintptr_t)botPlayer + 0x58);
+                if (tpCtrl != nullptr && isPointerReadable(tpCtrl) && isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
+                    void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
+                    if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                        void *headBone = GetBoneTransform(animator, 10);
+                        if (headBone != nullptr && isPointerReadable(headBone)) {
+                            hasPos = safeGetPosition(headBone, &targetPos);
+                        }
+                    }
+                }
+            }
+
+            if (!hasPos && isPointerReadable((void *)((uintptr_t)botPlayer + 0x28))) {
+                void *botLook = *(void **)((uintptr_t)botPlayer + 0x28);
+                if (botLook != nullptr && isPointerReadable(botLook) && isPointerReadable((void *)((uintptr_t)botLook + 0x28))) {
+                    void *headBone = *(void **)((uintptr_t)botLook + 0x28);
+                    if (headBone != nullptr && isPointerReadable(headBone)) {
+                        hasPos = safeGetPosition(headBone, &targetPos);
+                    }
+                }
+            }
+
+            if (!hasPos && get_transform != nullptr) {
+                void *bpTransform = get_transform(botPlayer);
+                if (bpTransform != nullptr) {
+                    if (safeGetPosition(bpTransform, &targetPos)) {
+                        targetPos.y += 1.35f;
+                        hasPos = true;
+                    }
+                }
+            }
+
+            if (hasPos) {
+                evaluateTargetCandidate(targetPos, botPlayer);
+            }
+        }
+    }
+
+    // 5. Apply Weapon Aim Rotation (ONLY weapon, NEVER camera)
+    if (foundTarget) {
+        Vector3 aimDir = {
+            bestTargetPos.x - weaponPos.x,
+            bestTargetPos.y - weaponPos.y,
+            bestTargetPos.z - weaponPos.z
+        };
+        Quaternion aimRot = lookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
+
+        // Directly orient weapon & muzzle transform towards enemy
+        safeSetRotation(weaponTransform, aimRot);
+        if (muzzleTransform != nullptr && isPointerReadable(muzzleTransform)) {
+            safeSetRotation(muzzleTransform, aimRot);
+        }
+
+        // Inform AimingControl internal target so game bullet raycast aligns
+        if (aimingControl != nullptr && isPointerReadable(aimingControl) && bestTargetObj != nullptr) {
+            if (aim_SetTarget != nullptr) {
+                aim_SetTarget(aimingControl, bestTargetObj);
+            }
+            if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
+                *(void **)((uintptr_t)aimingControl + 0xC8) = bestTargetObj;
+            }
+            if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xD0))) {
+                *(bool *)((uintptr_t)aimingControl + 0xD0) = true;
+            }
+        }
+
+        static uint64_t s_lastAimLogMs = 0;
+        uint64_t now = getCurrentTimeMs();
+        if (now - s_lastAimLogMs > 8000) {
+            s_lastAimLogMs = now;
+            ModLog("[WEAPON_AIMBOT] Active -> Weapon Aimed at Target: (%.1f, %.1f, %.1f) | Score: %.1f (Camera Untouched)",
+                   bestTargetPos.x, bestTargetPos.y, bestTargetPos.z, bestScore);
+        }
+    }
+}
+
+// =========================================================================
 // Il2Cpp Lifecycle Hooks
 // =========================================================================
 
@@ -1201,7 +1479,7 @@ void (*old_NetworkPlayer_Update)(void *instance) = nullptr;
 void hook_NetworkPlayer_Update(void *instance) {
     if (instance != nullptr) {
         setLastAction("NetworkPlayer_Update");
-        if (g_autoCount) {
+        if (g_autoCount || g_weaponAimbot) {
             onNetworkPlayerUpdate(instance);
         }
         if (g_bigHead) {
@@ -1237,7 +1515,7 @@ void hook_NetworkPlayer_OnDestroy(void *instance) {
 // BotPlayer.Start: RVA 0x44493F4
 void (*old_BotPlayer_Start)(void *instance) = nullptr;
 void hook_BotPlayer_Start(void *instance) {
-    if (instance != nullptr && g_autoCount) {
+    if (instance != nullptr && (g_autoCount || g_weaponAimbot)) {
         setLastAction("BotPlayer_Start");
         onBotPlayerUpdate(instance);
     }
@@ -1251,7 +1529,7 @@ void (*old_BotPlayer_Update)(void *instance) = nullptr;
 void hook_BotPlayer_Update(void *instance) {
     if (instance != nullptr) {
         setLastAction("BotPlayer_Update");
-        if (g_autoCount) {
+        if (g_autoCount || g_weaponAimbot) {
             onBotPlayerUpdate(instance);
         }
         if (g_bigHead) {
@@ -1292,10 +1570,6 @@ void *hack_thread(void *) {
 
     initSafetyPipe();
     initUnityPointers();
-    initAutoHeadshotPatches();
-    if (g_autoHeadshot) {
-        applyAutoHeadshotPatch(true);
-    }
     initFastFireRateSystem();
     if (g_fastFireRate) {
         applyFastFireRateToggle(true);
@@ -1380,11 +1654,11 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Category_🎮 FITUR GTA SA FPS"),
         OBFUSCATE("Toggle_Status Panel Overlay"), // featNum 0
         OBFUSCATE("Toggle_Big Head"),             // featNum 1
-        OBFUSCATE("Toggle_Auto Headshot"),        // featNum 2
-        OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 3
-        OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 4
+        OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 2
+        OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
+        OBFUSCATE("Toggle_Aimbot (Weapon Aim)"),         // featNum 4
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aimbot (Weapon Aim):</b> Mengarahkan bidikan senjata secara presisi ke target musuh tanpa mengubah sudut pandang/kamera player ataupun memodifikasi atribut senjata asli.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1436,23 +1710,9 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 2: { // Toggle_Auto Headshot (Memory Edit)
-            g_autoHeadshot = boolean;
-            ModLog("[TOGGLE] Feature #2 [Auto Headshot (Memory Edit)] set to: %s", stateStr);
-            setLastAction(boolean ? "Toggle Auto Headshot: ON" : "Toggle Auto Headshot: OFF");
-            applyAutoHeadshotPatch(boolean);
-
-            if (boolean) {
-                Toast(env, ctx, OBFUSCATE("Auto Headshot: ON (100% Headshot Memory Edit)"), ToastLength::LENGTH_SHORT);
-            } else {
-                Toast(env, ctx, OBFUSCATE("Auto Headshot: OFF (Normal)"), ToastLength::LENGTH_SHORT);
-            }
-            break;
-        }
-
-        case 3: { // Toggle_Fast FireRate (Client-Side)
+        case 2: { // Toggle_Fast FireRate (Client-Side)
             g_fastFireRate = boolean;
-            ModLog("[TOGGLE] Feature #3 [Fast FireRate (Client-Side)] set to: %s", stateStr);
+            ModLog("[TOGGLE] Feature #2 [Fast FireRate (Client-Side)] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle Fast FireRate: ON" : "Toggle Fast FireRate: OFF");
             applyFastFireRateToggle(boolean);
 
@@ -1464,15 +1724,28 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 4: { // Toggle_No Recoil (Client-Side)
+        case 3: { // Toggle_No Recoil (Client-Side)
             g_noRecoil = boolean;
-            ModLog("[TOGGLE] Feature #4 [No Recoil (Client-Side)] set to: %s", stateStr);
+            ModLog("[TOGGLE] Feature #3 [No Recoil (Client-Side)] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle No Recoil: ON" : "Toggle No Recoil: OFF");
 
             if (boolean) {
                 Toast(env, ctx, OBFUSCATE("No Recoil: ON (Senjata Tanpa Recoil - Client Side)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("No Recoil: OFF (Normal)"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
+
+        case 4: { // Toggle_Aimbot (Weapon Aim)
+            g_weaponAimbot = boolean;
+            ModLog("[TOGGLE] Feature #4 [Aimbot (Weapon Aim)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Weapon Aimbot: ON" : "Toggle Weapon Aimbot: OFF");
+
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("Aimbot (Weapon Aim): ON"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("Aimbot (Weapon Aim): OFF"), ToastLength::LENGTH_SHORT);
             }
             break;
         }
