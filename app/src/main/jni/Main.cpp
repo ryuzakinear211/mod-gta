@@ -160,6 +160,7 @@ static bool g_showStatusPanel = false;
 static bool g_autoCount = false;
 static bool g_bigHead = false;
 static bool g_autoHeadshot = false;
+static bool g_fastFireRate = false;
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -196,10 +197,10 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, AutoHeadshot=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, AutoHeadshot=%d, FastFireRate=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
-        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_autoHeadshot
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_autoHeadshot, (int)g_fastFireRate
     );
 
 #if defined(__aarch64__)
@@ -499,6 +500,84 @@ static void applyAutoHeadshotPatch(bool enable) {
     }
     ModLog("[HEADSHOT] Auto Headshot %s: %d/%zu patches successfully applied/restored.",
            enable ? "ENABLED (Memory Edit)" : "DISABLED (Restored)", successCount, NUM_HEADSHOT_PATCHES);
+}
+
+// =========================================================================
+// Fast FireRate System (Memory Patches for Instant Weapon Firerate & DPS)
+// =========================================================================
+
+static MemoryPatchItem g_fastFireRatePatches[] = {
+    // 1. WeaponShooterBehaviour.CanShoot (0x405BBF0) -> mov w0, #1; ret (Cooldown timer bypassed)
+    {"WeaponShooterBehaviour.CanShoot", 0x405BBF0, 8, "20008052C0035FD6", {0}, false},
+
+    // 2. FirstPersonController.ShootCheck1 (0x408E8E4) -> NOP (Single/tap shoot delay check bypassed)
+    {"FirstPersonController.ShootCheck1", 0x408E8E4, 4, "1F2003D5", {0}, false},
+
+    // 3. FirstPersonController.ShootCheck2 (0x40A0674) -> NOP (Tap fire delay check 2 bypassed)
+    {"FirstPersonController.ShootCheck2", 0x40A0674, 4, "1F2003D5", {0}, false},
+
+    // 4. FirstPersonController.ShootCheck3 (0x40A1BAC) -> NOP (Auto-fire hold delay check bypassed)
+    {"FirstPersonController.ShootCheck3", 0x40A1BAC, 4, "1F2003D5", {0}, false},
+
+    // 5. FirstPersonController.AutoCoroutine (0x40B8E58) -> fmov s0, wzr (Zero auto-fire coroutine delay)
+    {"FirstPersonController.AutoCoroutine", 0x40B8E58, 4, "E003271E", {0}, false},
+
+    // 6. FirstPersonController.BurstCoroutine (0x40B5D84) -> fmov s0, wzr (Zero burst coroutine delay)
+    {"FirstPersonController.BurstCoroutine", 0x40B5D84, 4, "E003271E", {0}, false},
+
+    // 7. WeaponTemplate.ShotIntervalCalc (0x4A44A6C) -> fmov s0, wzr (Zero weapon shot interval template)
+    {"WeaponTemplate.ShotIntervalCalc", 0x4A44A6C, 4, "E003271E", {0}, false},
+};
+static const size_t NUM_FIRERATE_PATCHES = sizeof(g_fastFireRatePatches) / sizeof(g_fastFireRatePatches[0]);
+
+static void initFastFireRatePatches() {
+    setLastAction("initFastFireRatePatches");
+    size_t initCount = 0;
+    for (size_t i = 0; i < NUM_FIRERATE_PATCHES; i++) {
+        MemoryPatchItem &item = g_fastFireRatePatches[i];
+        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
+        if (absAddr != 0) {
+            KittyMemory::memRead(item.origBytes, (const void *)absAddr, item.size);
+            item.initialized = true;
+            initCount++;
+        } else {
+            ModLog("[FIRERATE] Warning: Failed to get address for %s (RVA 0x%lx)", item.name, item.rva);
+        }
+    }
+    ModLog("[FIRERATE] Fast FireRate memory patches initialized (%zu/%zu targets ready)", initCount, NUM_FIRERATE_PATCHES);
+}
+
+static void applyFastFireRatePatch(bool enable) {
+    g_fastFireRate = enable;
+    setLastAction(enable ? "applyFastFireRatePatch(ON)" : "applyFastFireRatePatch(OFF)");
+    int successCount = 0;
+    for (size_t i = 0; i < NUM_FIRERATE_PATCHES; i++) {
+        MemoryPatchItem &item = g_fastFireRatePatches[i];
+        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
+        if (absAddr == 0) continue;
+
+        if (enable) {
+            uint8_t patchBuf[16];
+            KittyUtils::fromHex(item.patchHex, patchBuf);
+            if (KittyMemory::memWrite((void *)absAddr, patchBuf, item.size) == KittyMemory::SUCCESS) {
+                __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
+                successCount++;
+            } else {
+                ModLog("[FIRERATE] Error: Failed to write patch for %s at 0x%lx", item.name, absAddr);
+            }
+        } else {
+            if (item.initialized) {
+                if (KittyMemory::memWrite((void *)absAddr, item.origBytes, item.size) == KittyMemory::SUCCESS) {
+                    __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
+                    successCount++;
+                } else {
+                    ModLog("[FIRERATE] Error: Failed to restore patch for %s at 0x%lx", item.name, absAddr);
+                }
+            }
+        }
+    }
+    ModLog("[FIRERATE] Fast FireRate %s: %d/%zu patches successfully applied/restored.",
+           enable ? "ENABLED (Rapid Fire)" : "DISABLED (Normal)", successCount, NUM_FIRERATE_PATCHES);
 }
 
 // =========================================================================
@@ -877,6 +956,10 @@ void *hack_thread(void *) {
     if (g_autoHeadshot) {
         applyAutoHeadshotPatch(true);
     }
+    initFastFireRatePatches();
+    if (g_fastFireRate) {
+        applyFastFireRatePatch(true);
+    }
 
 #if defined(__aarch64__)
     ModLog("[HOOK] Installing hooks on libil2cpp.so (arm64-v8a)...");
@@ -919,8 +1002,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_Status Panel Overlay"), // featNum 0
         OBFUSCATE("Toggle_Big Head"),             // featNum 1
         OBFUSCATE("Toggle_Auto Headshot"),        // featNum 2
+        OBFUSCATE("Toggle_Fast FireRate"),        // featNum 3
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Fast FireRate:</b> Tembakan senjata super cepat tanpa cooldown / delay (Damage DPS tinggi).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -982,6 +1066,20 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
                 Toast(env, ctx, OBFUSCATE("Auto Headshot: ON (100% Headshot Memory Edit)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Auto Headshot: OFF (Normal)"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
+
+        case 3: { // Toggle_Fast FireRate
+            g_fastFireRate = boolean;
+            ModLog("[TOGGLE] Feature #3 [Fast FireRate] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Fast FireRate: ON" : "Toggle Fast FireRate: OFF");
+            applyFastFireRatePatch(boolean);
+
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("Fast FireRate: ON (Tembakan Super Cepat)"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("Fast FireRate: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             }
             break;
         }
