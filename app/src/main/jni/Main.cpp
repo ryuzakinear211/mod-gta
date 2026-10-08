@@ -518,102 +518,331 @@ static void applyAutoHeadshotPatch(bool enable) {
 }
 
 // =========================================================================
-// Fast FireRate System (Memory Patches for Instant Weapon Firerate & DPS)
+// Fast FireRate System (Dynamic Player Weapon Memory & Client-Side Hooks)
+// Target Methods & RVAs mapped from dump.cs:
+// - FirstPersonController.Update (0x40A1BF4): Local player lifecycle & memory tracker
+// - FirstPersonController.GetCurrentWeapon (0x408FC44): Resolves equipped weapon
+// - FirstPersonController.GetShooterBehaviour (0x409188C): Resolves shooter instance
+// - FirstPersonController.GetShotInterval1 (0x40906CC): Primary shot interval (ObscuredFloat)
+// - FirstPersonController.GetShotInterval2 (0x409F2F8): Secondary shot interval (ObscuredFloat)
+// - ShootCoroutine.MoveNext (0x40B93A0): Immediate fire coroutine loop
+// - WeaponShooterBehaviour.CanShoot (0x405BBF0): Cooldown availability check
+// - WeaponShooterBehaviour.SetCooldown (0x405D084): Cooldown timer setter
+// - WeaponShooterBehaviour.get_ShootAction (0x405C8DC): Auto fire action getter
+// - WeaponShooterBehaviour.SetClipAmmo (0x405A39C): Ammo replenish
+// - WeaponParameters.GetFireRate (0x49D0E90): Weapon RPM / firerate getter
+// - WeaponProfile.GetFireRate (0x4A451C0): Weapon profile firerate getter
+// - ObscuredFloat.op_Implicit (0x3D6E4DC): Anti-Cheat Toolkit genuine encrypted float
 // =========================================================================
 
-static MemoryPatchItem g_fastFireRatePatches[] = {
-    // 1. WeaponShooterBehaviour.CanShoot (0x405BBF0) -> mov w0, #1; ret (Cooldown timer bypassed)
-    {"WeaponShooterBehaviour.CanShoot", 0x405BBF0, 8, "20008052C0035FD6", {0}, false},
-
-    // 2. WeaponShooterBehaviour.SetCooldown (0x405D084) -> ret (Zero cooldown timer)
-    {"WeaponShooterBehaviour.SetCooldown", 0x405D084, 4, "C0035FD6", {0}, false},
-
-    // 3. WeaponShooterBehaviour.get_ShootAction (0x405C8DC) -> mov w0, #0; ret (Force full auto for all weapons)
-    {"WeaponShooterBehaviour.get_ShootAction", 0x405C8DC, 8, "00008052C0035FD6", {0}, false},
-
-    // 4. FirstPersonController.GetShotInterval (0x4090720) -> b #0x4090800 (Return 0.0f shot interval)
-    {"FirstPersonController.GetShotInterval", 0x4090720, 4, "38000014", {0}, false},
-
-    // 5. FirstPersonController.ShootCheck1 (0x408E8E4) -> NOP (Update shot interval comparison bypassed)
-    {"FirstPersonController.ShootCheck1", 0x408E8E4, 4, "1F2003D5", {0}, false},
-
-    // 6. FirstPersonController.CanShootNowCheck (0x408E93C) -> NOP (Update shoot trigger check bypassed)
-    {"FirstPersonController.CanShootNowCheck", 0x408E93C, 4, "1F2003D5", {0}, false},
-
-    // 7. FirstPersonController.ShootCheck2 (0x40A0674) -> NOP (Tap fire shot interval check bypassed)
-    {"FirstPersonController.ShootCheck2", 0x40A0674, 4, "1F2003D5", {0}, false},
-
-    // 8. FirstPersonController.ShootCheck3 (0x40A1BAC) -> NOP (Auto-fire shot interval check bypassed)
-    {"FirstPersonController.ShootCheck3", 0x40A1BAC, 4, "1F2003D5", {0}, false},
-
-    // 9. FirstPersonController.LaunchShootCoroutineCheck (0x4090B2C) -> b #0x4090b3c (Never block shoot launcher)
-    {"FirstPersonController.LaunchShootCoroutineCheck", 0x4090B2C, 4, "04000014", {0}, false},
-
-    // 10. ShootCoroutine.MoveNext_ImmediateFire (0x40B95B8) -> NOP (Instant fire without WaitForSeconds delay)
-    {"ShootCoroutine.MoveNext_ImmediateFire", 0x40B95B8, 4, "1F2003D5", {0}, false},
-
-    // 11. ShootCoroutine.MoveNext_ZeroDelay (0x40B9570) -> str wzr, [x20, #0x2c] (Zero coroutine wait variable)
-    {"ShootCoroutine.MoveNext_ZeroDelay", 0x40B9570, 4, "9F2E00B9", {0}, false},
-
-    // 12. FirstPersonController.ActionThrottleCheck (0x408F328) -> NOP (Zero action throttle)
-    {"FirstPersonController.ActionThrottleCheck", 0x408F328, 4, "1F2003D5", {0}, false},
-
-    // 13. WeaponShooterBehaviour.ShootAmmoDec1 (0x405AAE4) -> NOP (Infinite clip ammo during rapid fire)
-    {"WeaponShooterBehaviour.ShootAmmoDec1", 0x405AAE4, 4, "1F2003D5", {0}, false},
-
-    // 14. WeaponShooterBehaviour.ShootAmmoDec2 (0x405AB64) -> NOP (Infinite total ammo during rapid fire)
-    {"WeaponShooterBehaviour.ShootAmmoDec2", 0x405AB64, 4, "1F2003D5", {0}, false},
-};
-static const size_t NUM_FIRERATE_PATCHES = sizeof(g_fastFireRatePatches) / sizeof(g_fastFireRatePatches[0]);
-
-static void initFastFireRatePatches() {
-    setLastAction("initFastFireRatePatches");
-    size_t initCount = 0;
-    for (size_t i = 0; i < NUM_FIRERATE_PATCHES; i++) {
-        MemoryPatchItem &item = g_fastFireRatePatches[i];
-        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
-        if (absAddr != 0) {
-            KittyMemory::memRead(item.origBytes, (const void *)absAddr, item.size);
-            item.initialized = true;
-            initCount++;
-        } else {
-            ModLog("[FIRERATE] Warning: Failed to get address for %s (RVA 0x%lx)", item.name, item.rva);
-        }
-    }
-    ModLog("[FIRERATE] Fast FireRate memory patches initialized (%zu/%zu targets ready)", initCount, NUM_FIRERATE_PATCHES);
+static uint64_t getCurrentTimeMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
 }
 
-static void applyFastFireRatePatch(bool enable) {
-    g_fastFireRate = enable;
-    setLastAction(enable ? "applyFastFireRatePatch(ON)" : "applyFastFireRatePatch(OFF)");
-    int successCount = 0;
-    for (size_t i = 0; i < NUM_FIRERATE_PATCHES; i++) {
-        MemoryPatchItem &item = g_fastFireRatePatches[i];
-        uintptr_t absAddr = getAbsoluteAddress(targetLibName, item.rva);
-        if (absAddr == 0) continue;
+struct ObscuredFloat {
+    int hash;
+    int hiddenValue;
+    int currentCryptoKey;
+    float fakeValue;
+    uint32_t hiddenValueOldByte4;
+};
 
-        if (enable) {
-            uint8_t patchBuf[16];
-            KittyUtils::fromHex(item.patchHex, patchBuf);
-            if (KittyMemory::memWrite((void *)absAddr, patchBuf, item.size) == KittyMemory::SUCCESS) {
-                __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
-                successCount++;
-            } else {
-                ModLog("[FIRERATE] Error: Failed to write patch for %s at 0x%lx", item.name, absAddr);
-            }
-        } else {
-            if (item.initialized) {
-                if (KittyMemory::memWrite((void *)absAddr, item.origBytes, item.size) == KittyMemory::SUCCESS) {
-                    __builtin___clear_cache((char *)absAddr, (char *)absAddr + item.size);
-                    successCount++;
-                } else {
-                    ModLog("[FIRERATE] Error: Failed to restore patch for %s at 0x%lx", item.name, absAddr);
+// Dynamic Player Weapon Memory Addresses (Client Only)
+static void *g_localPlayerFPC = nullptr;
+static void *g_localPlayerWeapon = nullptr;
+static void *g_localPlayerShooter = nullptr;
+static void *g_localWeaponProfile = nullptr;
+static void *g_localWeaponParams = nullptr;
+static uint64_t g_lastWeaponLogMs = 0;
+static int g_origShootAction = -1;
+static bool g_hasOrigShootAction = false;
+
+// Function pointers to game methods from dump.cs
+static void* (*get_CurrentWeapon)(void *fpc) = nullptr;                       // 0x408FC44
+static void* (*get_ShooterBehaviour)(void *fpc, void *item) = nullptr;        // 0x409188C
+static void (*set_ClipAmmo)(void *shooter, int ammo) = nullptr;               // 0x405A39C
+static ObscuredFloat (*actk_op_Implicit_Float)(float val) = nullptr;          // 0x3D6E4DC
+
+static bool isClientWeapon(void *instance) {
+    if (instance == nullptr) return false;
+    if (instance == g_localPlayerShooter || instance == g_localPlayerWeapon) return true;
+    if (g_localPlayerFPC != nullptr && isPointerReadable(g_localPlayerFPC)) {
+        if (isPointerReadable((void *)((uintptr_t)g_localPlayerFPC + 0x50))) {
+            void *equipped = *(void **)((uintptr_t)g_localPlayerFPC + 0x50);
+            if (equipped == instance) return true;
+        }
+    }
+    return false;
+}
+
+static bool isClientWeaponProfile(void *instance) {
+    if (instance == nullptr) return false;
+    return (instance == g_localWeaponProfile);
+}
+
+static bool isClientWeaponParams(void *instance) {
+    if (instance == nullptr) return false;
+    return (instance == g_localWeaponParams);
+}
+
+static void updateLocalPlayerWeapon(void *fpc) {
+    if (fpc == nullptr || !isPointerReadable(fpc)) return;
+    g_localPlayerFPC = fpc;
+
+    void *currentWeapon = nullptr;
+    if (get_CurrentWeapon != nullptr) {
+        currentWeapon = get_CurrentWeapon(fpc);
+    }
+    if (currentWeapon == nullptr && isPointerReadable((void *)((uintptr_t)fpc + 0x50))) {
+        currentWeapon = *(void **)((uintptr_t)fpc + 0x50);
+    }
+
+    if (currentWeapon != nullptr && isPointerReadable(currentWeapon)) {
+        g_localPlayerWeapon = currentWeapon;
+
+        void *shooter = nullptr;
+        if (get_ShooterBehaviour != nullptr) {
+            shooter = get_ShooterBehaviour(fpc, currentWeapon);
+        }
+        if (shooter == nullptr) {
+            shooter = currentWeapon; // WeaponShooterBehaviour derives from ItemWeaponBehaviour
+        }
+        if (shooter != nullptr && isPointerReadable(shooter)) {
+            g_localPlayerShooter = shooter;
+        }
+
+        // WeaponProfile at offset 0x80 of ItemBehaviour
+        if (isPointerReadable((void *)((uintptr_t)currentWeapon + 0x80))) {
+            g_localWeaponProfile = *(void **)((uintptr_t)currentWeapon + 0x80);
+        }
+        // WeaponParameters at offset 0x88 of ItemBehaviour
+        if (isPointerReadable((void *)((uintptr_t)currentWeapon + 0x88))) {
+            g_localWeaponParams = *(void **)((uintptr_t)currentWeapon + 0x88);
+        }
+    }
+
+    uint64_t now = getCurrentTimeMs();
+    if (now - g_lastWeaponLogMs > 8000 && g_localPlayerShooter != nullptr) {
+        g_lastWeaponLogMs = now;
+        ModLog("[WEAPON] Client Weapon Memory Found -> FPC: %p | Weapon: %p | Shooter: %p | Profile: %p | Params: %p",
+               g_localPlayerFPC, g_localPlayerWeapon, g_localPlayerShooter, g_localWeaponProfile, g_localWeaponParams);
+    }
+}
+
+static void applyPlayerWeaponMemoryEdits() {
+    if (g_localPlayerShooter == nullptr || !isPointerReadable(g_localPlayerShooter)) return;
+
+    // 1. Force Full Auto (_shootAction at offset 0x150: AUTO = 0, BOLT_ACTION = 1)
+    if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x150))) {
+        int *shootActionPtr = (int *)((uintptr_t)g_localPlayerShooter + 0x150);
+        if (!g_hasOrigShootAction) {
+            g_origShootAction = *shootActionPtr;
+            g_hasOrigShootAction = true;
+        }
+        *shootActionPtr = 0; // AUTO
+    }
+
+    // 2. Zero out internal cooldown ObscuredFloat fields at offset 0x18C & 0x1B0
+    if (actk_op_Implicit_Float != nullptr) {
+        ObscuredFloat zeroVal = actk_op_Implicit_Float(0.0f);
+        if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x18C))) {
+            memcpy((void *)((uintptr_t)g_localPlayerShooter + 0x18C), &zeroVal, sizeof(ObscuredFloat));
+        }
+        if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x1B0))) {
+            memcpy((void *)((uintptr_t)g_localPlayerShooter + 0x1B0), &zeroVal, sizeof(ObscuredFloat));
+        }
+    }
+
+    // 3. Keep clip ammo filled during high-speed firing
+    if (set_ClipAmmo != nullptr) {
+        set_ClipAmmo(g_localPlayerShooter, 999);
+    }
+}
+
+static void resetFpcShotTimers(void *fpc) {
+    if (fpc == nullptr || !isPointerReadable(fpc)) return;
+    // Reset FPC shot delay timers at 0x88, 0xB0, 0x224
+    if (isPointerReadable((void *)((uintptr_t)fpc + 0x88))) {
+        *(float *)((uintptr_t)fpc + 0x88) = 0.0f;
+    }
+    if (isPointerReadable((void *)((uintptr_t)fpc + 0xB0))) {
+        *(float *)((uintptr_t)fpc + 0xB0) = 0.0f;
+    }
+    if (isPointerReadable((void *)((uintptr_t)fpc + 0x224))) {
+        *(float *)((uintptr_t)fpc + 0x224) = 0.0f;
+    }
+}
+
+// =========================================================================
+// Client-Side Fast FireRate Hooks (Strictly Client-Only)
+// =========================================================================
+
+// 1. FirstPersonController.Update: RVA 0x40A1BF4
+void (*old_FirstPersonController_Update)(void *instance) = nullptr;
+void hook_FirstPersonController_Update(void *instance) {
+    if (instance != nullptr) {
+        setLastAction("FirstPersonController_Update");
+        updateLocalPlayerWeapon(instance);
+        if (g_fastFireRate) {
+            applyPlayerWeaponMemoryEdits();
+            resetFpcShotTimers(instance);
+        }
+    }
+    if (old_FirstPersonController_Update != nullptr) {
+        old_FirstPersonController_Update(instance);
+    }
+}
+
+// 2. WeaponShooterBehaviour.CanShoot: RVA 0x405BBF0
+bool (*old_WeaponShooterBehaviour_CanShoot)(void *instance) = nullptr;
+bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
+    if (g_fastFireRate && isClientWeapon(instance)) {
+        return true; // Local weapon can always shoot instantly
+    }
+    if (old_WeaponShooterBehaviour_CanShoot != nullptr) {
+        return old_WeaponShooterBehaviour_CanShoot(instance);
+    }
+    return true;
+}
+
+// 3. WeaponShooterBehaviour.SetCooldown: RVA 0x405D084
+void (*old_WeaponShooterBehaviour_SetCooldown)(void *instance) = nullptr;
+void hook_WeaponShooterBehaviour_SetCooldown(void *instance) {
+    if (g_fastFireRate && isClientWeapon(instance)) {
+        return; // Zero cooldown for local weapon
+    }
+    if (old_WeaponShooterBehaviour_SetCooldown != nullptr) {
+        old_WeaponShooterBehaviour_SetCooldown(instance);
+    }
+}
+
+// 4. WeaponShooterBehaviour.get_ShootAction: RVA 0x405C8DC
+int (*old_WeaponShooterBehaviour_get_ShootAction)(void *instance) = nullptr;
+int hook_WeaponShooterBehaviour_get_ShootAction(void *instance) {
+    if (g_fastFireRate && isClientWeapon(instance)) {
+        return 0; // Force AUTO for local weapon
+    }
+    if (old_WeaponShooterBehaviour_get_ShootAction != nullptr) {
+        return old_WeaponShooterBehaviour_get_ShootAction(instance);
+    }
+    return 0;
+}
+
+// 5. FirstPersonController.GetShotInterval1: RVA 0x40906CC
+ObscuredFloat (*old_FPC_GetShotInterval1)(void *fpc, void *weapon) = nullptr;
+ObscuredFloat hook_FPC_GetShotInterval1(void *fpc, void *weapon) {
+    if (g_fastFireRate && (fpc == g_localPlayerFPC || isClientWeapon(weapon))) {
+        if (actk_op_Implicit_Float != nullptr) {
+            return actk_op_Implicit_Float(0.001f); // 0.001s shot interval
+        }
+    }
+    if (old_FPC_GetShotInterval1 != nullptr) {
+        return old_FPC_GetShotInterval1(fpc, weapon);
+    }
+    if (actk_op_Implicit_Float != nullptr) {
+        return actk_op_Implicit_Float(0.1f);
+    }
+    ObscuredFloat defVal = {0};
+    return defVal;
+}
+
+// 6. FirstPersonController.GetShotInterval2: RVA 0x409F2F8
+ObscuredFloat (*old_FPC_GetShotInterval2)(void *fpc, void *weapon) = nullptr;
+ObscuredFloat hook_FPC_GetShotInterval2(void *fpc, void *weapon) {
+    if (g_fastFireRate && (fpc == g_localPlayerFPC || isClientWeapon(weapon))) {
+        if (actk_op_Implicit_Float != nullptr) {
+            return actk_op_Implicit_Float(0.001f);
+        }
+    }
+    if (old_FPC_GetShotInterval2 != nullptr) {
+        return old_FPC_GetShotInterval2(fpc, weapon);
+    }
+    if (actk_op_Implicit_Float != nullptr) {
+        return actk_op_Implicit_Float(0.1f);
+    }
+    ObscuredFloat defVal = {0};
+    return defVal;
+}
+
+// 7. ShootCoroutine.MoveNext: RVA 0x40B93A0
+bool (*old_ShootCoroutine_MoveNext)(void *instance) = nullptr;
+bool hook_ShootCoroutine_MoveNext(void *instance) {
+    if (g_fastFireRate && instance != nullptr && isPointerReadable(instance)) {
+        if (isPointerReadable((void *)((uintptr_t)instance + 0x20))) {
+            void *fpc = *(void **)((uintptr_t)instance + 0x20);
+            if (fpc == g_localPlayerFPC && fpc != nullptr) {
+                // Immediate fire without WaitForSeconds delay
+                if (isPointerReadable((void *)((uintptr_t)instance + 0x28))) {
+                    *(bool *)((uintptr_t)instance + 0x28) = true;
+                }
+                if (isPointerReadable((void *)((uintptr_t)instance + 0x2C))) {
+                    *(float *)((uintptr_t)instance + 0x2C) = 100.0f;
                 }
             }
         }
     }
-    ModLog("[FIRERATE] Fast FireRate %s: %d/%zu patches successfully applied/restored.",
-           enable ? "ENABLED (Rapid Fire)" : "DISABLED (Normal)", successCount, NUM_FIRERATE_PATCHES);
+    if (old_ShootCoroutine_MoveNext != nullptr) {
+        return old_ShootCoroutine_MoveNext(instance);
+    }
+    return false;
+}
+
+// 8. WeaponParameters.GetFireRate: RVA 0x49D0E90
+float (*old_WeaponParams_GetFireRate)(void *instance) = nullptr;
+float hook_WeaponParams_GetFireRate(void *instance) {
+    if (g_fastFireRate && isClientWeaponParams(instance)) {
+        return 3000.0f; // High speed firerate (Client only)
+    }
+    if (old_WeaponParams_GetFireRate != nullptr) {
+        return old_WeaponParams_GetFireRate(instance);
+    }
+    return 600.0f;
+}
+
+// 9. WeaponProfile.GetFireRate: RVA 0x4A451C0
+float (*old_WeaponProfile_GetFireRate)(void *instance) = nullptr;
+float hook_WeaponProfile_GetFireRate(void *instance) {
+    if (g_fastFireRate && isClientWeaponProfile(instance)) {
+        return 3000.0f; // High speed firerate (Client only)
+    }
+    if (old_WeaponProfile_GetFireRate != nullptr) {
+        return old_WeaponProfile_GetFireRate(instance);
+    }
+    return 600.0f;
+}
+
+static void initFastFireRateSystem() {
+    setLastAction("initFastFireRateSystem");
+    get_CurrentWeapon = (void* (*)(void *)) getAbsoluteAddress(targetLibName, 0x408FC44);
+    get_ShooterBehaviour = (void* (*)(void *, void *)) getAbsoluteAddress(targetLibName, 0x409188C);
+    set_ClipAmmo = (void (*)(void *, int)) getAbsoluteAddress(targetLibName, 0x405A39C);
+    actk_op_Implicit_Float = (ObscuredFloat (*)(float)) getAbsoluteAddress(targetLibName, 0x3D6E4DC);
+
+    ModLog("[FIRERATE] Functions Resolved: GetCurrentWeapon=%p, GetShooterBehaviour=%p, SetClipAmmo=%p, ACTk_OpImplicit=%p",
+           get_CurrentWeapon, get_ShooterBehaviour, set_ClipAmmo, actk_op_Implicit_Float);
+}
+
+static void applyFastFireRateToggle(bool enable) {
+    g_fastFireRate = enable;
+    setLastAction(enable ? "applyFastFireRateToggle(ON)" : "applyFastFireRateToggle(OFF)");
+
+    if (enable) {
+        applyPlayerWeaponMemoryEdits();
+        if (g_localPlayerFPC != nullptr) {
+            resetFpcShotTimers(g_localPlayerFPC);
+        }
+        ModLog("[FIRERATE] Fast FireRate ENABLED (Client-Side Weapon Firerate Active, Shooter=%p)", g_localPlayerShooter);
+    } else {
+        // Restore original shootAction if known
+        if (g_hasOrigShootAction && g_localPlayerShooter != nullptr && isPointerReadable(g_localPlayerShooter)) {
+            if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x150))) {
+                *(int *)((uintptr_t)g_localPlayerShooter + 0x150) = g_origShootAction;
+            }
+        }
+        ModLog("[FIRERATE] Fast FireRate DISABLED (Restored Normal Firerate)");
+    }
 }
 
 // =========================================================================
@@ -630,12 +859,6 @@ static int g_bigHeadResetFrames = 0;
 
 static const Vector3 BIG_HEAD_SCALE(3.0f, 3.0f, 3.0f);
 static const Vector3 NORMAL_HEAD_SCALE(1.0f, 1.0f, 1.0f);
-
-static uint64_t getCurrentTimeMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()
-    ).count();
-}
 
 static void onNetworkPlayerUpdate(void *instance) {
     if (instance == nullptr) return;
@@ -992,13 +1215,41 @@ void *hack_thread(void *) {
     if (g_autoHeadshot) {
         applyAutoHeadshotPatch(true);
     }
-    initFastFireRatePatches();
+    initFastFireRateSystem();
     if (g_fastFireRate) {
-        applyFastFireRatePatch(true);
+        applyFastFireRateToggle(true);
     }
 
 #if defined(__aarch64__)
     ModLog("[HOOK] Installing hooks on libil2cpp.so (arm64-v8a)...");
+
+    // Client-Side Fast FireRate & Weapon Hooks (Client Only)
+    HOOK("0x40A1BF4", hook_FirstPersonController_Update, old_FirstPersonController_Update);
+    ModLog("[HOOK] FirstPersonController.Update (0x40A1BF4): %s", old_FirstPersonController_Update ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x405BBF0", hook_WeaponShooterBehaviour_CanShoot, old_WeaponShooterBehaviour_CanShoot);
+    ModLog("[HOOK] WeaponShooterBehaviour.CanShoot (0x405BBF0): %s", old_WeaponShooterBehaviour_CanShoot ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x405D084", hook_WeaponShooterBehaviour_SetCooldown, old_WeaponShooterBehaviour_SetCooldown);
+    ModLog("[HOOK] WeaponShooterBehaviour.SetCooldown (0x405D084): %s", old_WeaponShooterBehaviour_SetCooldown ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x405C8DC", hook_WeaponShooterBehaviour_get_ShootAction, old_WeaponShooterBehaviour_get_ShootAction);
+    ModLog("[HOOK] WeaponShooterBehaviour.get_ShootAction (0x405C8DC): %s", old_WeaponShooterBehaviour_get_ShootAction ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x40906CC", hook_FPC_GetShotInterval1, old_FPC_GetShotInterval1);
+    ModLog("[HOOK] FirstPersonController.GetShotInterval1 (0x40906CC): %s", old_FPC_GetShotInterval1 ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x409F2F8", hook_FPC_GetShotInterval2, old_FPC_GetShotInterval2);
+    ModLog("[HOOK] FirstPersonController.GetShotInterval2 (0x409F2F8): %s", old_FPC_GetShotInterval2 ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x40B93A0", hook_ShootCoroutine_MoveNext, old_ShootCoroutine_MoveNext);
+    ModLog("[HOOK] ShootCoroutine.MoveNext (0x40B93A0): %s", old_ShootCoroutine_MoveNext ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x49D0E90", hook_WeaponParams_GetFireRate, old_WeaponParams_GetFireRate);
+    ModLog("[HOOK] WeaponParameters.GetFireRate (0x49D0E90): %s", old_WeaponParams_GetFireRate ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4A451C0", hook_WeaponProfile_GetFireRate, old_WeaponProfile_GetFireRate);
+    ModLog("[HOOK] WeaponProfile.GetFireRate (0x4A451C0): %s", old_WeaponProfile_GetFireRate ? "SUCCESS" : "FAILED/HOOKED");
 
     // NetworkPlayer hooks
     HOOK("0x42CC8C8", hook_NetworkPlayer_Update, old_NetworkPlayer_Update);
@@ -1038,9 +1289,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_Status Panel Overlay"), // featNum 0
         OBFUSCATE("Toggle_Big Head"),             // featNum 1
         OBFUSCATE("Toggle_Auto Headshot"),        // featNum 2
-        OBFUSCATE("Toggle_Fast FireRate"),        // featNum 3
+        OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 3
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Fast FireRate:</b> Tembakan senjata super cepat tanpa cooldown / delay (Damage DPS tinggi).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Auto Headshot:</b> Memory edit 100% damage langsung tembus Headshot.<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1106,14 +1357,14 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 3: { // Toggle_Fast FireRate
+        case 3: { // Toggle_Fast FireRate (Client-Side)
             g_fastFireRate = boolean;
-            ModLog("[TOGGLE] Feature #3 [Fast FireRate] set to: %s", stateStr);
+            ModLog("[TOGGLE] Feature #3 [Fast FireRate (Client-Side)] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle Fast FireRate: ON" : "Toggle Fast FireRate: OFF");
-            applyFastFireRatePatch(boolean);
+            applyFastFireRateToggle(boolean);
 
             if (boolean) {
-                Toast(env, ctx, OBFUSCATE("Fast FireRate: ON (Tembakan Super Cepat)"), ToastLength::LENGTH_SHORT);
+                Toast(env, ctx, OBFUSCATE("Fast FireRate: ON (Tembakan Berkecepatan Tinggi - Client Side)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Fast FireRate: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             }
