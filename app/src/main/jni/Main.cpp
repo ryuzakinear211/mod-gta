@@ -673,20 +673,6 @@ static void applyPlayerWeaponMemoryEdits() {
     }
 }
 
-static void resetFpcShotTimers(void *fpc) {
-    if (fpc == nullptr || !isPointerReadable(fpc)) return;
-    // Reset FPC shot delay timers at 0x88, 0xB0, 0x224
-    if (isPointerReadable((void *)((uintptr_t)fpc + 0x88))) {
-        *(float *)((uintptr_t)fpc + 0x88) = 0.0f;
-    }
-    if (isPointerReadable((void *)((uintptr_t)fpc + 0xB0))) {
-        *(float *)((uintptr_t)fpc + 0xB0) = 0.0f;
-    }
-    if (isPointerReadable((void *)((uintptr_t)fpc + 0x224))) {
-        *(float *)((uintptr_t)fpc + 0x224) = 0.0f;
-    }
-}
-
 // =========================================================================
 // Client-Side Fast FireRate Hooks (Strictly Client-Only)
 // =========================================================================
@@ -736,7 +722,6 @@ void hook_FirstPersonController_Update(void *instance) {
         updateLocalPlayerWeapon(instance);
         if (g_fastFireRate) {
             applyPlayerWeaponMemoryEdits();
-            resetFpcShotTimers(instance);
         } else if (g_hasOrigShootAction && g_localPlayerShooter != nullptr && isPointerReadable(g_localPlayerShooter)) {
             // Restore normal fire mode safely on Unity thread
             if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x150))) {
