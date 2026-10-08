@@ -652,13 +652,18 @@ static void applyPlayerWeaponMemoryEdits() {
     }
 
     // 2. Zero out internal cooldown ObscuredFloat fields at offset 0x18C & 0x1B0
-    if (actk_op_Implicit_Float != nullptr) {
-        ObscuredFloat zeroVal = actk_op_Implicit_Float(0.0f);
+    static ObscuredFloat s_cachedZeroVal = {0};
+    static bool s_hasCachedZero = false;
+    if (!s_hasCachedZero && actk_op_Implicit_Float != nullptr) {
+        s_cachedZeroVal = actk_op_Implicit_Float(0.0f);
+        s_hasCachedZero = true;
+    }
+    if (s_hasCachedZero) {
         if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x18C))) {
-            memcpy((void *)((uintptr_t)g_localPlayerShooter + 0x18C), &zeroVal, sizeof(ObscuredFloat));
+            memcpy((void *)((uintptr_t)g_localPlayerShooter + 0x18C), &s_cachedZeroVal, sizeof(ObscuredFloat));
         }
         if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x1B0))) {
-            memcpy((void *)((uintptr_t)g_localPlayerShooter + 0x1B0), &zeroVal, sizeof(ObscuredFloat));
+            memcpy((void *)((uintptr_t)g_localPlayerShooter + 0x1B0), &s_cachedZeroVal, sizeof(ObscuredFloat));
         }
     }
 
@@ -732,6 +737,12 @@ void hook_FirstPersonController_Update(void *instance) {
         if (g_fastFireRate) {
             applyPlayerWeaponMemoryEdits();
             resetFpcShotTimers(instance);
+        } else if (g_hasOrigShootAction && g_localPlayerShooter != nullptr && isPointerReadable(g_localPlayerShooter)) {
+            // Restore normal fire mode safely on Unity thread
+            if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x150))) {
+                *(int *)((uintptr_t)g_localPlayerShooter + 0x150) = g_origShootAction;
+                g_hasOrigShootAction = false;
+            }
         }
         if (g_noRecoil) {
             applyNoRecoilMemoryEdits(instance);
@@ -927,22 +938,7 @@ static void initFastFireRateSystem() {
 static void applyFastFireRateToggle(bool enable) {
     g_fastFireRate = enable;
     setLastAction(enable ? "applyFastFireRateToggle(ON)" : "applyFastFireRateToggle(OFF)");
-
-    if (enable) {
-        applyPlayerWeaponMemoryEdits();
-        if (g_localPlayerFPC != nullptr) {
-            resetFpcShotTimers(g_localPlayerFPC);
-        }
-        ModLog("[FIRERATE] Fast FireRate ENABLED (Client-Side Weapon Firerate Active, Shooter=%p)", g_localPlayerShooter);
-    } else {
-        // Restore original shootAction if known
-        if (g_hasOrigShootAction && g_localPlayerShooter != nullptr && isPointerReadable(g_localPlayerShooter)) {
-            if (isPointerReadable((void *)((uintptr_t)g_localPlayerShooter + 0x150))) {
-                *(int *)((uintptr_t)g_localPlayerShooter + 0x150) = g_origShootAction;
-            }
-        }
-        ModLog("[FIRERATE] Fast FireRate DISABLED (Restored Normal Firerate)");
-    }
+    ModLog("[FIRERATE] Fast FireRate toggle set to: %s (Player shooter: %p)", enable ? "ON (ACTIVE)" : "OFF (INACTIVE)", g_localPlayerShooter);
 }
 
 // =========================================================================
@@ -1489,9 +1485,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             setLastAction(boolean ? "Toggle No Recoil: ON" : "Toggle No Recoil: OFF");
 
             if (boolean) {
-                if (g_localPlayerFPC != nullptr) {
-                    applyNoRecoilMemoryEdits(g_localPlayerFPC);
-                }
                 Toast(env, ctx, OBFUSCATE("No Recoil: ON (Senjata Tanpa Recoil - Client Side)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("No Recoil: OFF (Normal)"), ToastLength::LENGTH_SHORT);
