@@ -161,7 +161,7 @@ static bool g_autoCount = false;
 static bool g_bigHead = false;
 static bool g_fastFireRate = false;
 static bool g_noRecoil = false;
-static bool g_weaponAimbot = false;
+static bool g_aimAssistBoost = false;
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -198,10 +198,10 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, WeaponAimbot=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
-        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_fastFireRate, (int)g_noRecoil, (int)g_weaponAimbot
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_fastFireRate, (int)g_noRecoil, (int)g_aimAssistBoost
     );
 
 #if defined(__aarch64__)
@@ -380,23 +380,9 @@ struct Vector3 {
     Vector3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
 };
 
-struct Quaternion {
-    float x;
-    float y;
-    float z;
-    float w;
-    Quaternion() : x(0.0f), y(0.0f), z(0.0f), w(1.0f) {}
-    Quaternion(float _x, float _y, float _z, float _w) : x(_x), y(_y), z(_z), w(_w) {}
-};
-
 static void *(*get_transform)(void *) = nullptr;
 static void (*set_localScale_Injected)(void *, const Vector3 *) = nullptr;
 static void *(*GetBoneTransform)(void *, int) = nullptr;
-static void (*get_position_Injected)(void *, Vector3 &) = nullptr;
-static void (*get_rotation_Injected)(void *, Quaternion &) = nullptr;
-static void (*set_rotation_Injected)(void *, const Quaternion &) = nullptr;
-static void (*aim_SetTarget)(void *, void *) = nullptr;
-static void *(*get_MuzzleTransform)(void *) = nullptr;
 
 static void initUnityPointers() {
     setLastAction("initUnityPointers");
@@ -411,26 +397,6 @@ static void initUnityPointers() {
     if (GetBoneTransform == nullptr) {
         GetBoneTransform = (void *(*)(void *, int)) getAbsoluteAddress(targetLibName, 0x84EBAB0);
         ModLog("[UNITY] GetBoneTransform pointer: %p", GetBoneTransform);
-    }
-    if (get_position_Injected == nullptr) {
-        get_position_Injected = (void (*)(void *, Vector3 &)) getAbsoluteAddress(targetLibName, 0x85B1394);
-        ModLog("[UNITY] get_position_Injected pointer: %p", get_position_Injected);
-    }
-    if (get_rotation_Injected == nullptr) {
-        get_rotation_Injected = (void (*)(void *, Quaternion &)) getAbsoluteAddress(targetLibName, 0x85B1E10);
-        ModLog("[UNITY] get_rotation_Injected pointer: %p", get_rotation_Injected);
-    }
-    if (set_rotation_Injected == nullptr) {
-        set_rotation_Injected = (void (*)(void *, const Quaternion &)) getAbsoluteAddress(targetLibName, 0x85B1E5C);
-        ModLog("[UNITY] set_rotation_Injected pointer: %p", set_rotation_Injected);
-    }
-    if (aim_SetTarget == nullptr) {
-        aim_SetTarget = (void (*)(void *, void *)) getAbsoluteAddress(targetLibName, 0x4D287F8);
-        ModLog("[UNITY] AimingControl.SetTarget pointer: %p", aim_SetTarget);
-    }
-    if (get_MuzzleTransform == nullptr) {
-        get_MuzzleTransform = (void *(*)(void *)) getAbsoluteAddress(targetLibName, 0x405C050);
-        ModLog("[UNITY] WeaponShooterBehaviour.GetMuzzleTransform pointer: %p", get_MuzzleTransform);
     }
 }
 
@@ -449,108 +415,6 @@ static void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
     } else {
         set_localScale_Injected(transformObj, &scale);
     }
-}
-
-static bool safeGetPosition(void *transformObj, Vector3 *outPos) {
-    if (transformObj == nullptr || get_position_Injected == nullptr || outPos == nullptr) return false;
-    if (!isPointerReadable(transformObj)) return false;
-
-    void *nativePtr = nullptr;
-    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
-        nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
-    }
-    if (nativePtr != nullptr && isPointerReadable(nativePtr)) {
-        get_position_Injected(nativePtr, *outPos);
-    } else {
-        get_position_Injected(transformObj, *outPos);
-    }
-    return true;
-}
-
-static bool safeGetRotation(void *transformObj, Quaternion *outRot) {
-    if (transformObj == nullptr || get_rotation_Injected == nullptr || outRot == nullptr) return false;
-    if (!isPointerReadable(transformObj)) return false;
-
-    void *nativePtr = nullptr;
-    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
-        nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
-    }
-    if (nativePtr != nullptr && isPointerReadable(nativePtr)) {
-        get_rotation_Injected(nativePtr, *outRot);
-    } else {
-        get_rotation_Injected(transformObj, *outRot);
-    }
-    return true;
-}
-
-static bool safeSetRotation(void *transformObj, const Quaternion &inRot) {
-    if (transformObj == nullptr || set_rotation_Injected == nullptr) return false;
-    if (!isPointerReadable(transformObj)) return false;
-
-    void *nativePtr = nullptr;
-    if (isPointerReadable((void *)((uintptr_t)transformObj + 0x10))) {
-        nativePtr = *(void **)((uintptr_t)transformObj + 0x10);
-    }
-    if (nativePtr != nullptr && isPointerReadable(nativePtr)) {
-        set_rotation_Injected(nativePtr, inRot);
-    } else {
-        set_rotation_Injected(transformObj, inRot);
-    }
-    return true;
-}
-
-static Quaternion lookRotation(const Vector3 &forward, const Vector3 &up = Vector3(0.0f, 1.0f, 0.0f)) {
-    float len = sqrtf(forward.x * forward.x + forward.y * forward.y + forward.z * forward.z);
-    if (len < 0.0001f) return Quaternion(0.0f, 0.0f, 0.0f, 1.0f);
-    Vector3 f = { forward.x / len, forward.y / len, forward.z / len };
-
-    Vector3 r = {
-        up.y * f.z - up.z * f.y,
-        up.z * f.x - up.x * f.z,
-        up.x * f.y - up.y * f.x
-    };
-    float rLen = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
-    if (rLen < 0.0001f) {
-        Vector3 altUp = (fabsf(f.x) > 0.1f) ? Vector3(0.0f, 1.0f, 0.0f) : Vector3(1.0f, 0.0f, 0.0f);
-        r = { altUp.y * f.z - altUp.z * f.y, altUp.z * f.x - altUp.x * f.z, altUp.x * f.y - altUp.y * f.x };
-        rLen = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
-    }
-    r = { r.x / rLen, r.y / rLen, r.z / rLen };
-
-    Vector3 u = {
-        f.y * r.z - f.z * r.y,
-        f.z * r.x - f.x * r.z,
-        f.x * r.y - f.y * r.x
-    };
-
-    float trace = r.x + u.y + f.z;
-    Quaternion q;
-    if (trace > 0.0f) {
-        float s = 0.5f / sqrtf(trace + 1.0f);
-        q.w = 0.25f / s;
-        q.x = (u.z - f.y) * s;
-        q.y = (f.x - r.z) * s;
-        q.z = (r.y - u.x) * s;
-    } else if (r.x > u.y && r.x > f.z) {
-        float s = 2.0f * sqrtf(1.0f + r.x - u.y - f.z);
-        q.w = (u.z - f.y) / s;
-        q.x = 0.25f * s;
-        q.y = (u.x + r.y) / s;
-        q.z = (f.x + r.z) / s;
-    } else if (u.y > f.z) {
-        float s = 2.0f * sqrtf(1.0f + u.y - r.x - f.z);
-        q.w = (f.x - r.z) / s;
-        q.x = (u.x + r.y) / s;
-        q.y = 0.25f * s;
-        q.z = (f.y + u.z) / s;
-    } else {
-        float s = 2.0f * sqrtf(1.0f + f.z - r.x - u.y);
-        q.w = (r.y - u.x) / s;
-        q.x = (f.x + r.z) / s;
-        q.y = (f.y + u.z) / s;
-        q.z = 0.25f * s;
-    }
-    return q;
 }
 
 // =========================================================================
@@ -742,8 +606,6 @@ static void applyNoRecoilMemoryEdits(void *fpc) {
     }
 }
 
-static void applyWeaponAimbot(void *fpc);
-
 // 1. FirstPersonController.Update: RVA 0x40A1BF4
 void (*old_FirstPersonController_Update)(void *instance) = nullptr;
 void hook_FirstPersonController_Update(void *instance) {
@@ -761,9 +623,6 @@ void hook_FirstPersonController_Update(void *instance) {
         }
         if (g_noRecoil) {
             applyNoRecoilMemoryEdits(instance);
-        }
-        if (g_weaponAimbot) {
-            applyWeaponAimbot(instance);
         }
     }
     if (old_FirstPersonController_Update != nullptr) {
@@ -1226,248 +1085,203 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 }
 
 // =========================================================================
-// Pure Weapon Aimbot System (Weapon Aim Direction Manipulation)
-// - Focuses ONLY on weapon/muzzle aim orientation towards enemy targets
-// - Leaves camera / screen look angles 100% untouched and natural
-// - Preserves all original weapon stats and firing logic untouched
+// Native Aim Assist Boost System
+// - Hooks game's built-in Aim Assist & Auto Aim pipeline
+// - Drastically amplifies sensitivity, max rotation power, and lock-on range
+// - Forces Aim Assist to stay active for both hip-fire and scoping
+// - 100% preserves player character movement, animation, and manual weapon firing
 // =========================================================================
 
-static void applyWeaponAimbot(void *fpc) {
-    if (!g_weaponAimbot || fpc == nullptr || !isPointerReadable(fpc)) return;
-
-    // 1. Get weapon transform and muzzle transform
-    if (g_localPlayerWeapon == nullptr || !isPointerReadable(g_localPlayerWeapon)) return;
-    void *weaponTransform = (get_transform != nullptr) ? get_transform(g_localPlayerWeapon) : nullptr;
-    if (weaponTransform == nullptr || !isPointerReadable(weaponTransform)) return;
-
-    void *muzzleTransform = nullptr;
-    if (g_localPlayerShooter != nullptr && isPointerReadable(g_localPlayerShooter) && get_MuzzleTransform != nullptr) {
-        muzzleTransform = get_MuzzleTransform(g_localPlayerShooter);
+// 1. StrafeRotationConfig (0x52A6264, 0x52A6210, 0x52A624C, 0x52A65A4, 0x52A6598)
+float (*old_StrafeRotationConfig_get_MaxRotationPower)(void *instance) = nullptr;
+float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
+    float power = old_StrafeRotationConfig_get_MaxRotationPower ? old_StrafeRotationConfig_get_MaxRotationPower(instance) : 0.2f;
+    if (g_aimAssistBoost) {
+        return (power > 0.0f) ? (power * 4.5f) : 2.5f;
     }
+    return power;
+}
 
-    // 2. Resolve origin position of the weapon / muzzle
-    Vector3 weaponPos = {0.0f, 0.0f, 0.0f};
-    bool hasWeaponPos = false;
-    if (muzzleTransform != nullptr && isPointerReadable(muzzleTransform)) {
-        hasWeaponPos = safeGetPosition(muzzleTransform, &weaponPos);
+float (*old_StrafeRotationConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
+float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
+    float fov = old_StrafeRotationConfig_get_FOVAreaMultiplier ? old_StrafeRotationConfig_get_FOVAreaMultiplier(instance) : 1.0f;
+    if (g_aimAssistBoost) {
+        return (fov > 0.0f) ? (fov * 2.5f) : 2.5f;
     }
-    if (!hasWeaponPos) {
-        hasWeaponPos = safeGetPosition(weaponTransform, &weaponPos);
+    return fov;
+}
+
+float (*old_StrafeRotationConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
+float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
+    float dist = old_StrafeRotationConfig_get_DefaultStateMaxDistance ? old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
+    if (g_aimAssistBoost) {
+        return 150.0f; // Long range aim assist for hip fire
     }
-    if (!hasWeaponPos) return;
+    return dist;
+}
 
-    // 3. AimingControl at offset 0xF0 (Read ONLY for camera forward direction reference & internal target registration)
-    void *aimingControl = nullptr;
-    if (isPointerReadable((void *)((uintptr_t)fpc + 0xF0))) {
-        aimingControl = *(void **)((uintptr_t)fpc + 0xF0);
+float (*old_StrafeRotationConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
+float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
+    float dist = old_StrafeRotationConfig_get_ZoomedStateMaxDistance ? old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
+    if (g_aimAssistBoost) {
+        return 250.0f; // Long range aim assist for scope
     }
+    return dist;
+}
 
-    // Camera forward vector: only target enemies in front of player (~70 degree cone)
-    Vector3 camFwd = {0.0f, 0.0f, 1.0f};
-    if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
-        void *elevationNode = nullptr;
-        void *azimuthNode = nullptr;
-        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x30))) {
-            elevationNode = *(void **)((uintptr_t)aimingControl + 0x30);
-        }
-        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0x28))) {
-            azimuthNode = *(void **)((uintptr_t)aimingControl + 0x28);
-        }
-        Quaternion camRot(0.0f, 0.0f, 0.0f, 1.0f);
-        if (elevationNode != nullptr && safeGetRotation(elevationNode, &camRot)) {
-            camFwd = Vector3(
-                2.0f * (camRot.x * camRot.z + camRot.w * camRot.y),
-                2.0f * (camRot.y * camRot.z - camRot.w * camRot.x),
-                1.0f - 2.0f * (camRot.x * camRot.x + camRot.y * camRot.y)
-            );
-        } else if (azimuthNode != nullptr && safeGetRotation(azimuthNode, &camRot)) {
-            camFwd = Vector3(
-                2.0f * (camRot.x * camRot.z + camRot.w * camRot.y),
-                2.0f * (camRot.y * camRot.z - camRot.w * camRot.x),
-                1.0f - 2.0f * (camRot.x * camRot.x + camRot.y * camRot.y)
-            );
-        }
+float (*old_StrafeRotationConfig_get_FOVPowerMultiplier)(void *instance) = nullptr;
+float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
+    float fov = old_StrafeRotationConfig_get_FOVPowerMultiplier ? old_StrafeRotationConfig_get_FOVPowerMultiplier(instance) : 1.0f;
+    if (g_aimAssistBoost) {
+        return (fov > 0.0f) ? (fov * 2.5f) : 2.5f;
     }
+    return fov;
+}
 
-    // 4. Find best target among active enemies (players and bots)
-    float bestScore = 999999.0f;
-    Vector3 bestTargetPos = {0.0f, 0.0f, 0.0f};
-    void *bestTargetObj = nullptr;
-    bool foundTarget = false;
-
-    auto evaluateTargetCandidate = [&](const Vector3 &targetPos, void *tObj) {
-        float dx = targetPos.x - weaponPos.x;
-        float dy = targetPos.y - weaponPos.y;
-        float dz = targetPos.z - weaponPos.z;
-        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-
-        // Distance range: 1.0m to 150m (eliminates self-targeting)
-        if (dist < 1.0f || dist > 150.0f) return;
-
-        Vector3 dir = { dx / dist, dy / dist, dz / dist };
-
-        // Check if target is roughly in front (FOV cone ~70 degrees: dot > 0.34)
-        float dotFwd = dir.x * camFwd.x + dir.y * camFwd.y + dir.z * camFwd.z;
-        if (dotFwd <= 0.34f) return;
-
-        float clampedDot = std::max(-1.0f, std::min(1.0f, dotFwd));
-        float angleDeg = acosf(clampedDot) * 57.2957795f;
-
-        float score = angleDeg * 1.5f + dist * 0.5f;
-        if (score < bestScore) {
-            bestScore = score;
-            bestTargetPos = targetPos;
-            bestTargetObj = tObj;
-            foundTarget = true;
-        }
-    };
-
-    // A. Check NetworkPlayers
-    {
-        std::lock_guard<std::mutex> lock(g_entityMutex);
-        uint64_t now = getCurrentTimeMs();
-
-        void *localDoll = nullptr;
-        if (isPointerReadable((void *)((uintptr_t)fpc + 0xC8))) {
-            void *dollsMgr = *(void **)((uintptr_t)fpc + 0xC8);
-            if (dollsMgr != nullptr && isPointerReadable(dollsMgr) && isPointerReadable((void *)((uintptr_t)dollsMgr + 0x38))) {
-                localDoll = *(void **)((uintptr_t)dollsMgr + 0x38);
-            }
-        }
-
-        for (auto const &pair : g_networkPlayers) {
-            void *netPlayer = pair.first;
-            if (netPlayer == nullptr || !isPointerReadable(netPlayer)) continue;
-            if (now - pair.second > 3000) continue;
-
-            if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x90))) {
-                void *doll = *(void **)((uintptr_t)netPlayer + 0x90);
-                if (doll != nullptr && doll == localDoll) continue;
-            }
-
-            Vector3 targetPos = {0.0f, 0.0f, 0.0f};
-            bool hasPos = false;
-
-            // Head bone extraction (HumanBodyBones.Head = 10)
-            if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x78))) {
-                void *animator = *(void **)((uintptr_t)netPlayer + 0x78);
-                if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
-                    void *headBone = GetBoneTransform(animator, 10);
-                    if (headBone != nullptr && isPointerReadable(headBone)) {
-                        hasPos = safeGetPosition(headBone, &targetPos);
-                    }
-                }
-            }
-
-            if (!hasPos && get_transform != nullptr) {
-                void *npTransform = get_transform(netPlayer);
-                if (npTransform != nullptr) {
-                    if (safeGetPosition(npTransform, &targetPos)) {
-                        targetPos.y += 1.35f; // Center mass / upper chest
-                        hasPos = true;
-                    }
-                }
-            }
-
-            if (hasPos) {
-                evaluateTargetCandidate(targetPos, netPlayer);
-            }
-        }
-
-        // B. Check BotPlayers
-        for (auto const &pair : g_botPlayers) {
-            void *botPlayer = pair.first;
-            if (botPlayer == nullptr || !isPointerReadable(botPlayer)) continue;
-            if (now - pair.second > 3000) continue;
-
-            // Verify bot is alive (BotPlayerHealth at 0x30 -> currentHealth at 0x2C)
-            if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x30))) {
-                void *health = *(void **)((uintptr_t)botPlayer + 0x30);
-                if (health != nullptr && isPointerReadable(health) && isPointerReadable((void *)((uintptr_t)health + 0x2C))) {
-                    float curHp = *(float *)((uintptr_t)health + 0x2C);
-                    if (curHp <= 0.0f) continue;
-                }
-            }
-
-            Vector3 targetPos = {0.0f, 0.0f, 0.0f};
-            bool hasPos = false;
-
-            // Head bone via ThirdPersonController at 0x58
-            if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x58))) {
-                void *tpCtrl = *(void **)((uintptr_t)botPlayer + 0x58);
-                if (tpCtrl != nullptr && isPointerReadable(tpCtrl) && isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
-                    void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
-                    if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
-                        void *headBone = GetBoneTransform(animator, 10);
-                        if (headBone != nullptr && isPointerReadable(headBone)) {
-                            hasPos = safeGetPosition(headBone, &targetPos);
-                        }
-                    }
-                }
-            }
-
-            if (!hasPos && isPointerReadable((void *)((uintptr_t)botPlayer + 0x28))) {
-                void *botLook = *(void **)((uintptr_t)botPlayer + 0x28);
-                if (botLook != nullptr && isPointerReadable(botLook) && isPointerReadable((void *)((uintptr_t)botLook + 0x28))) {
-                    void *headBone = *(void **)((uintptr_t)botLook + 0x28);
-                    if (headBone != nullptr && isPointerReadable(headBone)) {
-                        hasPos = safeGetPosition(headBone, &targetPos);
-                    }
-                }
-            }
-
-            if (!hasPos && get_transform != nullptr) {
-                void *bpTransform = get_transform(botPlayer);
-                if (bpTransform != nullptr) {
-                    if (safeGetPosition(bpTransform, &targetPos)) {
-                        targetPos.y += 1.35f;
-                        hasPos = true;
-                    }
-                }
-            }
-
-            if (hasPos) {
-                evaluateTargetCandidate(targetPos, botPlayer);
-            }
-        }
+// 2. SpinSlowdownConfig (0x4600D68, 0x4600BCC, 0x4600BD8, 0x4600C44, 0x4600C5C)
+float (*old_SpinSlowdownConfig_get_MaxSlowdownValue)(void *instance) = nullptr;
+float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
+    float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.5f;
+    if (g_aimAssistBoost) {
+        return 0.85f; // Strong sticky crosshair friction on target
     }
+    return val;
+}
 
-    // 5. Apply Weapon Aim Rotation (ONLY weapon, NEVER camera)
-    if (foundTarget) {
-        Vector3 aimDir = {
-            bestTargetPos.x - weaponPos.x,
-            bestTargetPos.y - weaponPos.y,
-            bestTargetPos.z - weaponPos.z
-        };
-        Quaternion aimRot = lookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
-
-        // Directly orient weapon & muzzle transform towards enemy
-        safeSetRotation(weaponTransform, aimRot);
-        if (muzzleTransform != nullptr && isPointerReadable(muzzleTransform)) {
-            safeSetRotation(muzzleTransform, aimRot);
-        }
-
-        // Inform AimingControl internal target so game bullet raycast aligns
-        if (aimingControl != nullptr && isPointerReadable(aimingControl) && bestTargetObj != nullptr) {
-            if (aim_SetTarget != nullptr) {
-                aim_SetTarget(aimingControl, bestTargetObj);
-            }
-            if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
-                *(void **)((uintptr_t)aimingControl + 0xC8) = bestTargetObj;
-            }
-            if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xD0))) {
-                *(bool *)((uintptr_t)aimingControl + 0xD0) = true;
-            }
-        }
-
-        static uint64_t s_lastAimLogMs = 0;
-        uint64_t now = getCurrentTimeMs();
-        if (now - s_lastAimLogMs > 8000) {
-            s_lastAimLogMs = now;
-            ModLog("[WEAPON_AIMBOT] Active -> Weapon Aimed at Target: (%.1f, %.1f, %.1f) | Score: %.1f (Camera Untouched)",
-                   bestTargetPos.x, bestTargetPos.y, bestTargetPos.z, bestScore);
-        }
+float (*old_SpinSlowdownConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
+float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
+    float fov = old_SpinSlowdownConfig_get_FOVAreaMultiplier ? old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance) : 1.0f;
+    if (g_aimAssistBoost) {
+        return (fov > 0.0f) ? (fov * 2.5f) : 2.5f;
     }
+    return fov;
+}
+
+float (*old_SpinSlowdownConfig_get_Radius)(void *instance) = nullptr;
+float hook_SpinSlowdownConfig_get_Radius(void *instance) {
+    float r = old_SpinSlowdownConfig_get_Radius ? old_SpinSlowdownConfig_get_Radius(instance) : 1.0f;
+    if (g_aimAssistBoost) {
+        return (r > 0.0f) ? (r * 2.0f) : 2.0f;
+    }
+    return r;
+}
+
+float (*old_SpinSlowdownConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
+float hook_SpinSlowdownConfig_get_DefaultStateMaxDistance(void *instance) {
+    float dist = old_SpinSlowdownConfig_get_DefaultStateMaxDistance ? old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
+    if (g_aimAssistBoost) {
+        return 150.0f;
+    }
+    return dist;
+}
+
+float (*old_SpinSlowdownConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
+float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
+    float dist = old_SpinSlowdownConfig_get_ZoomedStateMaxDistance ? old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
+    if (g_aimAssistBoost) {
+        return 250.0f;
+    }
+    return dist;
+}
+
+// 3. StrafeRotationAimAssist.Calculate (0x4F0E254)
+Vector2 (*old_StrafeRotation_Calculate)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
+Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vector2 smoothed) {
+    if (old_StrafeRotation_Calculate == nullptr) return currentDelta;
+    Vector2 result = old_StrafeRotation_Calculate(instance, currentDelta, smoothed);
+    if (g_aimAssistBoost) {
+        float assistX = result.x - currentDelta.x;
+        float assistY = result.y - currentDelta.y;
+        result.x = currentDelta.x + assistX * 4.0f;
+        result.y = currentDelta.y + assistY * 4.0f;
+    }
+    return result;
+}
+
+// 4. AimAssistManager.Update (0x5290E40) & SetEnabled (0x529060C)
+Vector2 (*old_AimAssistManager_Update)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
+Vector2 hook_AimAssistManager_Update(void *instance, Vector2 currentDelta, Vector2 smoothed) {
+    if (old_AimAssistManager_Update == nullptr) return currentDelta;
+    Vector2 result = old_AimAssistManager_Update(instance, currentDelta, smoothed);
+    if (g_aimAssistBoost) {
+        float assistX = result.x - currentDelta.x;
+        float assistY = result.y - currentDelta.y;
+        result.x = currentDelta.x + assistX * 4.0f;
+        result.y = currentDelta.y + assistY * 4.0f;
+    }
+    return result;
+}
+
+void (*old_AimAssistManager_SetEnabled)(void *instance, bool enabled) = nullptr;
+void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
+    if (g_aimAssistBoost) {
+        enabled = true; // Keep enabled in hip fire and scope
+    }
+    if (old_AimAssistManager_SetEnabled != nullptr) {
+        old_AimAssistManager_SetEnabled(instance, enabled);
+    }
+}
+
+// 5. NewAutoAim.Update (0x421CC44) & SetEnabled (0x421C470)
+Vector2 (*old_NewAutoAim_Update)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
+Vector2 hook_NewAutoAim_Update(void *instance, Vector2 currentDelta, Vector2 smoothed) {
+    if (old_NewAutoAim_Update == nullptr) return currentDelta;
+    Vector2 result = old_NewAutoAim_Update(instance, currentDelta, smoothed);
+    if (g_aimAssistBoost) {
+        float assistX = result.x - currentDelta.x;
+        float assistY = result.y - currentDelta.y;
+        result.x = currentDelta.x + assistX * 4.0f;
+        result.y = currentDelta.y + assistY * 4.0f;
+    }
+    return result;
+}
+
+void (*old_NewAutoAim_SetEnabled)(void *instance, bool enabled) = nullptr;
+void hook_NewAutoAim_SetEnabled(void *instance, bool enabled) {
+    if (g_aimAssistBoost) {
+        enabled = true;
+    }
+    if (old_NewAutoAim_SetEnabled != nullptr) {
+        old_NewAutoAim_SetEnabled(instance, enabled);
+    }
+}
+
+// 6. BaseAimAssist.SetEnabled (0x4478A30)
+void (*old_BaseAimAssist_SetEnabled)(void *instance, bool enabled) = nullptr;
+void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
+    if (g_aimAssistBoost) {
+        enabled = true;
+    }
+    if (old_BaseAimAssist_SetEnabled != nullptr) {
+        old_BaseAimAssist_SetEnabled(instance, enabled);
+    }
+}
+
+// 7. AimingControlHelper.ProcessAimAssist1 (0x453E3D8) & ProcessAimAssist2 (0x453EBBC)
+Vector2 (*old_AimingControlHelper_Process1)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
+Vector2 hook_AimingControlHelper_Process1(void *instance, Vector2 currentDelta, Vector2 smoothed) {
+    if (old_AimingControlHelper_Process1 == nullptr) return currentDelta;
+    Vector2 result = old_AimingControlHelper_Process1(instance, currentDelta, smoothed);
+    if (g_aimAssistBoost) {
+        float assistX = result.x - currentDelta.x;
+        float assistY = result.y - currentDelta.y;
+        result.x = currentDelta.x + assistX * 4.0f;
+        result.y = currentDelta.y + assistY * 4.0f;
+    }
+    return result;
+}
+
+Vector2 (*old_AimingControlHelper_Process2)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
+Vector2 hook_AimingControlHelper_Process2(void *instance, Vector2 currentDelta, Vector2 smoothed) {
+    if (old_AimingControlHelper_Process2 == nullptr) return currentDelta;
+    Vector2 result = old_AimingControlHelper_Process2(instance, currentDelta, smoothed);
+    if (g_aimAssistBoost) {
+        float assistX = result.x - currentDelta.x;
+        float assistY = result.y - currentDelta.y;
+        result.x = currentDelta.x + assistX * 4.0f;
+        result.y = currentDelta.y + assistY * 4.0f;
+    }
+    return result;
 }
 
 // =========================================================================
@@ -1479,7 +1293,7 @@ void (*old_NetworkPlayer_Update)(void *instance) = nullptr;
 void hook_NetworkPlayer_Update(void *instance) {
     if (instance != nullptr) {
         setLastAction("NetworkPlayer_Update");
-        if (g_autoCount || g_weaponAimbot) {
+        if (g_autoCount) {
             onNetworkPlayerUpdate(instance);
         }
         if (g_bigHead) {
@@ -1515,7 +1329,7 @@ void hook_NetworkPlayer_OnDestroy(void *instance) {
 // BotPlayer.Start: RVA 0x44493F4
 void (*old_BotPlayer_Start)(void *instance) = nullptr;
 void hook_BotPlayer_Start(void *instance) {
-    if (instance != nullptr && (g_autoCount || g_weaponAimbot)) {
+    if (instance != nullptr && g_autoCount) {
         setLastAction("BotPlayer_Start");
         onBotPlayerUpdate(instance);
     }
@@ -1529,7 +1343,7 @@ void (*old_BotPlayer_Update)(void *instance) = nullptr;
 void hook_BotPlayer_Update(void *instance) {
     if (instance != nullptr) {
         setLastAction("BotPlayer_Update");
-        if (g_autoCount || g_weaponAimbot) {
+        if (g_autoCount) {
             onBotPlayerUpdate(instance);
         }
         if (g_bigHead) {
@@ -1634,6 +1448,61 @@ void *hack_thread(void *) {
     HOOK("0x4449EB0", hook_BotPlayer_OnDestroy, old_BotPlayer_OnDestroy);
     ModLog("[HOOK] BotPlayer.OnDestroy (0x4449EB0): %s", old_BotPlayer_OnDestroy ? "SUCCESS" : "FAILED/HOOKED");
 
+    // Native Aim Assist & Sensitivity Reinforcement Hooks
+    HOOK("0x52A6264", hook_StrafeRotationConfig_get_MaxRotationPower, old_StrafeRotationConfig_get_MaxRotationPower);
+    ModLog("[HOOK] StrafeRotationConfig.get_MaxRotationPower (0x52A6264): %s", old_StrafeRotationConfig_get_MaxRotationPower ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x52A6210", hook_StrafeRotationConfig_get_FOVAreaMultiplier, old_StrafeRotationConfig_get_FOVAreaMultiplier);
+    ModLog("[HOOK] StrafeRotationConfig.get_FOVAreaMultiplier (0x52A6210): %s", old_StrafeRotationConfig_get_FOVAreaMultiplier ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x52A624C", hook_StrafeRotationConfig_get_DefaultStateMaxDistance, old_StrafeRotationConfig_get_DefaultStateMaxDistance);
+    ModLog("[HOOK] StrafeRotationConfig.get_DefaultStateMaxDistance (0x52A624C): %s", old_StrafeRotationConfig_get_DefaultStateMaxDistance ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x52A65A4", hook_StrafeRotationConfig_get_ZoomedStateMaxDistance, old_StrafeRotationConfig_get_ZoomedStateMaxDistance);
+    ModLog("[HOOK] StrafeRotationConfig.get_ZoomedStateMaxDistance (0x52A65A4): %s", old_StrafeRotationConfig_get_ZoomedStateMaxDistance ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x52A6598", hook_StrafeRotationConfig_get_FOVPowerMultiplier, old_StrafeRotationConfig_get_FOVPowerMultiplier);
+    ModLog("[HOOK] StrafeRotationConfig.get_FOVPowerMultiplier (0x52A6598): %s", old_StrafeRotationConfig_get_FOVPowerMultiplier ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4600D68", hook_SpinSlowdownConfig_get_MaxSlowdownValue, old_SpinSlowdownConfig_get_MaxSlowdownValue);
+    ModLog("[HOOK] SpinSlowdownConfig.get_MaxSlowdownValue (0x4600D68): %s", old_SpinSlowdownConfig_get_MaxSlowdownValue ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4600BCC", hook_SpinSlowdownConfig_get_FOVAreaMultiplier, old_SpinSlowdownConfig_get_FOVAreaMultiplier);
+    ModLog("[HOOK] SpinSlowdownConfig.get_FOVAreaMultiplier (0x4600BCC): %s", old_SpinSlowdownConfig_get_FOVAreaMultiplier ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4600BD8", hook_SpinSlowdownConfig_get_Radius, old_SpinSlowdownConfig_get_Radius);
+    ModLog("[HOOK] SpinSlowdownConfig.get_Radius (0x4600BD8): %s", old_SpinSlowdownConfig_get_Radius ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4600C44", hook_SpinSlowdownConfig_get_DefaultStateMaxDistance, old_SpinSlowdownConfig_get_DefaultStateMaxDistance);
+    ModLog("[HOOK] SpinSlowdownConfig.get_DefaultStateMaxDistance (0x4600C44): %s", old_SpinSlowdownConfig_get_DefaultStateMaxDistance ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4600C5C", hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance, old_SpinSlowdownConfig_get_ZoomedStateMaxDistance);
+    ModLog("[HOOK] SpinSlowdownConfig.get_ZoomedStateMaxDistance (0x4600C5C): %s", old_SpinSlowdownConfig_get_ZoomedStateMaxDistance ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4F0E254", hook_StrafeRotation_Calculate, old_StrafeRotation_Calculate);
+    ModLog("[HOOK] StrafeRotationAimAssist.Calculate (0x4F0E254): %s", old_StrafeRotation_Calculate ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x5290E40", hook_AimAssistManager_Update, old_AimAssistManager_Update);
+    ModLog("[HOOK] AimAssistManager.Update (0x5290E40): %s", old_AimAssistManager_Update ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x529060C", hook_AimAssistManager_SetEnabled, old_AimAssistManager_SetEnabled);
+    ModLog("[HOOK] AimAssistManager.SetEnabled (0x529060C): %s", old_AimAssistManager_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x421CC44", hook_NewAutoAim_Update, old_NewAutoAim_Update);
+    ModLog("[HOOK] NewAutoAim.Update (0x421CC44): %s", old_NewAutoAim_Update ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x421C470", hook_NewAutoAim_SetEnabled, old_NewAutoAim_SetEnabled);
+    ModLog("[HOOK] NewAutoAim.SetEnabled (0x421C470): %s", old_NewAutoAim_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x4478A30", hook_BaseAimAssist_SetEnabled, old_BaseAimAssist_SetEnabled);
+    ModLog("[HOOK] BaseAimAssist.SetEnabled (0x4478A30): %s", old_BaseAimAssist_SetEnabled ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x453E3D8", hook_AimingControlHelper_Process1, old_AimingControlHelper_Process1);
+    ModLog("[HOOK] AimingControlHelper.Process1 (0x453E3D8): %s", old_AimingControlHelper_Process1 ? "SUCCESS" : "FAILED/HOOKED");
+
+    HOOK("0x453EBBC", hook_AimingControlHelper_Process2, old_AimingControlHelper_Process2);
+    ModLog("[HOOK] AimingControlHelper.Process2 (0x453EBBC): %s", old_AimingControlHelper_Process2 ? "SUCCESS" : "FAILED/HOOKED");
+
     ModLog("[THREAD] All core hooks installed successfully!");
     setLastAction("Hooks installed and ready");
 #else
@@ -1656,9 +1525,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_Big Head"),             // featNum 1
         OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 2
         OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
-        OBFUSCATE("Toggle_Aimbot (Weapon Aim)"),         // featNum 4
+        OBFUSCATE("Toggle_Aim Assist (Enhanced Sensitivity)"), // featNum 4
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aimbot (Weapon Aim):</b> Mengarahkan bidikan senjata secara presisi ke target musuh tanpa mengubah sudut pandang/kamera player ataupun memodifikasi atribut senjata asli.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Enhanced):</b> Hook sistem Aim Assist bawaan game dengan sensivitas & jangkauan kuncian maksimal untuk Hip-fire dan Scope tanpa mengganggu pergerakan atau penembakan karakter.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1737,15 +1606,15 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 4: { // Toggle_Aimbot (Weapon Aim)
-            g_weaponAimbot = boolean;
-            ModLog("[TOGGLE] Feature #4 [Aimbot (Weapon Aim)] set to: %s", stateStr);
-            setLastAction(boolean ? "Toggle Weapon Aimbot: ON" : "Toggle Weapon Aimbot: OFF");
+        case 4: { // Toggle_Aim Assist (Enhanced Sensitivity)
+            g_aimAssistBoost = boolean;
+            ModLog("[TOGGLE] Feature #4 [Aim Assist (Enhanced Sensitivity)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Aim Assist Boost: ON" : "Toggle Aim Assist Boost: OFF");
 
             if (boolean) {
-                Toast(env, ctx, OBFUSCATE("Aimbot (Weapon Aim): ON"), ToastLength::LENGTH_SHORT);
+                Toast(env, ctx, OBFUSCATE("Aim Assist (Enhanced Sensitivity): ON"), ToastLength::LENGTH_SHORT);
             } else {
-                Toast(env, ctx, OBFUSCATE("Aimbot (Weapon Aim): OFF"), ToastLength::LENGTH_SHORT);
+                Toast(env, ctx, OBFUSCATE("Aim Assist (Enhanced Sensitivity): OFF"), ToastLength::LENGTH_SHORT);
             }
             break;
         }
