@@ -162,6 +162,7 @@ static bool g_bigHead = false;
 static bool g_fastFireRate = false;
 static bool g_noRecoil = false;
 static bool g_aimAssistBoost = false;
+static int g_aimSensitivity = 80; // 0 - 100 slider (default: 80)
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -198,10 +199,10 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d, AimSens=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
-        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_fastFireRate, (int)g_noRecoil, (int)g_aimAssistBoost
+        g_lastAction, (int)g_showStatusPanel, (int)g_autoCount, (int)g_bigHead, (int)g_fastFireRate, (int)g_noRecoil, (int)g_aimAssistBoost, g_aimSensitivity
     );
 
 #if defined(__aarch64__)
@@ -1154,13 +1155,21 @@ static bool isTargetTeammate(void *targetibleObj) {
     return false;
 }
 
+static inline float getAimSensitivityFactor() {
+    int val = g_aimSensitivity;
+    if (val < 0) val = 0;
+    if (val > 100) val = 100;
+    return (float)val / 100.0f;
+}
+
 // 1. StrafeRotationConfig (0x52A6264, 0x52A6210, 0x52A624C, 0x52A65A4, 0x52A6598)
 float (*old_StrafeRotationConfig_get_MaxRotationPower)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
     float power = old_StrafeRotationConfig_get_MaxRotationPower ? old_StrafeRotationConfig_get_MaxRotationPower(instance) : 0.2f;
     if (g_aimAssistBoost) {
-        // Controlled rotation power: firm stickiness without violent jerking (default is ~0.2f)
-        return (power > 0.0f) ? (power * 2.0f) : 0.65f;
+        float factor = getAimSensitivityFactor();
+        // Dynamic rotational power scaled by slider (0.4f up to 2.8f)
+        return 0.4f + 2.4f * factor;
     }
     return power;
 }
@@ -1169,9 +1178,10 @@ float (*old_StrafeRotationConfig_get_FOVAreaMultiplier)(void *instance) = nullpt
 float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
     float fov = old_StrafeRotationConfig_get_FOVAreaMultiplier ? old_StrafeRotationConfig_get_FOVAreaMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        // Controlled FOV: only engages when crosshair is already close to enemy,
-        // avoiding spinning or grabbing targets in peripheral vision
-        return 1.15f;
+        float factor = getAimSensitivityFactor();
+        // Dynamic FOV capture radius: when crosshair sweeps into enemy radius,
+        // it immediately detects and locks the target (1.10f up to 1.70f)
+        return 1.10f + 0.60f * factor;
     }
     return fov;
 }
@@ -1180,7 +1190,8 @@ float (*old_StrafeRotationConfig_get_DefaultStateMaxDistance)(void *instance) = 
 float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
     float dist = old_StrafeRotationConfig_get_DefaultStateMaxDistance ? old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
     if (g_aimAssistBoost) {
-        return 80.0f; // Reliable distance for hip fire
+        float factor = getAimSensitivityFactor();
+        return 70.0f + 50.0f * factor; // 70m to 120m for hip fire
     }
     return dist;
 }
@@ -1189,7 +1200,8 @@ float (*old_StrafeRotationConfig_get_ZoomedStateMaxDistance)(void *instance) = n
 float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
     float dist = old_StrafeRotationConfig_get_ZoomedStateMaxDistance ? old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
     if (g_aimAssistBoost) {
-        return 180.0f; // Long range aim assist for scope
+        float factor = getAimSensitivityFactor();
+        return 140.0f + 110.0f * factor; // 140m to 250m for scope
     }
     return dist;
 }
@@ -1198,7 +1210,8 @@ float (*old_StrafeRotationConfig_get_FOVPowerMultiplier)(void *instance) = nullp
 float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
     float fov = old_StrafeRotationConfig_get_FOVPowerMultiplier ? old_StrafeRotationConfig_get_FOVPowerMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        return 1.25f;
+        float factor = getAimSensitivityFactor();
+        return 1.15f + 0.85f * factor;
     }
     return fov;
 }
@@ -1208,7 +1221,10 @@ float (*old_SpinSlowdownConfig_get_MaxSlowdownValue)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
     float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.5f;
     if (g_aimAssistBoost) {
-        return 0.78f; // Strong sticky crosshair friction on target ("langsung nempel")
+        float factor = getAimSensitivityFactor();
+        // High sticky crosshair friction on target:
+        // 0.65f up to 0.95f (at 95%, crosshair acts like a strong magnet glued to the enemy!)
+        return 0.65f + 0.30f * factor;
     }
     return val;
 }
@@ -1217,7 +1233,8 @@ float (*old_SpinSlowdownConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
     float fov = old_SpinSlowdownConfig_get_FOVAreaMultiplier ? old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        return 1.15f; // Only slows down when crosshair is on/near target
+        float factor = getAimSensitivityFactor();
+        return 1.10f + 0.50f * factor;
     }
     return fov;
 }
@@ -1226,7 +1243,8 @@ float (*old_SpinSlowdownConfig_get_Radius)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_Radius(void *instance) {
     float r = old_SpinSlowdownConfig_get_Radius ? old_SpinSlowdownConfig_get_Radius(instance) : 1.0f;
     if (g_aimAssistBoost) {
-        return (r > 0.0f) ? (r * 1.25f) : 1.25f;
+        float factor = getAimSensitivityFactor();
+        return 1.15f + 0.65f * factor;
     }
     return r;
 }
@@ -1235,7 +1253,8 @@ float (*old_SpinSlowdownConfig_get_DefaultStateMaxDistance)(void *instance) = nu
 float hook_SpinSlowdownConfig_get_DefaultStateMaxDistance(void *instance) {
     float dist = old_SpinSlowdownConfig_get_DefaultStateMaxDistance ? old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
     if (g_aimAssistBoost) {
-        return 80.0f;
+        float factor = getAimSensitivityFactor();
+        return 70.0f + 50.0f * factor;
     }
     return dist;
 }
@@ -1244,13 +1263,14 @@ float (*old_SpinSlowdownConfig_get_ZoomedStateMaxDistance)(void *instance) = nul
 float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
     float dist = old_SpinSlowdownConfig_get_ZoomedStateMaxDistance ? old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
     if (g_aimAssistBoost) {
-        return 180.0f;
+        float factor = getAimSensitivityFactor();
+        return 140.0f + 110.0f * factor;
     }
     return dist;
 }
 
 // 3. StrafeRotationAimAssist.Calculate (0x4F0E254)
-// Proportional assist: 100% natural when in open space, smooth sticky boost when close to enemy
+// Proportional assist: 100% natural when in open space, magnetic lock when inside enemy radius
 Vector2 (*old_StrafeRotation_Calculate)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
 Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vector2 smoothed) {
     if (old_StrafeRotation_Calculate == nullptr) return currentDelta;
@@ -1261,21 +1281,26 @@ Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vect
     float assistY = result.y - currentDelta.y;
     float assistMag = sqrtf(assistX * assistX + assistY * assistY);
 
-    // Natural camera movement: if no target is near the crosshair, return native delta untouched!
+    // Natural camera movement: if no target is within the enemy radius,
+    // return native delta untouched (100% free & natural camera motion)!
     if (assistMag < 0.0001f) {
         return currentDelta;
     }
 
-    // Boost assist smoothly when crosshair is already directed close to enemy
-    float boost = 1.8f;
+    float factor = getAimSensitivityFactor();
+
+    // Dynamic magnetic boost (1.5x up to 4.5x):
+    // Directly pulls crosshair into the center of the enemy when in radius
+    float boost = 1.5f + 3.0f * factor;
     assistX *= boost;
     assistY *= boost;
 
-    // Safety clamp: cap maximum rotational delta step per frame (prevents camera spinning/whipping)
-    const float MAX_ASSIST_STEP = 8.0f;
+    // Dynamic safety clamp (8.0f up to 24.0f):
+    // Allows snappy lock-on while preventing 360-degree camera disorientation
+    float maxStep = 8.0f + 16.0f * factor;
     float boostedMag = sqrtf(assistX * assistX + assistY * assistY);
-    if (boostedMag > MAX_ASSIST_STEP) {
-        float scale = MAX_ASSIST_STEP / boostedMag;
+    if (boostedMag > maxStep) {
+        float scale = maxStep / boostedMag;
         assistX *= scale;
         assistY *= scale;
     }
@@ -1585,9 +1610,10 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_Big Head"),             // featNum 1
         OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 2
         OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
-        OBFUSCATE("Toggle_Aim Assist (Enhanced Sensitivity)"), // featNum 4
+        OBFUSCATE("Toggle_Aim Assist (Auto-Lock Radius)"), // featNum 4
+        OBFUSCATE("SeekBar_Aim Sensitivity (Sticky Lock)_0_100"), // featNum 5
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Enhanced):</b> Hook sistem Aim Assist bawaan game dengan fitur abaikan rekan tim otomatis & pergerakan kamera alami (asistensi kuncian presisi & friction hanya aktif menempel saat bidikan dekat musuh).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook sistem Aim Assist bawaan game; otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan masuk radius musuh.<br><br>• <b>Aim Sensitivity Slider (0-100):</b> Menyesuaikan daya kuncian & gesekan perlambatan (friction). Semakin tinggi nilai slider, semakin lengket (magnetic lock) crosshair menempel pada target musuh.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -1666,16 +1692,23 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 4: { // Toggle_Aim Assist (Enhanced Sensitivity)
+        case 4: { // Toggle_Aim Assist (Auto-Lock Radius)
             g_aimAssistBoost = boolean;
-            ModLog("[TOGGLE] Feature #4 [Aim Assist (Enhanced Sensitivity)] set to: %s", stateStr);
+            ModLog("[TOGGLE] Feature #4 [Aim Assist (Auto-Lock Radius)] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle Aim Assist Boost: ON" : "Toggle Aim Assist Boost: OFF");
 
             if (boolean) {
-                Toast(env, ctx, OBFUSCATE("Aim Assist (Enhanced Sensitivity): ON"), ToastLength::LENGTH_SHORT);
+                Toast(env, ctx, OBFUSCATE("Aim Assist (Auto-Lock): ON"), ToastLength::LENGTH_SHORT);
             } else {
-                Toast(env, ctx, OBFUSCATE("Aim Assist (Enhanced Sensitivity): OFF"), ToastLength::LENGTH_SHORT);
+                Toast(env, ctx, OBFUSCATE("Aim Assist (Auto-Lock): OFF"), ToastLength::LENGTH_SHORT);
             }
+            break;
+        }
+
+        case 5: { // SeekBar_Aim Sensitivity (Sticky Lock)_0_100
+            g_aimSensitivity = value;
+            ModLog("[SLIDER] Feature #5 [Aim Sensitivity] set to: %d", value);
+            setLastAction("Slider Aim Sensitivity changed");
             break;
         }
 
