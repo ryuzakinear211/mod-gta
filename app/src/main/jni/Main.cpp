@@ -2030,8 +2030,13 @@ static void processAimAssistLock(void *aimingControl) {
         camPos = getTransformPosition(g_localPlayerFPC) + Vector3(0.0f, 1.6f, 0.0f);
     }
 
-    // 5. Crosshair Targeting Cone in degrees
-    float maxFovAngle = g_bigHead ? 20.0f : 15.0f;
+    int sliderVal = g_aimSmoothness;
+    if (sliderVal < 0) sliderVal = 0;
+    if (sliderVal > 100) sliderVal = 100;
+    float s = (float)sliderVal / 100.0f;
+
+    // 5. Crosshair Targeting Cone in degrees (Expands slightly with higher slider)
+    float maxFovAngle = g_bigHead ? (22.0f + 5.0f * s) : (16.0f + 5.0f * s);
 
     // 6. Search Best Enemy Bone (Enemy Players or Bots only, Strictly Teammates Excluded)
     TargetBoneInfo targetInfo = findBestTargetBone(camPos, currentYaw, currentPitch, maxFovAngle, cameraObj);
@@ -2049,48 +2054,50 @@ static void processAimAssistLock(void *aimingControl) {
     // 7. Angular Delta Calculation
     float diffYaw = targetInfo.targetYaw - currentYaw;
     while (diffYaw > 180.0f) diffYaw -= 360.0f;
-    while (diffYaw < -180.0f) diffYaw -= 360.0f;
+    while (diffYaw < -180.0f) diffYaw += 360.0f;
 
     float diffPitch = targetInfo.targetPitch - currentPitch;
     while (diffPitch > 180.0f) diffPitch -= 360.0f;
     while (diffPitch < -180.0f) diffPitch += 360.0f;
 
-    // 8. Calculate Proximity Falloff & Smooth Pull
+    // 8. Instant Snap & Assist Rate Calculation
     // Distance from crosshair center: 0 = directly on target, maxFovAngle = edge of cone
     float proximity = 1.0f - (targetInfo.angleOffset / (maxFovAngle + 0.001f));
     if (proximity < 0.0f) proximity = 0.0f;
     if (proximity > 1.0f) proximity = 1.0f;
-    // Quadratic weighting: very soft at periphery, firmer near center
-    float weight = proximity * proximity;
 
-    int sliderVal = g_aimSmoothness;
-    if (sliderVal < 0) sliderVal = 0;
-    if (sliderVal > 100) sliderVal = 100;
-    float s = (float)sliderVal / 100.0f;
+    // Full baseline weight (0.80 to 1.0) so when target enters FOV, it snaps immediately!
+    float weight = 0.80f + 0.20f * proximity;
 
-    // Smooth magnetic pull rate:
-    // Low smoothness (0%): ~0.03 * weight
-    // Mid smoothness (50%): ~0.08 * weight
-    // High smoothness (100%): ~0.14 * weight
-    float assistRate = (0.03f + 0.11f * s) * weight;
+    // Fast/Instant snap rate:
+    // At s = 0.0 (0% slider): ~0.45 * weight (smooth fast glide)
+    // At s = 0.5 (50% slider): ~0.72 * weight (very fast acquisition)
+    // At s = 0.8 (default 80%): ~0.89 * weight (near instant snap in 1-2 frames)
+    // At s = 1.0 (100% slider): ~1.00 * weight (instant snap on frame 1)
+    float baseSnapRate = 0.45f + 0.55f * s;
+    float assistRate = baseSnapRate * weight;
 
     // USER SWIPE AUTHORITY:
-    // If player is actively swiping in the opposite direction of the enemy (trying to turn away),
-    // dramatically reduce assist pull so the player's swipe is 100% responsive and never blocked!
-    if ((userDeltaYaw > 0.3f && diffYaw < -0.2f) || (userDeltaYaw < -0.3f && diffYaw > 0.2f)) {
-        assistRate *= 0.15f; // Reduce by 85% when user swipes away
-    }
-    if ((userDeltaPitch > 0.3f && diffPitch < -0.2f) || (userDeltaPitch < -0.3f && diffPitch > 0.2f)) {
-        assistRate *= 0.15f;
+    // If player is actively swiping AWAY from the target, drastically suppress assist (90-100%)
+    // so player retains 100% effortless camera control and can look away freely at any time!
+    bool userFightingYaw = (userDeltaYaw > 0.25f && diffYaw < -0.15f) || (userDeltaYaw < -0.25f && diffYaw > 0.15f);
+    bool userFightingPitch = (userDeltaPitch > 0.25f && diffPitch < -0.15f) || (userDeltaPitch < -0.25f && diffPitch > 0.15f);
+
+    if (userFightingYaw || userFightingPitch) {
+        if (fabsf(userDeltaYaw) > 1.2f || fabsf(userDeltaPitch) > 1.2f) {
+            assistRate = 0.0f; // Complete release on fast flick away
+        } else {
+            assistRate *= 0.10f; // 90% reduction on gentle swipe away
+        }
     }
 
     float stepYaw = diffYaw * assistRate;
     float stepPitch = diffPitch * assistRate;
 
     // 9. Angular velocity clamp per frame
-    // Player thumb swipes (typically 5-15 deg/frame) will easily overpower this assist
-    // Max angular speed: 0.4 deg/frame (at s=0) to 1.2 deg/frame (at s=1.0)
-    float maxStepPerFrame = 0.4f + 0.8f * s;
+    // High clamp allows instant snap when entering FOV
+    // Max angular speed: 4.0 deg/frame (at s=0) to 20.0 deg/frame (at s=1.0)
+    float maxStepPerFrame = 4.0f + 16.0f * s;
     float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
     if (stepLen > maxStepPerFrame) {
         float scale = maxStepPerFrame / stepLen;
@@ -2135,7 +2142,7 @@ static void processAimAssistLock(void *aimingControl) {
 
     if (nowMs - g_lastAimAssistLogMs > 6000) {
         g_lastAimAssistLogMs = nowMs;
-        ModLog("[AIM_ASSIST] Smooth Assist Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+        ModLog("[AIM_ASSIST] Instant Snap Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Speed/Smooth: %d%% | Step: (%.2f, %.2f)",
                targetInfo.isHead ? "HEAD BONE" : "BODY BONE",
                targetInfo.dist3D,
                targetInfo.angleOffset,
