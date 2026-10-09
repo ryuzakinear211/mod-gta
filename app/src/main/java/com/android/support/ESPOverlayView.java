@@ -155,14 +155,15 @@ public class ESPOverlayView extends View {
                 boolean isEnemy = entityData[base + 8] > 0.5f;
 
                 // Box dimensions
+                float boxMidX = (rootX + headX) / 2.0f;
                 float boxHeight = Math.abs(rootY - headY);
                 if (boxHeight < dp(14)) boxHeight = dp(14);
-                float boxWidth = boxHeight * 0.52f;
+                float boxWidth = boxHeight * 0.50f;
 
-                float boxTop = Math.min(headY, rootY) - (boxHeight * 0.12f);
-                float boxBottom = Math.max(headY, rootY) + (boxHeight * 0.06f);
-                float boxLeft = rootX - (boxWidth / 2.0f);
-                float boxRight = rootX + (boxWidth / 2.0f);
+                float boxTop = Math.min(headY, rootY) - (boxHeight * 0.08f);
+                float boxBottom = Math.max(headY, rootY) + (boxHeight * 0.04f);
+                float boxLeft = boxMidX - (boxWidth / 2.0f);
+                float boxRight = boxMidX + (boxWidth / 2.0f);
 
                 // Palette selection
                 Paint boxPaint = isEnemy ? (isBot ? mPaintBoxBot : mPaintBoxEnemy) : mPaintBoxAlly;
@@ -170,7 +171,7 @@ public class ESPOverlayView extends View {
 
                 // 1. Tracer Line
                 if (drawLine) {
-                    canvas.drawLine(screenMidX, tracerOriginY, headX, boxTop, linePaint);
+                    canvas.drawLine(screenMidX, tracerOriginY, boxMidX, boxTop, linePaint);
                 }
 
                 // 2. 2D Bounding Box (Corner brackets style for tactical look)
@@ -203,14 +204,14 @@ public class ESPOverlayView extends View {
                 if (drawName) {
                     String label = (isBot ? "[BOT]" : "[PLAYER]") + (isEnemy ? " [E]" : " [A]");
                     float labelY = boxTop - dp(4.0f);
-                    drawTextWithOutline(canvas, label, rootX, labelY, boxPaint.getColor());
+                    drawTextWithOutline(canvas, label, boxMidX, labelY, boxPaint.getColor());
                 }
 
                 // 5. Distance (in meters below box)
                 if (drawDistance) {
                     String distStr = String.format("%.0fm", dist);
                     float distY = boxBottom + dp(11.0f);
-                    drawTextWithOutline(canvas, distStr, rootX, distY, Color.parseColor("#00E5FF"));
+                    drawTextWithOutline(canvas, distStr, boxMidX, distY, Color.parseColor("#00E5FF"));
                 }
             }
         }

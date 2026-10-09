@@ -1,0 +1,43 @@
+name: Build Mod Menu Native Library
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-native:
+    name: Build Native Library (arm64-v8a)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27b
+          add-to-path: true
+
+      - name: Build with ndk-build
+        run: |
+          ndk-build -C app/src/main/jni
+
+      - name: Verify libModMenu.so
+        run: |
+          ls -lh app/src/main/libs/arm64-v8a/libModMenu.so
+
+      - name: Upload libModMenu.so Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libModMenu-arm64-v8a
+          path: app/src/main/libs/arm64-v8a/libModMenu.so

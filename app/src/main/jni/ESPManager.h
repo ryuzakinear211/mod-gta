@@ -9,7 +9,7 @@
 #include "Includes/Logger.h"
 #include "hook.h"
 
-// Forward declaration of helpers defined in Main.cpp
+// Forward declarations of helper functions defined in Main.cpp
 static bool isNetworkPlayerTeammate(void *netPlayer);
 static bool isEntityEnemy(void *netPlayer, void *targetibleObj, void *botPlayer);
 static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj);
@@ -129,6 +129,7 @@ public:
             return 0;
         }
 
+        void *localTObj = g_localPlayerTargetibleObject.load();
         int visibleCount = 0;
 
         for (auto it = enemies.begin(); it != enemies.end(); ) {
@@ -147,60 +148,167 @@ public:
                 continue;
             }
 
-            // Check if entity is dead/corpse
-            bool isDead = false;
-            if (enemy->isBot) {
-                isDead = isEntityDeadOrCorpse(nullptr, entityObj, nullptr);
-            } else {
-                isDead = isEntityDeadOrCorpse(entityObj, nullptr, nullptr);
+            // Ensure transform is valid
+            if (get_transform == nullptr) {
+                ++it;
+                continue;
             }
-
-            if (isDead) {
-                delete enemy;
-                it = enemies.erase(it);
+            void *rootTrans = get_transform(entityObj);
+            if (rootTrans == nullptr || !isUnityObjectAlive(rootTrans)) {
+                ++it;
+                continue;
+            }
+            Vector3 charRoot = getTransformPosition(rootTrans);
+            if (charRoot.x == 0.0f && charRoot.y == 0.0f && charRoot.z == 0.0f) {
+                ++it;
                 continue;
             }
 
-            // Teammate & Enemy filtering
-            bool isEnemy = true;
+            // Health extraction & death verification
+            int currentHp = 100;
+            int maxHp = 100;
+            bool isDead = false;
+
             if (enemy->isBot) {
-                isEnemy = isEntityEnemy(nullptr, nullptr, entityObj);
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x30))) {
+                    void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x30);
+                    if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
+                            float hpVal = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
+                            if (hpVal <= 0.0f) {
+                                isDead = true;
+                            } else {
+                                currentHp = static_cast<int>(hpVal);
+                            }
+                        }
+                    }
+                }
             } else {
-                isEnemy = isEntityEnemy(entityObj, nullptr, nullptr);
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0))) {
+                    void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0);
+                    if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
+                            bool isAlive = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
+                            if (!isAlive) {
+                                isDead = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (isDead) {
+                // Skip rendering dead entity this frame without erasing it permanently
+                ++it;
+                continue;
+            }
+
+            // Team & Enemy discrimination
+            bool isEnemy = true;
+            void *targetibleObj = nullptr;
+
+            if (enemy->isBot) {
+                // AI Bots in match are enemies by default
+                isEnemy = true;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x60))) {
+                    targetibleObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x60);
+                }
+                if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
+                    targetibleObj = BotPlayer_GetTargetibleObject(entityObj);
+                }
+                if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
+                        void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
+                        if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
+                            if (get_AllyObjectToogle != nullptr && get_AllyObjectToogle(customSettings)) {
+                                isEnemy = false;
+                            } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
+                                if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20)) {
+                                    isEnemy = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // NetworkPlayer
+                if (NetworkPlayer_GetTargetibleObject != nullptr) {
+                    targetibleObj = NetworkPlayer_GetTargetibleObject(entityObj);
+                }
+
+                int targetType = 0;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0))) {
+                    void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0);
+                    if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
+                            targetType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
+                        }
+                        if (targetType == 0 && get_TargetType != nullptr) {
+                            targetType = get_TargetType(targetInfo);
+                        }
+                    }
+                }
+
+                if (targetType == 1) { // LocalPlayer
+                    g_localPlayerNetPlayer.store(entityObj);
+                    ++it;
+                    continue;
+                }
+
+                if (targetType != 0) {
+                    if ((targetType & (2 | 8 | 32)) != 0) {
+                        isEnemy = false; // Teammate/Ally
+                    } else if ((targetType & (4 | 16 | 64 | 128)) != 0) {
+                        isEnemy = true;  // Enemy
+                    }
+                } else {
+                    if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
+                            void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
+                            if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
+                                if (get_AllyObjectToogle != nullptr && get_AllyObjectToogle(customSettings)) {
+                                    isEnemy = false;
+                                } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
+                                    if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20)) {
+                                        isEnemy = false;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        void *localNet = g_localPlayerNetPlayer.load();
+                        if (localNet != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localNet)) {
+                            isEnemy = !NetworkPlayer_IsTeammate(entityObj, localNet);
+                        } else {
+                            isEnemy = true;
+                        }
+                    }
+                }
             }
             enemy->isEnemy = isEnemy;
 
+            // Filter if enemy only toggle is active
             if (enemyOnly && !isEnemy) {
                 ++it;
                 continue;
             }
 
-            // Resolve 3D Bone Coordinates (Head & Root)
+            // Resolve 3D Bone Coordinates (Head & Ground/Feet)
             void *headBone = nullptr;
-            void *bodyBone = nullptr;
-            int currentHp = 100;
-            int maxHp = 100;
 
             if (enemy->isBot) {
-                // AI Bot Bone Resolution
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x58))) {
                     void *tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x58);
                     if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
                         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78))) {
                             void *animator = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78);
                             if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
-                                void *hb = GetBoneTransform(animator, 10);
+                                void *hb = GetBoneTransform(animator, 10); // Head bone
                                 if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
-                                void *bb = GetBoneTransform(animator, 9);
-                                if (bb == nullptr || !isUnityObjectAlive(bb)) {
-                                    bb = GetBoneTransform(animator, 8);
-                                }
-                                if (bb != nullptr && isUnityObjectAlive(bb)) bodyBone = bb;
                             }
                         }
                     }
                 }
-
                 if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x28))) {
                     void *botLook = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x28);
                     if (botLook != nullptr && isUnityObjectAlive(botLook)) {
@@ -210,22 +318,13 @@ public:
                         }
                     }
                 }
-
-                // Bot Health Resolution (BotPlayerHealth at 0x30)
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x30))) {
-                    void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x30);
-                    if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
-                        float hpVal = 100.0f;
-                        if (BotPlayerHealth_GetHealth != nullptr) {
-                            hpVal = BotPlayerHealth_GetHealth(botHealth);
-                        } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
-                            hpVal = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
-                        }
-                        currentHp = static_cast<int>(std::max(0.0f, hpVal));
+                if (headBone == nullptr && targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x38))) {
+                        void *t = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x38);
+                        if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
                     }
                 }
             } else {
-                // Real Network Player Bone Resolution
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x88))) {
                     void *dollsMgr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x88);
                     if (dollsMgr != nullptr && isUnityObjectAlive(dollsMgr)) {
@@ -242,81 +341,46 @@ public:
                                 if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
                                     void *hb = GetBoneTransform(animator, 10);
                                     if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
-                                    void *bb = GetBoneTransform(animator, 9);
-                                    if (bb == nullptr || !isUnityObjectAlive(bb)) {
-                                        bb = GetBoneTransform(animator, 8);
-                                    }
-                                    if (bb != nullptr && isUnityObjectAlive(bb)) bodyBone = bb;
                                 }
                             }
                         }
                     }
                 }
-
-                if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0xC8))) {
-                    void *bpm = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0xC8);
-                    if (bpm != nullptr && isPointerReadable(bpm)) {
-                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bpm) + 0x20))) {
-                            void *bodyPointsArr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bpm) + 0x20);
-                            if (bodyPointsArr != nullptr && isPointerReadable(bodyPointsArr)) {
-                                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bodyPointsArr) + 0x18))) {
-                                    uintptr_t length = *reinterpret_cast<uintptr_t *>(reinterpret_cast<uintptr_t>(bodyPointsArr) + 0x18);
-                                    if (length > 0 && length < 32) {
-                                        void **items = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bodyPointsArr) + 0x20);
-                                        for (uintptr_t i = 0; i < length; i++) {
-                                            if (isPointerReadable(&items[i])) {
-                                                void *bp = items[i];
-                                                if (bp != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bp) + 0x10))) {
-                                                    void *bpView = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bp) + 0x10);
-                                                    if (bpView != nullptr && isUnityObjectAlive(bpView) &&
-                                                        isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bpView) + 0x20))) {
-                                                        int pType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(bpView) + 0x20);
-                                                        if (pType == 0 && headBone == nullptr && get_transform != nullptr) {
-                                                            void *t = get_transform(bpView);
-                                                            if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
-                                                        } else if (pType != 0 && bodyBone == nullptr && get_transform != nullptr) {
-                                                            void *t = get_transform(bpView);
-                                                            if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                if (headBone == nullptr && targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40))) {
+                        void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40);
+                        if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
+                            void *t = get_transform(col);
+                            if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
                         }
                     }
                 }
             }
 
-            // Calculate world positions
+            Vector3 worldFeet = charRoot;
+            if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x80))) {
+                    void *footTrans = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x80);
+                    if (footTrans != nullptr && isUnityObjectAlive(footTrans)) {
+                        Vector3 fPos = getTransformPosition(footTrans);
+                        if (fPos.x != 0.0f || fPos.y != 0.0f || fPos.z != 0.0f) {
+                            worldFeet = fPos;
+                        }
+                    }
+                }
+            }
+
             Vector3 worldHead(0.0f, 0.0f, 0.0f);
-            Vector3 worldRoot(0.0f, 0.0f, 0.0f);
 
             if (headBone != nullptr && isUnityObjectAlive(headBone)) {
                 worldHead = getTransformPosition(headBone);
             }
-            if (bodyBone != nullptr && isUnityObjectAlive(bodyBone)) {
-                worldRoot = getTransformPosition(bodyBone);
-            }
-
-            // Fallback to transform if either bone is missing
-            if (worldRoot.x == 0.0f && worldRoot.y == 0.0f && worldRoot.z == 0.0f) {
-                if (get_transform != nullptr) {
-                    void *t = get_transform(entityObj);
-                    if (t != nullptr && isUnityObjectAlive(t)) {
-                        worldRoot = getTransformPosition(t);
-                    }
-                }
-            }
             if (worldHead.x == 0.0f && worldHead.y == 0.0f && worldHead.z == 0.0f) {
-                worldHead = worldRoot + Vector3(0.0f, 1.65f, 0.0f);
-            }
-            // Root height adjustment (feet ground level)
-            Vector3 worldFeet = worldRoot;
-            if (worldFeet.y > worldHead.y - 0.5f) {
-                worldFeet.y = worldHead.y - 1.65f;
+                worldHead = worldFeet + Vector3(0.0f, 1.70f, 0.0f);
+            } else if (worldHead.y <= worldFeet.y + 0.3f) {
+                worldHead = worldFeet + Vector3(0.0f, 1.70f, 0.0f);
+            } else {
+                worldHead = worldHead + Vector3(0.0f, 0.15f, 0.0f);
             }
 
             // World to Viewport Projection
@@ -326,25 +390,45 @@ public:
             bool headValid = worldToViewport(cameraObj, worldHead, vpHead);
             bool feetValid = worldToViewport(cameraObj, worldFeet, vpFeet);
 
-            if (!headValid && !feetValid) {
-                // Completely behind camera
+            // In Unity, z > 0.1f means the target is in front of the camera view
+            if ((!headValid && !feetValid) || (vpHead.z < 0.2f && vpFeet.z < 0.2f)) {
+                // Target is behind camera
                 ++it;
                 continue;
             }
 
-            float dist = feetValid ? vpFeet.z : vpHead.z;
+            float dist = (vpFeet.z > 0.2f) ? vpFeet.z : vpHead.z;
             if (dist < 0.2f || dist > maxDistance) {
                 ++it;
                 continue;
             }
 
             // Convert Viewport coordinates (0..1) to Android Screen Canvas coordinates
-            float screenRootX = vpFeet.x * screenWidth;
-            float screenRootY = (1.0f - vpFeet.y) * screenHeight;
-            float screenHeadX = vpHead.x * screenWidth;
-            float screenHeadY = (1.0f - vpHead.y) * screenHeight;
+            float screenHeadX = vpHead.x * static_cast<float>(screenWidth);
+            float screenHeadY = (1.0f - vpHead.y) * static_cast<float>(screenHeight);
 
-            // Push 9 float attributes into the buffer
+            float screenRootX = vpFeet.x * static_cast<float>(screenWidth);
+            float screenRootY = (1.0f - vpFeet.y) * static_cast<float>(screenHeight);
+
+            // Handle edge clipping when feet or head cross near camera plane
+            float approxH = (static_cast<float>(screenHeight) * 1.70f) / std::max(0.5f, dist);
+            if (!headValid || vpHead.z < 0.2f) {
+                screenHeadX = screenRootX;
+                screenHeadY = screenRootY - approxH;
+            } else if (!feetValid || vpFeet.z < 0.2f) {
+                screenRootX = screenHeadX;
+                screenRootY = screenHeadY + approxH;
+            }
+
+            // Discard targets extremely far off-screen
+            float offMargin = static_cast<float>(screenWidth) * 0.4f;
+            if (screenHeadX < -offMargin || screenHeadX > static_cast<float>(screenWidth) + offMargin ||
+                screenHeadY < -offMargin || screenHeadY > static_cast<float>(screenHeight) + offMargin) {
+                ++it;
+                continue;
+            }
+
+            // Push 9 float attributes into the serialized buffer for JNI
             outBuffer.push_back(screenRootX);
             outBuffer.push_back(screenRootY);
             outBuffer.push_back(screenHeadX);
