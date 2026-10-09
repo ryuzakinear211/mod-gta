@@ -47,6 +47,7 @@ namespace Offsets {
     constexpr uintptr_t UNITY_WORLD_TO_VIEWPORT_POINT       = 0x851DF1C;
     constexpr uintptr_t UNITY_WORLD_TO_SCREEN_POINT         = 0x851DE04;
     constexpr uintptr_t UNITY_CAMERA_GET_MAIN               = 0x851ED38;
+    constexpr uintptr_t UNITY_CAMERA_GET_CURRENT            = 0x851EDD4;
     constexpr uintptr_t UNITY_SET_ROTATION_INJECTED         = 0x85B1E5C;
     constexpr uintptr_t UNITY_LOOK_ROTATION_INJECTED        = 0x8588584;
     constexpr uintptr_t UNITY_COLLIDER_GET_ENABLED          = 0x864B404;
@@ -389,6 +390,7 @@ inline void (*SetLocalEulerAngles_Injected)(void *, const Vector3 *, int) = null
 inline void (*WorldToViewportPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
 inline void (*WorldToScreenPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
 inline void *(*Camera_get_main)() = nullptr;
+inline void *(*Camera_get_current)() = nullptr;
 inline void (*set_rotation_Injected)(void *, const Quaternion *) = nullptr;
 inline void (*LookRotation_Injected)(const Vector3 *, const Vector3 *, Quaternion *) = nullptr;
 inline bool (*Collider_get_enabled)(void *) = nullptr;
@@ -499,6 +501,7 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::UNITY_WORLD_TO_VIEWPORT_POINT,       WorldToViewportPoint_Injected, "WorldToViewportPoint_Injected");
     resolvePointer(base, Offsets::UNITY_WORLD_TO_SCREEN_POINT,         WorldToScreenPoint_Injected,   "WorldToScreenPoint_Injected");
     resolvePointer(base, Offsets::UNITY_CAMERA_GET_MAIN,               Camera_get_main,               "Camera_get_main");
+    resolvePointer(base, Offsets::UNITY_CAMERA_GET_CURRENT,            Camera_get_current,            "Camera_get_current");
     resolvePointer(base, Offsets::UNITY_SET_ROTATION_INJECTED,         set_rotation_Injected,         "set_rotation_Injected");
     resolvePointer(base, Offsets::UNITY_LOOK_ROTATION_INJECTED,        LookRotation_Injected,         "LookRotation_Injected");
     resolvePointer(base, Offsets::UNITY_COLLIDER_GET_ENABLED,          Collider_get_enabled,          "Collider_get_enabled");

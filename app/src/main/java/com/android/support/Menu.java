@@ -1266,13 +1266,23 @@ public class Menu {
         mEspOverlay.setVisibility(View.GONE);
     }
 
+    public void ensureEspOverlayAdded() {
+        if (mEspOverlay != null && mWindowManager != null && mEspOverlay.getParent() == null) {
+            try {
+                mWindowManager.addView(mEspOverlay, espParams);
+            } catch (Exception ignored) {}
+        }
+    }
+
     public void setEspLine(final boolean enabled) {
+        ensureEspOverlayAdded();
         if (mEspOverlay != null) {
             mEspOverlay.setEspLine(enabled);
         }
     }
 
     public void setEspBox(final boolean enabled) {
+        ensureEspOverlayAdded();
         if (mEspOverlay != null) {
             mEspOverlay.setEspBox(enabled);
         }

@@ -1737,6 +1737,14 @@ void hook_AimingControl_Update(void *instance) {
     if (instance != nullptr && isUnityObjectAlive(instance)) {
         g_activeAimingControl.store(instance);
 
+        // Always capture active player FPS camera (_aimingCamera at offset 0x20)
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x20))) {
+            void *cam = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x20);
+            if (cam != nullptr && isUnityObjectAlive(cam)) {
+                g_activeAimingCamera.store(cam);
+            }
+        }
+
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
             *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
         }
@@ -2004,7 +2012,7 @@ void hook_NetworkPlayer_Update(void *instance) {
         onNetworkPlayerUpdate(instance);
 
         if (espManager != nullptr && (g_espLine.load() || g_espBox.load())) {
-            espManager->tryAddEnemy(instance);
+            espManager->tryAddEnemy(instance, ENTITY_TYPE_NET_PLAYER);
         }
 
         if (g_bigHead.load()) {
@@ -2054,7 +2062,7 @@ void hook_BotPlayer_Start(void *instance) {
         onBotPlayerUpdate(instance);
 
         if (espManager != nullptr && (g_espLine.load() || g_espBox.load())) {
-            espManager->tryAddEnemy(instance);
+            espManager->tryAddEnemy(instance, ENTITY_TYPE_BOT_PLAYER);
         }
     }
     if (old_BotPlayer_Start != nullptr) {
@@ -2070,7 +2078,7 @@ void hook_BotPlayer_Update(void *instance) {
         onBotPlayerUpdate(instance);
 
         if (espManager != nullptr && (g_espLine.load() || g_espBox.load())) {
-            espManager->tryAddEnemy(instance);
+            espManager->tryAddEnemy(instance, ENTITY_TYPE_BOT_PLAYER);
         }
 
         if (g_bigHead.load()) {
@@ -2408,6 +2416,27 @@ jfloatArray GetEspData(JNIEnv *env, jclass clazz, jint screenWidth, jint screenH
         return nullptr;
     }
 
+    // Auto-sync active player and bot candidates into ESPManager so no entity is missed
+    {
+        std::lock_guard<std::mutex> lock(g_entityMutex);
+        uint64_t now = getCurrentTimeMs();
+        const uint64_t TIMEOUT_MS = 2500;
+        void *localPlayer = g_localPlayerNetPlayer.load();
+
+        for (const auto &pair : g_networkPlayers) {
+            if (now - pair.second <= TIMEOUT_MS && isUnityObjectAlive(pair.first)) {
+                if (pair.first != localPlayer) {
+                    espManager->tryAddEnemy(pair.first, ENTITY_TYPE_NET_PLAYER);
+                }
+            }
+        }
+        for (const auto &pair : g_botPlayers) {
+            if (now - pair.second <= TIMEOUT_MS && isUnityObjectAlive(pair.first)) {
+                espManager->tryAddEnemy(pair.first, ENTITY_TYPE_BOT_PLAYER);
+            }
+        }
+    }
+
     void *cam = get_camera();
     if (cam == nullptr || !isUnityObjectAlive(cam)) {
         return nullptr;
@@ -2428,26 +2457,34 @@ jfloatArray GetEspData(JNIEnv *env, jclass clazz, jint screenWidth, jint screenH
 
             if (!isUnityObjectAlive(playerObj)) continue;
             if (localPlayer != nullptr && playerObj == localPlayer) continue;
-            if (isNetworkPlayerTeammate(playerObj)) continue;
-            if (IsPlayerDead(playerObj)) continue;
+
+            // Safe Teammate Verification
+            if (enemy->type == ENTITY_TYPE_BOT_PLAYER) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x50))) {
+                    void *botNet = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x50);
+                    if (botNet != nullptr && isUnityObjectAlive(botNet) && isNetworkPlayerTeammate(botNet)) {
+                        continue;
+                    }
+                }
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x60))) {
+                    void *tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x60);
+                    if (tObj != nullptr && isUnityObjectAlive(tObj) && isTargetibleObjectTeammate(tObj)) {
+                        continue;
+                    }
+                }
+            } else {
+                if (isNetworkPlayerTeammate(playerObj)) continue;
+            }
+
+            if (IsPlayerDead(playerObj, enemy->type)) continue;
 
             Vector3 rootPos = GetPlayerLocation(playerObj);
-            if (rootPos.x == 0.0f && rootPos.y == 0.0f && rootPos.z == 0.0f) continue;
 
-            Vector3 headWorldPos = rootPos + Vector3(0.0f, 1.80f, 0.0f);
-            Vector3 feetWorldPos = rootPos;
-
+            // Resilient Bone & Head Position Resolution
             void *headBone = nullptr;
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x88))) {
-                void *dollsMgr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x88);
-                if (dollsMgr != nullptr && isUnityObjectAlive(dollsMgr)) {
-                    void *tpCtrl = nullptr;
-                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50))) {
-                        tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50);
-                    }
-                    if (tpCtrl == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60))) {
-                        tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60);
-                    }
+            if (enemy->type == ENTITY_TYPE_BOT_PLAYER) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x58))) {
+                    void *tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x58);
                     if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
                         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78))) {
                             void *animator = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78);
@@ -2458,27 +2495,106 @@ jfloatArray GetEspData(JNIEnv *env, jclass clazz, jint screenWidth, jint screenH
                         }
                     }
                 }
+                if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x28))) {
+                    void *botLook = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x28);
+                    if (botLook != nullptr && isUnityObjectAlive(botLook)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botLook) + 0x28))) {
+                            void *t = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botLook) + 0x28);
+                            if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
+                        }
+                    }
+                }
+                if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x60))) {
+                    void *tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x60);
+                    if (tObj != nullptr && isUnityObjectAlive(tObj)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tObj) + 0x40))) {
+                            void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tObj) + 0x40);
+                            if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
+                                void *t = get_transform(col);
+                                if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x88))) {
+                    void *dollsMgr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x88);
+                    if (dollsMgr != nullptr && isUnityObjectAlive(dollsMgr)) {
+                        void *tpCtrl = nullptr;
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50))) {
+                            tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50);
+                        }
+                        if (tpCtrl == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60))) {
+                            tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60);
+                        }
+                        if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
+                            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78))) {
+                                void *animator = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78);
+                                if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
+                                    void *hb = GetBoneTransform(animator, 10);
+                                    if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
+                                }
+                            }
+                        }
+                    }
+                }
             }
+
+            Vector3 headWorldPos(0.0f, 0.0f, 0.0f);
+            Vector3 feetWorldPos(0.0f, 0.0f, 0.0f);
 
             if (headBone != nullptr) {
                 Vector3 hp = getTransformPosition(headBone);
                 if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
                     headWorldPos = hp;
-                    feetWorldPos = Vector3(hp.x, rootPos.y, hp.z);
+                    if (rootPos.x != 0.0f || rootPos.y != 0.0f || rootPos.z != 0.0f) {
+                        feetWorldPos = Vector3(hp.x, rootPos.y, hp.z);
+                    } else {
+                        feetWorldPos = Vector3(hp.x, hp.y - 1.80f, hp.z);
+                    }
                 }
             }
 
-            Vector3 screenHead = WorldToScreenPoint(cam, headWorldPos);
-            Vector3 screenFeet = WorldToScreenPoint(cam, feetWorldPos);
+            if (headWorldPos.x == 0.0f && headWorldPos.y == 0.0f && headWorldPos.z == 0.0f) {
+                if (rootPos.x == 0.0f && rootPos.y == 0.0f && rootPos.z == 0.0f) continue;
+                headWorldPos = rootPos + Vector3(0.0f, 1.80f, 0.0f);
+                feetWorldPos = rootPos;
+            }
 
-            if (screenHead.z < 0.5f) continue; // In front of camera check
+            // Project coordinates using worldToViewport (normalized, independent of render buffer scale)
+            Vector3 vpHead(0.0f, 0.0f, -1.0f);
+            Vector3 vpFeet(0.0f, 0.0f, -1.0f);
+            bool hasVp = worldToViewport(cam, headWorldPos, vpHead) && (vpHead.z > 0.2f);
 
-            float canvasHeadX = screenHead.x;
-            float canvasHeadY = static_cast<float>(screenHeight) - screenHead.y;
-            float canvasFeetY = static_cast<float>(screenHeight) - screenFeet.y;
+            float canvasHeadX = 0.0f;
+            float topY = 0.0f;
+            float bottomY = 0.0f;
+            float distance = 0.0f;
 
-            float topY = canvasHeadY;
-            float bottomY = canvasFeetY;
+            if (hasVp) {
+                if (!worldToViewport(cam, feetWorldPos, vpFeet)) {
+                    vpFeet = vpHead;
+                    vpFeet.y -= 0.15f;
+                }
+                canvasHeadX = vpHead.x * static_cast<float>(screenWidth);
+                float canvasHeadY = (1.0f - vpHead.y) * static_cast<float>(screenHeight);
+                float canvasFeetY = (1.0f - vpFeet.y) * static_cast<float>(screenHeight);
+
+                topY = canvasHeadY;
+                bottomY = canvasFeetY;
+                distance = vpHead.z;
+            } else {
+                // Secondary Fallback: Direct WorldToScreenPoint
+                Vector3 screenHead = WorldToScreenPoint(cam, headWorldPos);
+                Vector3 screenFeet = WorldToScreenPoint(cam, feetWorldPos);
+                if (screenHead.z < 0.2f) continue;
+
+                canvasHeadX = screenHead.x;
+                topY = static_cast<float>(screenHeight) - screenHead.y;
+                bottomY = static_cast<float>(screenHeight) - screenFeet.y;
+                distance = screenHead.z;
+            }
+
             if (topY > bottomY) std::swap(topY, bottomY);
 
             float boxHeight = bottomY - topY;
@@ -2494,8 +2610,6 @@ jfloatArray GetEspData(JNIEnv *env, jclass clazz, jint screenWidth, jint screenH
                 bottomY < -200.0f || topY > screenHeight + 200.0f) {
                 continue;
             }
-
-            float distance = screenHead.z;
 
             drawList.push_back(canvasHeadX);
             drawList.push_back(topY);

@@ -13,11 +13,22 @@
 // Global player pointer matching tutorial
 inline void *myPlayer = nullptr;
 
+// Entity classification for accurate life checking and bone parsing
+enum EntityType {
+    ENTITY_TYPE_UNKNOWN = 0,
+    ENTITY_TYPE_NET_PLAYER = 1,
+    ENTITY_TYPE_BOT_PLAYER = 2
+};
+
 // Enemy entity structure matching tutorial
 struct enemy_t {
     void *object;
+    EntityType type;
     Vector3 location;
     int health;
+
+    enemy_t() : object(nullptr), type(ENTITY_TYPE_UNKNOWN), location(Vector3(0.0f, 0.0f, 0.0f)), health(100) {}
+    enemy_t(void *obj, EntityType t) : object(obj), type(t), location(Vector3(0.0f, 0.0f, 0.0f)), health(100) {}
 };
 
 // Forward declarations from Main.cpp
@@ -26,21 +37,40 @@ extern bool isNetworkPlayerTeammate(void *netPlayer);
 extern std::atomic<void*> g_localPlayerNetPlayer;
 extern std::atomic<void*> g_activeAimingCamera;
 
-// Health & Alive checking helpers matching tutorial
-inline int GetPlayerHealth(void *player) {
-    if (player == nullptr || !isPointerReadable(player) || !isUnityObjectAlive(player)) return 0;
-    if (isEntityDeadOrCorpse(player, player, nullptr)) return 0;
-    return 100;
-}
-
-inline bool PlayerAlive(void *player) {
-    if (player == nullptr || !isPointerReadable(player) || !isUnityObjectAlive(player)) return false;
-    return !isEntityDeadOrCorpse(player, player, nullptr);
-}
-
-inline bool IsPlayerDead(void *player) {
+// Safe Health & Alive checking helpers matching tutorial
+inline bool IsPlayerDead(void *player, EntityType type = ENTITY_TYPE_UNKNOWN) {
     if (player == nullptr || !isPointerReadable(player) || !isUnityObjectAlive(player)) return true;
-    return isEntityDeadOrCorpse(player, player, nullptr);
+
+    if (type == ENTITY_TYPE_NET_PLAYER) {
+        return isEntityDeadOrCorpse(player, nullptr, nullptr);
+    } else if (type == ENTITY_TYPE_BOT_PLAYER) {
+        void *netPlayer = nullptr;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(player) + 0x50))) {
+            netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(player) + 0x50);
+            if (netPlayer != nullptr && !isUnityObjectAlive(netPlayer)) {
+                netPlayer = nullptr;
+            }
+        }
+        void *tObj = nullptr;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(player) + 0x60))) {
+            tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(player) + 0x60);
+            if (tObj != nullptr && !isUnityObjectAlive(tObj)) {
+                tObj = nullptr;
+            }
+        }
+        return isEntityDeadOrCorpse(netPlayer, player, tObj);
+    }
+
+    return false;
+}
+
+inline bool PlayerAlive(void *player, EntityType type = ENTITY_TYPE_UNKNOWN) {
+    return !IsPlayerDead(player, type);
+}
+
+inline int GetPlayerHealth(void *player, EntityType type = ENTITY_TYPE_UNKNOWN) {
+    if (player == nullptr || IsPlayerDead(player, type)) return 0;
+    return 100;
 }
 
 // Transform & Position helpers matching tutorial
@@ -64,18 +94,30 @@ inline Vector3 GetPlayerLocation(void *player) {
     return get_position(tf);
 }
 
-// Camera helper matching tutorial
+// Camera helper matching tutorial with multiple resilient fallbacks
 inline void *get_camera() {
+    // 1. AimingCamera from AimingControl (Active Player FPS Camera)
+    void *aimCam = g_activeAimingCamera.load();
+    if (aimCam != nullptr && isUnityObjectAlive(aimCam)) {
+        return aimCam;
+    }
+
+    // 2. Camera.main
     if (Camera_get_main != nullptr) {
         void *cam = Camera_get_main();
         if (cam != nullptr && isUnityObjectAlive(cam)) {
             return cam;
         }
     }
-    void *aimCam = g_activeAimingCamera.load();
-    if (aimCam != nullptr && isUnityObjectAlive(aimCam)) {
-        return aimCam;
+
+    // 3. Camera.current
+    if (Camera_get_current != nullptr) {
+        void *curCam = Camera_get_current();
+        if (curCam != nullptr && isUnityObjectAlive(curCam)) {
+            return curCam;
+        }
     }
+
     return nullptr;
 }
 
@@ -168,7 +210,7 @@ public:
         }
     }
 
-    void tryAddEnemy(void *enemyObject) {
+    void tryAddEnemy(void *enemyObject, EntityType type = ENTITY_TYPE_UNKNOWN) {
         if (enemyObject == nullptr) return;
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!enemies) return;
@@ -177,24 +219,23 @@ public:
             return;
         }
 
-        if (IsPlayerDead(enemyObject)) {
+        if (IsPlayerDead(enemyObject, type)) {
             return;
         }
 
-        enemy_t *newEnemy = new enemy_t();
-        newEnemy->object = enemyObject;
+        enemy_t *newEnemy = new enemy_t(enemyObject, type);
         newEnemy->health = 100;
         newEnemy->location = GetPlayerLocation(enemyObject);
 
         enemies->push_back(newEnemy);
     }
 
-    void updateEnemies(void *enemyObject) {
+    void updateEnemies() {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!enemies) return;
         for (size_t i = 0; i < enemies->size(); ) {
             enemy_t *current = (*enemies)[i];
-            if (current == nullptr || current->object == nullptr || IsPlayerDead(current->object)) {
+            if (current == nullptr || current->object == nullptr || IsPlayerDead(current->object, current->type)) {
                 delete current;
                 enemies->erase(enemies->begin() + i);
             } else {
@@ -202,6 +243,15 @@ public:
                 ++i;
             }
         }
+    }
+
+    void clearEnemies() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!enemies) return;
+        for (auto *e : *enemies) {
+            delete e;
+        }
+        enemies->clear();
     }
 
     void removeEnemyGivenObject(void *enemyObject) {

@@ -10,7 +10,9 @@ import android.view.View;
 public class ESPOverlayView extends View {
 
     private Paint linePaint;
+    private Paint lineShadowPaint;
     private Paint boxPaint;
+    private Paint boxShadowPaint;
     private Paint textPaint;
 
     private boolean espLineEnabled = false;
@@ -27,11 +29,23 @@ public class ESPOverlayView extends View {
     }
 
     private void init() {
-        // ESP Line: Berwarna Kuning (Yellow) sesuai permintaan
+        // Outline hitam di belakang garis kuning untuk kontras maksimal di latar terang
+        lineShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        lineShadowPaint.setColor(Color.argb(180, 0, 0, 0));
+        lineShadowPaint.setStrokeWidth(4.5f);
+        lineShadowPaint.setStyle(Paint.Style.STROKE);
+
+        // ESP Line: Berwarna Kuning (Yellow) sesuai tutorial
         linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         linePaint.setColor(Color.YELLOW);
         linePaint.setStrokeWidth(2.5f);
         linePaint.setStyle(Paint.Style.STROKE);
+
+        // Outline hitam untuk kotak 2D ESP Box
+        boxShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        boxShadowPaint.setColor(Color.argb(180, 0, 0, 0));
+        boxShadowPaint.setStrokeWidth(4.5f);
+        boxShadowPaint.setStyle(Paint.Style.STROKE);
 
         // ESP Box: Berwarna Kuning (Yellow)
         boxPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -42,10 +56,10 @@ public class ESPOverlayView extends View {
         // Text Paint untuk indikator jarak (Distance)
         textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         textPaint.setColor(Color.YELLOW);
-        textPaint.setTextSize(22f);
+        textPaint.setTextSize(24f);
         textPaint.setFakeBoldText(true);
         textPaint.setTextAlign(Paint.Align.CENTER);
-        textPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+        textPaint.setShadowLayer(4f, 1f, 1f, Color.BLACK);
     }
 
     public void setEspLine(boolean enabled) {
@@ -72,6 +86,8 @@ public class ESPOverlayView extends View {
             public void run() {
                 if (espLineEnabled || espBoxEnabled) {
                     setVisibility(View.VISIBLE);
+                    requestLayout();
+                    invalidate();
                     postInvalidate();
                 } else {
                     setVisibility(View.GONE);
@@ -87,6 +103,9 @@ public class ESPOverlayView extends View {
         if (!espLineEnabled && !espBoxEnabled) {
             return;
         }
+
+        // Pastikan render loop 60fps selalu terjadwal lebih dulu
+        postInvalidateOnAnimation();
 
         int width = getWidth();
         int height = getHeight();
@@ -111,25 +130,22 @@ public class ESPOverlayView extends View {
 
                     // 1. ESP Line (Kuning)
                     if (espLineEnabled) {
+                        canvas.drawLine(startX, startY, headX, boxTop, lineShadowPaint);
                         canvas.drawLine(startX, startY, headX, boxTop, linePaint);
                     }
 
                     // 2. ESP Box
                     if (espBoxEnabled) {
+                        canvas.drawRect(boxLeft, boxTop, boxRight, boxBottom, boxShadowPaint);
                         canvas.drawRect(boxLeft, boxTop, boxRight, boxBottom, boxPaint);
                         if (dist > 0.0f) {
                             String distStr = String.format("%.0fm", dist);
-                            canvas.drawText(distStr, headX, boxTop - 6.0f, textPaint);
+                            canvas.drawText(distStr, headX, boxTop - 8.0f, textPaint);
                         }
                     }
                 }
             }
         } catch (Throwable ignored) {
-        }
-
-        // Loop rendering 60fps saat ESP aktif
-        if (espLineEnabled || espBoxEnabled) {
-            postInvalidateOnAnimation();
         }
     }
 }
