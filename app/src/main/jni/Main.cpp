@@ -717,6 +717,7 @@ static void* (*get_CurrentWeapon)(void *fpc) = nullptr;                       //
 static void* (*get_ShooterBehaviour)(void *fpc, void *item) = nullptr;        // 0x409188C
 static void (*set_ClipAmmo)(void *shooter, int ammo) = nullptr;               // 0x405A39C
 static ObscuredFloat (*actk_op_Implicit_Float)(float val) = nullptr;          // 0x3D6E4DC
+static int (*get_TargetType)(void *targetInfo) = nullptr;                     // 0x40AAA58
 
 static bool isClientWeapon(void *instance) {
     if (instance == nullptr) return false;
@@ -1112,12 +1113,32 @@ static void onNetworkPlayerUpdate(void *instance) {
     if (instance == nullptr || !isUnityObjectAlive(instance)) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_networkPlayers[instance] = getCurrentTimeMs();
+
+    // Dynamically detect local player if TargetType == 1 (LocalPlayer)
+    if (isPointerReadable((void *)((uintptr_t)instance + 0xC0))) {
+        void *targetInfo = *(void **)((uintptr_t)instance + 0xC0);
+        if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+            int tType = 0;
+            if (get_TargetType != nullptr) {
+                tType = get_TargetType(targetInfo);
+            }
+            if (tType == 0 && isPointerReadable((void *)((uintptr_t)targetInfo + 0x30))) {
+                tType = *(int *)((uintptr_t)targetInfo + 0x30);
+            }
+            if (tType == 1) { // LocalPlayer
+                g_localPlayerNetPlayer = instance;
+            }
+        }
+    }
 }
 
 static void onNetworkPlayerDestroy(void *instance) {
     if (instance == nullptr) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_networkPlayers.erase(instance);
+    if (instance == g_localPlayerNetPlayer) {
+        g_localPlayerNetPlayer = nullptr;
+    }
 }
 
 static void onBotPlayerUpdate(void *instance) {
@@ -1383,6 +1404,10 @@ static void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
 static bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
 
 static void initAimAssistPointers() {
+    if (get_TargetType == nullptr) {
+        get_TargetType = (int (*)(void *)) getAbsoluteAddress(targetLibName, 0x40AAA58);
+        ModLog("[AIM_ASSIST] TargetInfo.get_TargetType pointer: %p", get_TargetType);
+    }
     if (get_AllyObjectToogle == nullptr) {
         get_AllyObjectToogle = (bool (*)(void *)) getAbsoluteAddress(targetLibName, 0x4DED164);
         ModLog("[AIM_ASSIST] TargetibleObjectCustomSettings.get_AllyObjectToogle pointer: %p", get_AllyObjectToogle);
@@ -1413,63 +1438,131 @@ static void initAimAssistPointers() {
     }
 }
 
+// Check if a NetworkPlayer is an ally / teammate or local player
+static bool isNetworkPlayerTeammate(void *netPlayer) {
+    if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return true;
+    if (!isUnityObjectAlive(netPlayer)) return true; // Destroyed -> ignore
+
+    // Ignore self
+    if (g_localPlayerNetPlayer != nullptr && netPlayer == g_localPlayerNetPlayer) {
+        return true;
+    }
+
+    // 1. Check targetInfo at offset 0xC0
+    if (isPointerReadable((void *)((uintptr_t)netPlayer + 0xC0))) {
+        void *targetInfo = *(void **)((uintptr_t)netPlayer + 0xC0);
+        if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+            int tType = 0;
+            if (get_TargetType != nullptr) {
+                tType = get_TargetType(targetInfo);
+            }
+            if (tType == 0 && isPointerReadable((void *)((uintptr_t)targetInfo + 0x30))) {
+                tType = *(int *)((uintptr_t)targetInfo + 0x30);
+            }
+
+            if (tType != 0) {
+                if (tType == 1) { // LocalPlayer
+                    g_localPlayerNetPlayer = netPlayer;
+                    return true;
+                }
+                // Bitmask: LocalPlayer (1) | OtherPlayerAlly (2) | VehicleAlly (8) | BotAlly (32) = 43
+                if ((tType & (1 | 2 | 8 | 32)) != 0) {
+                    return true; // Marked as ally by game engine!
+                }
+                // Bitmask: OtherPlayerEnemy (4) | VehicleEnemy (16) | BotEnemy (64) | BotDeathmatch (128) = 212
+                if ((tType & (4 | 16 | 64 | 128)) != 0) {
+                    return false; // Confirmed enemy!
+                }
+            }
+        }
+    }
+
+    // 2. Check NetworkPlayer.IsTeammate if local player is known
+    if (g_localPlayerNetPlayer != nullptr && NetworkPlayer_IsTeammate != nullptr &&
+        isUnityObjectAlive(g_localPlayerNetPlayer)) {
+        if (NetworkPlayer_IsTeammate(netPlayer, g_localPlayerNetPlayer)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Check if a TargetibleObject is an ally / teammate or self
-static bool isTargetTeammate(void *targetibleObj) {
+static bool isTargetibleObjectTeammate(void *targetibleObj) {
     if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) {
-        return false;
+        return true;
     }
     if (!isUnityObjectAlive(targetibleObj)) {
         return true; // Destroyed object -> Ignore as aim target!
     }
 
-    // 1. Check TargetibleObjectCustomSettings at offset 0x90
+    // Ignore self if targetibleObject belongs to local player
+    if (g_localPlayerTargetibleObject != nullptr && targetibleObj == g_localPlayerTargetibleObject) {
+        return true;
+    }
+
+    // 1. Check associated NetworkPlayer at offset 0xD8
+    if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0xD8))) {
+        void *targetNetPlayer = *(void **)((uintptr_t)targetibleObj + 0xD8);
+        if (targetNetPlayer != nullptr && isPointerReadable(targetNetPlayer) && isUnityObjectAlive(targetNetPlayer)) {
+            if (isNetworkPlayerTeammate(targetNetPlayer)) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Check TargetibleObjectCustomSettings at offset 0x90
     if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0x90))) {
         void *customSettings = *(void **)((uintptr_t)targetibleObj + 0x90);
-        if (customSettings != nullptr && isUnityObjectAlive(customSettings)) {
-            // Direct memory check for backing field <AllyObjectToogle>k__BackingField at offset 0x20
+        if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
+            // A. Call get_AllyObjectToogle (RVA 0x4DED164)
+            if (get_AllyObjectToogle != nullptr && get_AllyObjectToogle(customSettings)) {
+                return true; // Explicitly marked as ally!
+            }
+
+            // B. Direct check of <AllyObjectToogle>k__BackingField at offset 0x20
             if (isPointerReadable((void *)((uintptr_t)customSettings + 0x20))) {
-                bool isAllyField = *(bool *)((uintptr_t)customSettings + 0x20);
-                if (isAllyField) {
-                    return true; // Marked as ally -> Ignore!
+                if (*(bool *)((uintptr_t)customSettings + 0x20)) {
+                    return true;
                 }
             }
 
-            // Direct check on _enemyData at offset 0x28 -> TargetibleObjectCustomSettingsData.IsAutoAimAllowed (0x11)
+            // C. Call get_IsAutoAimAllowed (RVA 0x4DED124)
+            if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
+                return true; // Auto aim disallowed by game settings -> Ally / non-target!
+            }
+
+            // D. Direct check on _allyData at offset 0x30
+            if (isPointerReadable((void *)((uintptr_t)customSettings + 0x30))) {
+                void *allyData = *(void **)((uintptr_t)customSettings + 0x30);
+                if (allyData != nullptr && isPointerReadable(allyData) &&
+                    isPointerReadable((void *)((uintptr_t)allyData + 0x10))) {
+                    if (*(bool *)((uintptr_t)allyData + 0x10)) {
+                        return true;
+                    }
+                }
+            }
+
+            // E. Direct check on _enemyData at offset 0x28 -> IsAutoAimAllowed (0x11)
             if (isPointerReadable((void *)((uintptr_t)customSettings + 0x28))) {
                 void *enemyData = *(void **)((uintptr_t)customSettings + 0x28);
                 if (enemyData != nullptr && isPointerReadable(enemyData) &&
                     isPointerReadable((void *)((uintptr_t)enemyData + 0x11))) {
                     bool autoAimAllowed = *(bool *)((uintptr_t)enemyData + 0x11);
                     if (!autoAimAllowed) {
-                        return true; // Game explicitly disallows auto aim for this object
+                        return true; // Disallowed auto aim -> ignore!
                     }
                 }
             }
         }
     }
 
-    // 2. Ignore self if targetibleObject belongs to local player
-    if (g_localPlayerTargetibleObject != nullptr && targetibleObj == g_localPlayerTargetibleObject) {
-        return true;
-    }
-
-    // 3. NetworkPlayer teammate check
-    if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0xD8))) {
-        void *targetNetPlayer = *(void **)((uintptr_t)targetibleObj + 0xD8);
-        if (targetNetPlayer != nullptr && isPointerReadable(targetNetPlayer)) {
-            if (g_localPlayerNetPlayer != nullptr && targetNetPlayer == g_localPlayerNetPlayer) {
-                return true;
-            }
-            if (g_localPlayerNetPlayer != nullptr && NetworkPlayer_IsTeammate != nullptr &&
-                isUnityObjectAlive(targetNetPlayer) && isUnityObjectAlive(g_localPlayerNetPlayer)) {
-                if (NetworkPlayer_IsTeammate(targetNetPlayer, g_localPlayerNetPlayer)) {
-                    return true;
-                }
-            }
-        }
-    }
-
     return false;
+}
+
+static inline bool isTargetTeammate(void *targetibleObj) {
+    return isTargetibleObjectTeammate(targetibleObj);
 }
 
 static inline Vector3 getTransformPosition(void *transformObj) {
@@ -1496,24 +1589,41 @@ static inline bool worldToViewport(void *cameraObj, const Vector3 &worldPos, Vec
     return (viewportPos.z > 0.1f); // In front of camera
 }
 
-static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj) {
+static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botPlayer = nullptr) {
+    // 1. NetworkPlayer check
     if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
-        // Ignore self
-        if (g_localPlayerNetPlayer != nullptr && entityNetPlayer == g_localPlayerNetPlayer) {
+        if (isNetworkPlayerTeammate(entityNetPlayer)) {
             return false;
         }
-        // Teammate check via NetworkPlayer method
-        if (g_localPlayerNetPlayer != nullptr && NetworkPlayer_IsTeammate != nullptr &&
-            isUnityObjectAlive(entityNetPlayer) && isUnityObjectAlive(g_localPlayerNetPlayer)) {
-            if (NetworkPlayer_IsTeammate(entityNetPlayer, g_localPlayerNetPlayer)) {
-                return false;
+    }
+
+    // 2. TargetibleObject check
+    if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+        if (isTargetibleObjectTeammate(targetibleObj)) {
+            return false;
+        }
+    }
+
+    // 3. BotPlayer component checks
+    if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
+        if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x50))) {
+            void *botNet = *(void **)((uintptr_t)botPlayer + 0x50);
+            if (botNet != nullptr && isPointerReadable(botNet) && isUnityObjectAlive(botNet)) {
+                if (isNetworkPlayerTeammate(botNet)) {
+                    return false;
+                }
+            }
+        }
+        if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x60))) {
+            void *botTObj = *(void **)((uintptr_t)botPlayer + 0x60);
+            if (botTObj != nullptr && isPointerReadable(botTObj) && isUnityObjectAlive(botTObj)) {
+                if (isTargetibleObjectTeammate(botTObj)) {
+                    return false;
+                }
             }
         }
     }
-    // TargetibleObject check
-    if (targetibleObj != nullptr && isTargetTeammate(targetibleObj)) {
-        return false;
-    }
+
     return true;
 }
 
@@ -1558,8 +1668,8 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
         }
     }
 
-    auto evaluateCandidate = [&](void *headTransform, void *bodyTransform, void *targetibleObj, void *netPlayer, void *fallbackEntity) {
-        if (!isEntityEnemy(netPlayer, targetibleObj)) return;
+    auto evaluateCandidate = [&](void *headTransform, void *bodyTransform, void *targetibleObj, void *netPlayer, void *fallbackEntity, void *botPlayer = nullptr) {
+        if (!isEntityEnemy(netPlayer, targetibleObj, botPlayer)) return;
 
         auto checkBone = [&](void *boneTransform, bool isHead, const Vector3 &offset) {
             if (boneTransform == nullptr || !isPointerReadable(boneTransform) || !isUnityObjectAlive(boneTransform)) return;
@@ -1591,7 +1701,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 
             float allowedAngle = maxFovAngle;
             if (g_bigHead && isHead) {
-                allowedAngle *= 1.4f; // More forgiving capture for enlarged head
+                allowedAngle *= 1.35f; // More forgiving capture for enlarged head
             }
 
             if (angleOffset <= allowedAngle) {
@@ -1632,7 +1742,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
     // 1. Process Real Players (NetworkPlayer)
     for (void *netPlayer : candidateNetPlayers) {
         if (netPlayer == nullptr || !isPointerReadable(netPlayer) || !isUnityObjectAlive(netPlayer)) continue;
-        if (g_localPlayerNetPlayer != nullptr && netPlayer == g_localPlayerNetPlayer) continue;
+        if (isNetworkPlayerTeammate(netPlayer)) continue;
 
         void *headBone = nullptr;
         void *bodyBone = nullptr;
@@ -1737,12 +1847,13 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
         }
 
-        evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer, netPlayer);
+        evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer, netPlayer, nullptr);
     }
 
     // 2. Process AI Bots (BotPlayer)
     for (void *botPlayer : candidateBotPlayers) {
         if (botPlayer == nullptr || !isPointerReadable(botPlayer) || !isUnityObjectAlive(botPlayer)) continue;
+        if (!isEntityEnemy(nullptr, nullptr, botPlayer)) continue;
 
         void *headBone = nullptr;
         void *bodyBone = nullptr;
@@ -1755,7 +1866,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             if (netPlayer != nullptr) {
                 if (!isUnityObjectAlive(netPlayer)) {
                     netPlayer = nullptr;
-                } else if (g_localPlayerNetPlayer != nullptr && netPlayer == g_localPlayerNetPlayer) {
+                } else if (isNetworkPlayerTeammate(netPlayer)) {
                     continue;
                 }
             }
@@ -1768,8 +1879,12 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
         if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
             targetibleObj = BotPlayer_GetTargetibleObject(botPlayer);
         }
-        if (targetibleObj != nullptr && !isUnityObjectAlive(targetibleObj)) {
-            targetibleObj = nullptr;
+        if (targetibleObj != nullptr) {
+            if (!isUnityObjectAlive(targetibleObj)) {
+                targetibleObj = nullptr;
+            } else if (isTargetibleObjectTeammate(targetibleObj)) {
+                continue;
+            }
         }
 
         // BotPlayer -> ThirdPersonController at 0x58
@@ -1830,7 +1945,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
         }
 
-        evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer, botPlayer);
+        evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer, botPlayer, botPlayer);
     }
 
     return bestTarget;
@@ -1889,8 +2004,8 @@ static void processAimAssistLock(void *aimingControl) {
         camPos = getTransformPosition(g_localPlayerFPC) + Vector3(0.0f, 1.6f, 0.0f);
     }
 
-    // 4. Capture Cone in degrees (more generous when Big Head is active)
-    float maxFovAngle = g_bigHead ? 42.0f : 32.0f;
+    // 4. Capture Cone in degrees (Natural, focused crosshair cone)
+    float maxFovAngle = g_bigHead ? 22.0f : 16.0f;
 
     // 5. Search Best Enemy Bone (Player or Bot)
     TargetBoneInfo targetInfo = findBestTargetBone(camPos, currentYaw, currentPitch, maxFovAngle, cameraObj);
@@ -1911,31 +2026,41 @@ static void processAimAssistLock(void *aimingControl) {
     while (diffPitch > 180.0f) diffPitch -= 360.0f;
     while (diffPitch < -180.0f) diffPitch += 360.0f;
 
-    // 7. Apply Smoothness & Sticky Lock
-    // Slider mentok (100): 100% GLUED TO BONE ("selalu lengket")
-    // Slider < 100: Silky-smooth interpolation curve
+    // 7. Calculate Proximity Falloff & Smooth Pull
+    // Distance from crosshair center: 0 = directly on target, maxFovAngle = edge of cone
+    float proximity = 1.0f - (targetInfo.angleOffset / (maxFovAngle + 0.001f));
+    if (proximity < 0.0f) proximity = 0.0f;
+    if (proximity > 1.0f) proximity = 1.0f;
+    // Quadratic weighting: very soft at periphery, firmer near center
+    float weight = proximity * proximity;
+
     int sliderVal = g_aimSmoothness;
     if (sliderVal < 0) sliderVal = 0;
     if (sliderVal > 100) sliderVal = 100;
+    float s = (float)sliderVal / 100.0f;
 
-    float applyYaw = 0.0f;
-    float applyPitch = 0.0f;
-    float newYaw = 0.0f;
-    float newPitch = 0.0f;
+    // Smooth assist pull rate:
+    // Low smoothness (0%): ~0.04 * weight
+    // Mid smoothness (50%): ~0.15 * weight
+    // High smoothness (100%): ~0.26 * weight
+    float assistRate = (0.04f + 0.22f * s) * weight;
 
-    if (sliderVal >= 100) {
-        applyYaw = diffYaw;
-        applyPitch = diffPitch;
-        newYaw = targetInfo.targetYaw;
-        newPitch = targetInfo.targetPitch;
-    } else {
-        float s = (float)sliderVal / 100.0f;
-        float smoothFactor = 0.08f + 0.92f * (s * s);
-        applyYaw = diffYaw * smoothFactor;
-        applyPitch = diffPitch * smoothFactor;
-        newYaw = currentYaw + applyYaw;
-        newPitch = currentPitch + applyPitch;
+    float stepYaw = diffYaw * assistRate;
+    float stepPitch = diffPitch * assistRate;
+
+    // 8. Angular velocity clamp per frame
+    // This allows player finger swipes to ALWAYS easily overpower the assist
+    // Max angular speed: 0.8 deg/frame (at s=0) to 2.8 deg/frame (at s=1.0)
+    float maxStepPerFrame = 0.8f + 2.0f * s;
+    float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
+    if (stepLen > maxStepPerFrame) {
+        float scale = maxStepPerFrame / stepLen;
+        stepYaw *= scale;
+        stepPitch *= scale;
     }
+
+    float newYaw = currentYaw + stepYaw;
+    float newPitch = currentPitch + stepPitch;
 
     // Read pitch limits from AimingControl if readable
     float minPitch = -85.0f;
@@ -1952,22 +2077,15 @@ static void processAimAssistLock(void *aimingControl) {
     if (newPitch < minPitch) newPitch = minPitch;
     if (newPitch > maxPitch) newPitch = maxPitch;
 
-    // 8. Update Euler Angles on Azimuth and Elevation Nodes
+    // 9. Update Euler Angles on Azimuth and Elevation Nodes
     azEuler.y = fmodf(newYaw + 360.0f, 360.0f);
     elEuler.x = (newPitch < 0.0f) ? (newPitch + 360.0f) : newPitch;
 
     setTransformLocalEulerAngles(azimuthNode, azEuler);
     setTransformLocalEulerAngles(elevationNode, elEuler);
 
-    // 9. When slider >= 95, also apply direct world look rotation if direction is valid
-    if (sliderVal >= 95) {
-        Vector3 aimDir = targetInfo.bonePos - camPos;
-        float magSq = aimDir.x * aimDir.x + aimDir.y * aimDir.y + aimDir.z * aimDir.z;
-        if (magSq > 0.0001f) {
-            Quaternion fullLook = Quaternion::LookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
-            setTransformRotation(elevationNode, fullLook);
-        }
-    }
+    // NOTICE: Direct world look rotation (setTransformRotation fullLook) is REMOVED!
+    // This ensures 100% free camera movement and swipe responsive control at all times!
 
     // 10. Sync TargetibleObject in AimingControl
     if (targetInfo.targetibleObj != nullptr && isUnityObjectAlive(targetInfo.targetibleObj)) {
@@ -1981,12 +2099,12 @@ static void processAimAssistLock(void *aimingControl) {
 
     if (nowMs - g_lastAimAssistLogMs > 6000) {
         g_lastAimAssistLogMs = nowMs;
-        ModLog("[AIM_ASSIST] Bone Lock Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | TargetYaw: %.2f | TargetPitch: %.2f",
+        ModLog("[AIM_ASSIST] Bone Lock Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
                targetInfo.isHead ? "HEAD BONE" : "BODY BONE",
                targetInfo.dist3D,
                targetInfo.angleOffset,
                sliderVal,
-               targetInfo.targetYaw, targetInfo.targetPitch);
+               stepYaw, stepPitch);
     }
 }
 
@@ -2014,7 +2132,7 @@ float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
     float power = old_StrafeRotationConfig_get_MaxRotationPower ? old_StrafeRotationConfig_get_MaxRotationPower(instance) : 0.2f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 0.4f + 2.4f * factor;
+        return 0.25f + 0.45f * factor;
     }
     return power;
 }
@@ -2024,7 +2142,7 @@ float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
     float fov = old_StrafeRotationConfig_get_FOVAreaMultiplier ? old_StrafeRotationConfig_get_FOVAreaMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 1.10f + 0.60f * factor;
+        return 1.05f + 0.25f * factor;
     }
     return fov;
 }
@@ -2054,7 +2172,7 @@ float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
     float fov = old_StrafeRotationConfig_get_FOVPowerMultiplier ? old_StrafeRotationConfig_get_FOVPowerMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 1.15f + 0.85f * factor;
+        return 1.10f + 0.40f * factor;
     }
     return fov;
 }
@@ -2062,10 +2180,11 @@ float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
 // 2. SpinSlowdownConfig (0x4600D68, 0x4600BCC, 0x4600BD8, 0x4600C44, 0x4600C5C)
 float (*old_SpinSlowdownConfig_get_MaxSlowdownValue)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
-    float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.5f;
+    float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.3f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 0.65f + 0.30f * factor;
+        // Maximum slowdown 0.35 (so player touch swipe retains 65-85% sensitivity at all times!)
+        return 0.15f + 0.20f * factor;
     }
     return val;
 }
@@ -2075,7 +2194,7 @@ float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
     float fov = old_SpinSlowdownConfig_get_FOVAreaMultiplier ? old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance) : 1.0f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 1.10f + 0.50f * factor;
+        return 1.05f + 0.20f * factor;
     }
     return fov;
 }
@@ -2085,7 +2204,7 @@ float hook_SpinSlowdownConfig_get_Radius(void *instance) {
     float r = old_SpinSlowdownConfig_get_Radius ? old_SpinSlowdownConfig_get_Radius(instance) : 1.0f;
     if (g_aimAssistBoost) {
         float factor = getAimSensitivityFactor();
-        return 1.15f + 0.65f * factor;
+        return 1.05f + 0.25f * factor;
     }
     return r;
 }
@@ -2126,11 +2245,11 @@ Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vect
     }
 
     float factor = getAimSensitivityFactor();
-    float boost = 1.5f + 3.0f * factor;
+    float boost = 1.15f + 0.85f * factor;
     assistX *= boost;
     assistY *= boost;
 
-    float maxStep = 8.0f + 16.0f * factor;
+    float maxStep = 2.0f + 2.5f * factor;
     float boostedMag = sqrtf(assistX * assistX + assistY * assistY);
     if (boostedMag > maxStep) {
         float scale = maxStep / boostedMag;
@@ -2185,7 +2304,7 @@ bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
     if (!valid) return false;
 
     if (g_aimAssistBoost) {
-        if (isTargetTeammate(targetibleObject)) {
+        if (isTargetibleObjectTeammate(targetibleObject)) {
             return false; // Ignore teammates!
         }
     }
@@ -2200,7 +2319,7 @@ bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
     if (!valid) return false;
 
     if (g_aimAssistBoost) {
-        if (isTargetTeammate(targetibleObject)) {
+        if (isTargetibleObjectTeammate(targetibleObject)) {
             return false; // Ignore teammates!
         }
     }
