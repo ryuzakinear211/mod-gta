@@ -117,9 +117,26 @@ public class Menu {
     private Handler statusHandler;
     private Runnable statusRunnable;
 
-    //ESP Overlay
+    // ESP Overlay System
     public ESPOverlayView mEspOverlay;
     public WindowManager.LayoutParams espParams;
+    public boolean mEspMaster = false;
+    public boolean mEspBox = true;
+    public boolean mEspLine = true;
+    public boolean mEspDistance = true;
+    public boolean mEspHealth = true;
+    public boolean mEspName = true;
+    public boolean mEspEnemyOnly = true;
+
+    // Tabs
+    public LinearLayout tabBar;
+    public LinearLayout mTabFitur;
+    public LinearLayout mTabEsp;
+    public LinearLayout mTabStatus;
+    public Button mBtnTabFitur;
+    public Button mBtnTabEsp;
+    public Button mBtnTabStatus;
+    public int mCurrentTab = 0; // 0 = FITUR, 1 = ESP, 2 = STATUS
 
     //initialize methods from the native library
     native void Init(Context context, TextView title, TextView subTitle);
@@ -146,14 +163,9 @@ public class Menu {
 
     native void ResetEntityCounters();
 
-    native static float[] GetEspData(int screenWidth, int screenHeight);
+    native float[] GetESPData(int screenWidth, int screenHeight);
 
-    public static float[] getEspDrawData(int width, int height) {
-        if (instance != null) {
-            return GetEspData(width, height);
-        }
-        return null;
-    }
+    native boolean GetESPSetting(int settingId);
 
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
@@ -234,12 +246,13 @@ public class Menu {
                 try {
                     settingsOpen = !settingsOpen;
                     if (settingsOpen) {
-                        scrollView.removeView(mods);
+                        if (tabBar != null) tabBar.setVisibility(View.GONE);
+                        scrollView.removeAllViews();
                         scrollView.addView(mSettings);
                         scrollView.scrollTo(0, 0);
                     } else {
-                        scrollView.removeView(mSettings);
-                        scrollView.addView(mods);
+                        if (tabBar != null) tabBar.setVisibility(View.VISIBLE);
+                        switchTab(mCurrentTab);
                     }
                 } catch (IllegalStateException e) {
                 }
@@ -250,6 +263,48 @@ public class Menu {
         mSettings = new LinearLayout(context);
         mSettings.setOrientation(LinearLayout.VERTICAL);
         featureList(SettingsList(), mSettings);
+
+        //********** Tabs & Tab Bar **********
+        mTabFitur = new LinearLayout(context);
+        mTabFitur.setOrientation(LinearLayout.VERTICAL);
+
+        mTabEsp = new LinearLayout(context);
+        mTabEsp.setOrientation(LinearLayout.VERTICAL);
+
+        mTabStatus = new LinearLayout(context);
+        mTabStatus.setOrientation(LinearLayout.VERTICAL);
+
+        tabBar = new LinearLayout(context);
+        tabBar.setOrientation(LinearLayout.HORIZONTAL);
+        tabBar.setLayoutParams(new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+        tabBar.setPadding(dp(6), dp(2), dp(6), dp(4));
+
+        mBtnTabFitur = createTabButton(context, "FITUR", true);
+        mBtnTabEsp = createTabButton(context, "ESP", false);
+        mBtnTabStatus = createTabButton(context, "STATUS", false);
+
+        mBtnTabFitur.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                switchTab(0);
+            }
+        });
+        mBtnTabEsp.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                switchTab(1);
+            }
+        });
+        mBtnTabStatus.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                switchTab(2);
+            }
+        });
+
+        tabBar.addView(mBtnTabFitur);
+        tabBar.addView(mBtnTabEsp);
+        tabBar.addView(mBtnTabStatus);
 
         //********** Title **********
         RelativeLayout titleText = new RelativeLayout(context);
@@ -356,6 +411,7 @@ public class Menu {
         titleText.addView(settings);
         mExpanded.addView(titleText);
         mExpanded.addView(subTitle);
+        mExpanded.addView(tabBar);
         scrollView.addView(mods);
         mExpanded.addView(scrollView);
         relativeLayout.addView(hideBtn);
@@ -391,6 +447,7 @@ public class Menu {
                 } else {
                     mods.removeAllViews();
                     featureList(GetFeatureList(), mods);
+                    switchTab(mCurrentTab);
                 }
             }
         }, 500);
@@ -587,6 +644,118 @@ public class Menu {
         }
     }
 
+    public float[] getNativeEspData(int width, int height) {
+        try {
+            return GetESPData(width, height);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public boolean isEspMasterActive() {
+        return mEspMaster;
+    }
+
+    public boolean isEspBoxActive() {
+        return mEspBox;
+    }
+
+    public boolean isEspLineActive() {
+        return mEspLine;
+    }
+
+    public boolean isEspDistanceActive() {
+        return mEspDistance;
+    }
+
+    public boolean isEspHealthActive() {
+        return mEspHealth;
+    }
+
+    public boolean isEspNameActive() {
+        return mEspName;
+    }
+
+    public void setEspOverlayVisible(final boolean visible) {
+        mEspMaster = visible;
+        if (mEspOverlay != null) {
+            mEspOverlay.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (visible) {
+                        mEspOverlay.startLoop();
+                    } else {
+                        mEspOverlay.stopLoop();
+                    }
+                }
+            });
+        }
+    }
+
+    private void createEspOverlay(final Context context) {
+        int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
+        espParams = new WindowManager.LayoutParams(
+                MATCH_PARENT,
+                MATCH_PARENT,
+                context instanceof Activity ? WindowManager.LayoutParams.TYPE_APPLICATION : iparams,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+        );
+        mEspOverlay = new ESPOverlayView(context);
+        mEspOverlay.setVisibility(View.GONE);
+    }
+
+    private Button createTabButton(final Context context, final String title, boolean active) {
+        Button btn = new Button(context);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(30), 1.0f);
+        lp.setMargins(dp(2), 0, dp(2), 0);
+        btn.setLayoutParams(lp);
+        btn.setPadding(0, 0, 0, 0);
+        btn.setText(title);
+        btn.setTextSize(10.5f);
+        btn.setTypeface(Typeface.DEFAULT_BOLD);
+        btn.setAllCaps(false);
+        updateTabButtonStyle(btn, active);
+        return btn;
+    }
+
+    private void updateTabButtonStyle(Button btn, boolean active) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setCornerRadius(dp(4));
+        if (active) {
+            gd.setColor(Color.parseColor("#EE162E3B"));
+            gd.setStroke(dp(2), Color.parseColor("#00E5FF"));
+            btn.setTextColor(Color.parseColor("#00E5FF"));
+        } else {
+            gd.setColor(Color.parseColor("#EE141C22"));
+            gd.setStroke(dp(1), Color.parseColor("#2F3D4C"));
+            btn.setTextColor(Color.parseColor("#82CAFD"));
+        }
+        btn.setBackground(gd);
+    }
+
+    public void switchTab(int index) {
+        mCurrentTab = index;
+        if (mBtnTabFitur != null) updateTabButtonStyle(mBtnTabFitur, index == 0);
+        if (mBtnTabEsp != null) updateTabButtonStyle(mBtnTabEsp, index == 1);
+        if (mBtnTabStatus != null) updateTabButtonStyle(mBtnTabStatus, index == 2);
+
+        if (scrollView != null) {
+            scrollView.removeAllViews();
+            if (index == 0) {
+                scrollView.addView(mTabFitur != null ? mTabFitur : mods);
+            } else if (index == 1) {
+                scrollView.addView(mTabEsp != null ? mTabEsp : mods);
+            } else if (index == 2) {
+                scrollView.addView(mTabStatus != null ? mTabStatus : mods);
+            }
+            scrollView.scrollTo(0, 0);
+        }
+    }
+
     private View.OnTouchListener onTouchListener() {
         return new View.OnTouchListener() {
             final View collapsedView = mCollapsed;
@@ -638,22 +807,41 @@ public class Menu {
     }
 
     private void featureList(String[] listFT, LinearLayout linearLayout) {
-        //Currently looks messy right now. Let me know if you have improvements
         int featNum, subFeat = 0;
         LinearLayout llBak = linearLayout;
+        LinearLayout currentTarget = linearLayout;
+
+        if (linearLayout == mods) {
+            if (mTabFitur != null) mTabFitur.removeAllViews();
+            if (mTabEsp != null) mTabEsp.removeAllViews();
+            if (mTabStatus != null) mTabStatus.removeAllViews();
+            currentTarget = mTabFitur;
+        }
 
         for (int i = 0; i < listFT.length; i++) {
             boolean switchedOn = false;
-            //Log.i("featureList", listFT[i]);
             String feature = listFT[i];
             if (feature.contains("_True")) {
                 switchedOn = true;
                 feature = feature.replaceFirst("_True", "");
             }
 
+            if (linearLayout == mods) {
+                if (feature.contains("Category_") || feature.contains("Collapse_")) {
+                    String upper = feature.toUpperCase();
+                    if (upper.contains("ESP")) {
+                        currentTarget = mTabEsp;
+                    } else if (upper.contains("STATUS") || upper.contains("DEBUG")) {
+                        currentTarget = mTabStatus;
+                    } else {
+                        currentTarget = mTabFitur;
+                    }
+                }
+                llBak = currentTarget;
+            }
+
             linearLayout = llBak;
             if (feature.contains("CollapseAdd_")) {
-                //if (collapse != null)
                 linearLayout = mCollapse;
                 feature = feature.replaceFirst("CollapseAdd_", "");
             }
@@ -751,7 +939,24 @@ public class Menu {
         switchR.setText(featName);
         switchR.setTextColor(TEXT_COLOR_2);
         switchR.setPadding(10, 5, 0, 5);
-        switchR.setChecked(Preferences.loadPrefBool(featName, featNum, swiOn));
+        boolean loadedBool = Preferences.loadPrefBool(featName, featNum, swiOn);
+        switchR.setChecked(loadedBool);
+        if (featNum == 6 && loadedBool) {
+            setEspOverlayVisible(true);
+        } else if (featNum == 7) {
+            mEspBox = loadedBool;
+        } else if (featNum == 8) {
+            mEspLine = loadedBool;
+        } else if (featNum == 9) {
+            mEspDistance = loadedBool;
+        } else if (featNum == 10) {
+            mEspHealth = loadedBool;
+        } else if (featNum == 11) {
+            mEspName = loadedBool;
+        } else if (featNum == 12) {
+            mEspEnemyOnly = loadedBool;
+        }
+
         switchR.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             public void onCheckedChanged(CompoundButton compoundButton, boolean bool) {
                 Preferences.changeFeatureBool(featName, featNum, bool);
@@ -764,6 +969,33 @@ public class Menu {
                     case -3:
                         Preferences.isExpanded = bool;
                         scrollView.setLayoutParams(bool ? scrlLLExpanded : scrlLL);
+                        break;
+                    case 6: // ESP Master Switch
+                        setEspOverlayVisible(bool);
+                        break;
+                    case 7: // ESP 2D Box
+                        mEspBox = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                        break;
+                    case 8: // ESP Line Tracer
+                        mEspLine = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                        break;
+                    case 9: // ESP Distance
+                        mEspDistance = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                        break;
+                    case 10: // ESP Health Bar
+                        mEspHealth = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                        break;
+                    case 11: // ESP Name & Bot Info
+                        mEspName = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                        break;
+                    case 12: // ESP Enemy Only
+                        mEspEnemyOnly = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
                         break;
                 }
             }
@@ -825,8 +1057,8 @@ public class Menu {
                 switch (featNum) {
 
                     case -6:
-                        scrollView.removeView(mSettings);
-                        scrollView.addView(mods);
+                        if (tabBar != null) tabBar.setVisibility(View.VISIBLE);
+                        switchTab(mCurrentTab);
                         break;
                     case -100:
                         stopChecking = true;
@@ -1244,48 +1476,6 @@ public class Menu {
 
     private int dp(int i) {
         return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, (float) i, getContext.getResources().getDisplayMetrics());
-    }
-
-    private void createEspOverlay(final Context context) {
-        int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
-        espParams = new WindowManager.LayoutParams(
-                MATCH_PARENT,
-                MATCH_PARENT,
-                context instanceof Activity ? WindowManager.LayoutParams.TYPE_APPLICATION : iparams,
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-        );
-        espParams.gravity = Gravity.TOP | Gravity.START;
-        espParams.x = 0;
-        espParams.y = 0;
-
-        mEspOverlay = new ESPOverlayView(context);
-        mEspOverlay.setVisibility(View.GONE);
-    }
-
-    public void ensureEspOverlayAdded() {
-        if (mEspOverlay != null && mWindowManager != null && mEspOverlay.getParent() == null) {
-            try {
-                mWindowManager.addView(mEspOverlay, espParams);
-            } catch (Exception ignored) {}
-        }
-    }
-
-    public void setEspLine(final boolean enabled) {
-        ensureEspOverlayAdded();
-        if (mEspOverlay != null) {
-            mEspOverlay.setEspLine(enabled);
-        }
-    }
-
-    public void setEspBox(final boolean enabled) {
-        ensureEspOverlayAdded();
-        if (mEspOverlay != null) {
-            mEspOverlay.setEspBox(enabled);
-        }
     }
 
     public void setVisibility(int view) {
