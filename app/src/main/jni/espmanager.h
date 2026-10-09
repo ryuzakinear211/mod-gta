@@ -41,24 +41,28 @@ extern std::atomic<void*> g_activeAimingCamera;
 inline bool IsPlayerDead(void *player, EntityType type = ENTITY_TYPE_UNKNOWN) {
     if (player == nullptr || !isPointerReadable(player) || !isUnityObjectAlive(player)) return true;
 
-    if (type == ENTITY_TYPE_NET_PLAYER) {
-        return isEntityDeadOrCorpse(player, nullptr, nullptr);
-    } else if (type == ENTITY_TYPE_BOT_PLAYER) {
-        void *netPlayer = nullptr;
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(player) + 0x50))) {
-            netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(player) + 0x50);
-            if (netPlayer != nullptr && !isUnityObjectAlive(netPlayer)) {
-                netPlayer = nullptr;
+    if (type == ENTITY_TYPE_BOT_PLAYER) {
+        // If BotPlayer has BotPlayerHealth, check if hp <= 0
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(player) + 0x30))) {
+            void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(player) + 0x30);
+            if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
+                    float hp = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
+                    if (hp <= 0.0f) return true;
+                }
             }
         }
-        void *tObj = nullptr;
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(player) + 0x60))) {
-            tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(player) + 0x60);
-            if (tObj != nullptr && !isUnityObjectAlive(tObj)) {
-                tObj = nullptr;
+    } else if (type == ENTITY_TYPE_NET_PLAYER) {
+        // If NetworkPlayer has TargetInfo at 0xC0, check isAlive at 0x34
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(player) + 0xC0))) {
+            void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(player) + 0xC0);
+            if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
+                    bool isAlive = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
+                    if (!isAlive) return true;
+                }
             }
         }
-        return isEntityDeadOrCorpse(netPlayer, player, tObj);
     }
 
     return false;
@@ -103,17 +107,7 @@ inline void *get_camera() {
     return nullptr;
 }
 
-// WorldToScreenPoint helper matching tutorial
-inline Vector3 WorldToScreenPoint(void *cameraObj, Vector3 test) {
-    if (cameraObj == nullptr || !isUnityObjectAlive(cameraObj)) return Vector3(0.0f, 0.0f, -1.0f);
-    void *nativeCam = getNativeUnityPointer(cameraObj);
-    if (nativeCam == nullptr) nativeCam = cameraObj;
-    Vector3 position(0.0f, 0.0f, -1.0f);
-    if (WorldToScreenPoint_Injected != nullptr) {
-        WorldToScreenPoint_Injected(nativeCam, &test, 2, &position);
-    }
-    return position;
-}
+
 
 // Color and Render helper matching tutorial
 struct Color {

@@ -416,10 +416,12 @@ inline float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
 
 // Safe wrapper to set local scale on a Transform
 inline void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
-    if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || set_localScale_Injected == nullptr) return;
+    if (transformObj == nullptr || !isPointerReadable(transformObj) || set_localScale_Injected == nullptr) return;
+    set_localScale_Injected(transformObj, &scale);
     void *nativeTrans = getNativeUnityPointer(transformObj);
-    if (nativeTrans == nullptr) return;
-    set_localScale_Injected(nativeTrans, &scale);
+    if (nativeTrans != nullptr && nativeTrans != transformObj && isPointerReadable(nativeTrans)) {
+        set_localScale_Injected(nativeTrans, &scale);
+    }
 }
 
 // Safe wrapper to query local euler angles from a Transform
@@ -442,20 +444,48 @@ inline void setTransformLocalEulerAngles(void *transformObj, const Vector3 &eule
 // Safe wrapper to query position from a Transform
 inline Vector3 getTransformPosition(void *transformObj) {
     Vector3 pos(0.0f, 0.0f, 0.0f);
-    if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || get_position_Injected == nullptr) return pos;
+    if (transformObj == nullptr || !isPointerReadable(transformObj) || get_position_Injected == nullptr) return pos;
+    // 1. Try managed Transform object directly (standard Unity IL2CPP)
+    get_position_Injected(transformObj, &pos);
+    if (pos.x != 0.0f || pos.y != 0.0f || pos.z != 0.0f) {
+        return pos;
+    }
+    // 2. Fallback to native pointer
     void *nativeTrans = getNativeUnityPointer(transformObj);
-    if (nativeTrans == nullptr) return pos;
-    get_position_Injected(nativeTrans, &pos);
+    if (nativeTrans != nullptr && nativeTrans != transformObj && isPointerReadable(nativeTrans)) {
+        get_position_Injected(nativeTrans, &pos);
+    }
     return pos;
 }
 
 // Safe wrapper to project world coordinates to viewport (Mono mode = 2)
 inline bool worldToViewport(void *cameraObj, const Vector3 &worldPos, Vector3 &viewportPos) {
-    if (cameraObj == nullptr || !isUnityObjectAlive(cameraObj) || WorldToViewportPoint_Injected == nullptr) return false;
+    if (cameraObj == nullptr || !isPointerReadable(cameraObj) || WorldToViewportPoint_Injected == nullptr) return false;
+    // 1. Try managed Camera object directly (standard Unity IL2CPP)
+    WorldToViewportPoint_Injected(cameraObj, &worldPos, 2, &viewportPos);
+    if (viewportPos.z > 0.1f) return true;
+    // 2. Fallback to native Camera pointer
     void *nativeCam = getNativeUnityPointer(cameraObj);
-    if (nativeCam == nullptr) return false;
-    WorldToViewportPoint_Injected(nativeCam, &worldPos, 2, &viewportPos);
-    return (viewportPos.z > 0.1f);
+    if (nativeCam != nullptr && nativeCam != cameraObj && isPointerReadable(nativeCam)) {
+        WorldToViewportPoint_Injected(nativeCam, &worldPos, 2, &viewportPos);
+        if (viewportPos.z > 0.1f) return true;
+    }
+    return false;
+}
+
+// Safe wrapper to project world coordinates to screen pixels (Mono mode = 2)
+inline Vector3 WorldToScreenPoint(void *cameraObj, const Vector3 &worldPos) {
+    Vector3 screenPos(0.0f, 0.0f, -1.0f);
+    if (cameraObj == nullptr || !isPointerReadable(cameraObj) || WorldToScreenPoint_Injected == nullptr) return screenPos;
+    // 1. Try managed Camera object directly (standard Unity IL2CPP)
+    WorldToScreenPoint_Injected(cameraObj, &worldPos, 2, &screenPos);
+    if (screenPos.z > 0.1f) return screenPos;
+    // 2. Fallback to native Camera pointer
+    void *nativeCam = getNativeUnityPointer(cameraObj);
+    if (nativeCam != nullptr && nativeCam != cameraObj && isPointerReadable(nativeCam)) {
+        WorldToScreenPoint_Injected(nativeCam, &worldPos, 2, &screenPos);
+    }
+    return screenPos;
 }
 
 // =========================================================================

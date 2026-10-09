@@ -1772,35 +1772,35 @@ static void updateEspData(void *cam) {
         return; // Throttle to max ~120 fps
     }
 
-    EntityStats stats = getEntityStats();
-    if (!stats.inGame) {
-        std::lock_guard<std::mutex> lock(g_espDataMutex);
-        if (!g_espDrawData.empty()) {
-            g_espDrawData.clear();
-        }
-        return;
-    }
+    // Always maintain heartbeat so Java UI thread knows engine tick is active
+    g_lastEspUpdateMs.store(now);
 
     int screenWidth = g_espScreenWidth.load();
     int screenHeight = g_espScreenHeight.load();
     if (screenWidth <= 0 || screenHeight <= 0) {
-        return;
+        screenWidth = 1920;
+        screenHeight = 1080;
     }
 
+    // Comprehensive Camera Acquisition
     if (cam == nullptr || !isUnityObjectAlive(cam)) {
         cam = g_activeAimingCamera.load();
-        if (cam == nullptr || !isUnityObjectAlive(cam)) {
-            if (Camera_get_main != nullptr) {
-                cam = Camera_get_main();
-                if (cam != nullptr && isUnityObjectAlive(cam)) {
-                    g_activeAimingCamera.store(cam);
-                } else {
-                    cam = nullptr;
-                }
-            }
+    }
+    if (cam == nullptr || !isUnityObjectAlive(cam)) {
+        if (Camera_get_main != nullptr) {
+            cam = Camera_get_main();
         }
     }
     if (cam == nullptr || !isUnityObjectAlive(cam)) {
+        if (Camera_get_current != nullptr) {
+            cam = Camera_get_current();
+        }
+    }
+    if (cam != nullptr && isUnityObjectAlive(cam)) {
+        g_activeAimingCamera.store(cam);
+    } else {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        g_espDrawData.clear();
         return;
     }
 
@@ -1808,7 +1808,10 @@ static void updateEspData(void *cam) {
         return;
     }
 
-    // Auto-sync active player and bot candidates into ESPManager so no entity is missed
+    // 1. Prune dead enemies
+    espManager->updateEnemies();
+
+    // 2. Auto-sync active player and bot candidates into ESPManager so no entity is missed
     {
         std::lock_guard<std::mutex> lock(g_entityMutex);
         const uint64_t TIMEOUT_MS = 2500;
@@ -2012,6 +2015,18 @@ static void updateEspData(void *cam) {
         g_espDrawData = std::move(drawList);
     }
     g_lastEspUpdateMs.store(now);
+
+    static uint64_t lastEspLogMs = 0;
+    if (now - lastEspLogMs > 3000) {
+        lastEspLogMs = now;
+        ModLog("[ESP_LOG] Tick -> Cam: %p | Enemies: %zu | Drawn: %zu | NetPlayers: %zu | Bots: %zu | Screen: %dx%d",
+               cam,
+               (espManager && espManager->enemies) ? espManager->enemies->size() : 0,
+               (g_espDrawData.size() / 7),
+               g_networkPlayers.size(),
+               g_botPlayers.size(),
+               screenWidth, screenHeight);
+    }
 }
 
 // 0. AimingControl.Update: RVA 0x4D27294
@@ -2715,10 +2730,10 @@ jfloatArray GetEspData(JNIEnv *env, jclass clazz, jint screenWidth, jint screenH
     g_espScreenWidth.store(screenWidth);
     g_espScreenHeight.store(screenHeight);
 
-    // If data is older than 500ms, player is in lobby, loading, or game paused.
+    // If data is older than 2000ms, player is in lobby, loading, or game paused.
     // Return null immediately with zero IL2CPP/Unity calls on Java UI thread!
     uint64_t now = getCurrentTimeMs();
-    if (now - g_lastEspUpdateMs.load() > 500) {
+    if (now - g_lastEspUpdateMs.load() > 2000) {
         return nullptr;
     }
 
@@ -2729,6 +2744,13 @@ jfloatArray GetEspData(JNIEnv *env, jclass clazz, jint screenWidth, jint screenH
             return nullptr;
         }
         copy = g_espDrawData;
+    }
+
+    static uint64_t lastJniLogMs = 0;
+    if (now - lastJniLogMs > 3000) {
+        lastJniLogMs = now;
+        ModLog("[ESP_JNI] GetEspData -> Sending %zu floats (%zu entities) to Java overlay view",
+               copy.size(), copy.size() / 7);
     }
 
     jfloatArray result = env->NewFloatArray(static_cast<jsize>(copy.size()));
