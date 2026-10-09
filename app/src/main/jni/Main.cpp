@@ -770,6 +770,9 @@ static void onNetworkPlayerDestroy(void *instance) {
     onESPPlayerDestroy(instance);
     if (instance == g_localPlayerNetPlayer.load()) {
         g_localPlayerNetPlayer.store(nullptr);
+        g_localPlayerTargetibleObject.store(nullptr);
+        g_activeAimingControl.store(nullptr);
+        onESPClear();
     }
 }
 
@@ -853,6 +856,7 @@ static void resetEntityCounters() {
     g_botNetPlayers.clear();
     g_localPlayerTargetibleObject.store(nullptr);
     g_localPlayerNetPlayer.store(nullptr);
+    g_activeAimingControl.store(nullptr);
     onESPClear();
     ModLog("[STATS] Entity counters reset manually.");
 }
@@ -999,48 +1003,62 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 static bool isTargetibleObjectTeammate(void *targetibleObj);
 
 static bool isNetworkPlayerTeammate(void *netPlayer) {
-    if (netPlayer == nullptr || !isPointerReadable(netPlayer) || !isUnityObjectAlive(netPlayer)) {
-        return false;
+    if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return true;
+    if (!isUnityObjectAlive(netPlayer)) return true; // Destroyed -> ignore
+
+    // Ignore self
+    void *localNet = g_localPlayerNetPlayer.load();
+    if (localNet != nullptr && netPlayer == localNet) {
+        return true;
     }
 
-    void *localPlayer = g_localPlayerNetPlayer.load();
-    if (localPlayer != nullptr && netPlayer == localPlayer) {
-        return true; // Local player is own team
-    }
-
-    // 1. Direct TargetType check
+    // 1. Check targetInfo at offset 0xC0
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
         void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
         if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-            int targetType = 0;
+            int tType = 0;
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
-                targetType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
+                tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
             }
-            if (targetType == 0 && get_TargetType != nullptr) {
-                targetType = get_TargetType(targetInfo);
+            if (tType == 0 && get_TargetType != nullptr) {
+                tType = get_TargetType(targetInfo);
             }
-            if (targetType != 0) {
-                if ((targetType & (2 | 8 | 32)) != 0) {
-                    return true; // Teammate/Ally
+
+            if (tType != 0) {
+                if (tType == 1) { // LocalPlayer
+                    g_localPlayerNetPlayer.store(netPlayer);
+                    return true;
                 }
-                if ((targetType & (4 | 16 | 64 | 128)) != 0) {
-                    return false; // Enemy
+                // Bitmask: LocalPlayer (1) | OtherPlayerAlly (2) | VehicleAlly (8) | BotAlly (32) = 43
+                if ((tType & (1 | 2 | 8 | 32)) != 0) {
+                    return true; // Marked as ally by game engine!
+                }
+                // Bitmask: OtherPlayerEnemy (4) | VehicleEnemy (16) | BotEnemy (64) | BotDeathmatch (128) = 212
+                if ((tType & (4 | 16 | 64 | 128)) != 0) {
+                    return false; // Confirmed enemy!
                 }
             }
         }
     }
 
-    // 2. Call NetworkPlayer.IsTeammate(this, localPlayer)
-    if (localPlayer != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localPlayer)) {
-        return NetworkPlayer_IsTeammate(netPlayer, localPlayer);
+    // 2. Check NetworkPlayer.IsTeammate if local player is known
+    if (localNet != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localNet)) {
+        if (NetworkPlayer_IsTeammate(netPlayer, localNet)) {
+            return true;
+        }
     }
 
     return false;
 }
 
 static bool isTargetibleObjectTeammate(void *targetibleObj) {
-    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj) || !isUnityObjectAlive(targetibleObj)) {
-        return false;
+    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return true;
+    if (!isUnityObjectAlive(targetibleObj)) return true;
+
+    // Ignore self if targetibleObject belongs to local player
+    void *localTObj = g_localPlayerTargetibleObject.load();
+    if (localTObj != nullptr && targetibleObj == localTObj) {
+        return true;
     }
 
     // 1. Check associated NetworkPlayer at offset 0xD8
@@ -1258,6 +1276,13 @@ static std::atomic<bool> g_espName{true};
 static std::atomic<bool> g_espEnemyOnly{true};
 static std::atomic<int> g_espMaxDistance{200};
 
+// ESP Shared State between Unity thread and Java UI thread
+static std::atomic<int> g_espScreenWidth{0};
+static std::atomic<int> g_espScreenHeight{0};
+static std::vector<float> g_espDrawData;
+static std::mutex g_espDataMutex;
+static std::atomic<uint64_t> g_lastEspUpdateMs{0};
+
 void onESPPlayerUpdate(void *instance, bool isBot) {
     if (espManager != nullptr) {
         espManager->tryAddEnemy(instance, isBot);
@@ -1274,44 +1299,41 @@ void onESPClear() {
     if (espManager != nullptr) {
         espManager->clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        g_espDrawData.clear();
+    }
+    g_lastEspUpdateMs.store(0);
 }
 
-static void *getGameCamera() {
-    void *aimingControl = g_activeAimingControl.load();
-    if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20))) {
-            void *cam = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20);
-            if (cam != nullptr && isUnityObjectAlive(cam)) {
-                return cam;
-            }
+// Executes synchronously on the Unity Main Engine Thread inside hook_AimingControl_Update
+static void updateEspData(void *aimingControl) {
+    if (aimingControl == nullptr || !isUnityObjectAlive(aimingControl) || espManager == nullptr) {
+        return;
+    }
+
+    void *cam = nullptr;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20))) {
+        cam = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20);
+    }
+    if (cam == nullptr || !isUnityObjectAlive(cam)) {
+        if (Camera_get_main != nullptr) {
+            cam = Camera_get_main();
         }
     }
-    if (Camera_get_main != nullptr) {
-        void *mainCam = Camera_get_main();
-        if (mainCam != nullptr && isUnityObjectAlive(mainCam)) {
-            return mainCam;
-        }
-    }
-    return nullptr;
-}
-
-jfloatArray GetESPData(JNIEnv *env, jobject thiz, jint screenWidth, jint screenHeight) {
-    if (!g_espMaster.load() || espManager == nullptr) {
-        return env->NewFloatArray(0);
+    if (cam == nullptr || !isUnityObjectAlive(cam)) {
+        return;
     }
 
-    void *cam = getGameCamera();
-    if (cam == nullptr) {
-        return env->NewFloatArray(0);
+    int screenWidth = g_espScreenWidth.load();
+    int screenHeight = g_espScreenHeight.load();
+    if (screenWidth <= 0 || screenHeight <= 0) {
+        return;
     }
-
-    std::vector<float> buffer;
-    buffer.reserve(32 * 9);
 
     float maxDist = static_cast<float>(g_espMaxDistance.load());
     bool enemyOnly = g_espEnemyOnly.load();
 
-    // Collect active entities directly from g_entityMutex matching status panel overlay logic
     std::vector<ESPEntityItem> activeEntities;
     {
         std::lock_guard<std::mutex> lock(g_entityMutex);
@@ -1360,14 +1382,54 @@ jfloatArray GetESPData(JNIEnv *env, jobject thiz, jint screenWidth, jint screenH
         }
     }
 
-    int count = espManager->collectESPDataFromList(cam, screenWidth, screenHeight, maxDist, enemyOnly, activeEntities, buffer);
-    if (count <= 0 || buffer.empty()) {
+    if (activeEntities.empty()) {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        g_espDrawData.clear();
+        g_lastEspUpdateMs.store(getCurrentTimeMs());
+        return;
+    }
+
+    std::vector<float> buffer;
+    buffer.reserve(activeEntities.size() * 9);
+
+    espManager->collectESPDataFromList(cam, screenWidth, screenHeight, maxDist, enemyOnly, activeEntities, buffer);
+
+    {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        g_espDrawData = std::move(buffer);
+    }
+    g_lastEspUpdateMs.store(getCurrentTimeMs());
+}
+
+// Thread-safe JNI consumer called on Android UI thread (Zero Unity engine calls)
+jfloatArray GetESPData(JNIEnv *env, jobject thiz, jint screenWidth, jint screenHeight) {
+    if (screenWidth > 0 && screenHeight > 0) {
+        g_espScreenWidth.store(screenWidth);
+        g_espScreenHeight.store(screenHeight);
+    }
+
+    if (!g_espMaster.load()) {
         return env->NewFloatArray(0);
     }
 
-    jfloatArray result = env->NewFloatArray(static_cast<jsize>(buffer.size()));
-    if (result != nullptr) {
-        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(buffer.size()), buffer.data());
+    uint64_t now = getCurrentTimeMs();
+    uint64_t lastUpdate = g_lastEspUpdateMs.load();
+    if (now - lastUpdate > 400) {
+        return env->NewFloatArray(0);
+    }
+
+    std::vector<float> copy;
+    {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        if (g_espDrawData.empty()) {
+            return env->NewFloatArray(0);
+        }
+        copy = g_espDrawData;
+    }
+
+    jfloatArray result = env->NewFloatArray(static_cast<jsize>(copy.size()));
+    if (result != nullptr && !copy.empty()) {
+        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(copy.size()), copy.data());
     }
     return result;
 }
@@ -1877,6 +1939,12 @@ void hook_AimingControl_Update(void *instance) {
 
     if (old_AimingControl_Update != nullptr) {
         old_AimingControl_Update(instance);
+    }
+
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        if (g_espMaster.load() && espManager != nullptr) {
+            updateEspData(instance);
+        }
     }
 
     if (!g_aimAssistBoost.load()) {
@@ -2432,6 +2500,9 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
 
         case 6: { // Toggle_ESP Master Switch
             g_espMaster.store(boolean);
+            if (!boolean) {
+                onESPClear();
+            }
             ModLog("[TOGGLE] Feature #6 [ESP Master Switch] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle ESP Master: ON" : "Toggle ESP Master: OFF");
 

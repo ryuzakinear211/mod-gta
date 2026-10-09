@@ -197,20 +197,59 @@ public:
                 continue;
             }
 
-            // Team & Enemy discrimination
-            bool isEnemy = true;
+            // Skip local player
+            void *localNet = g_localPlayerNetPlayer.load();
+            if (localNet != nullptr && (entityObj == localNet || netPlayer == localNet)) {
+                continue;
+            }
+
+            // Resolve targetible object & netPlayer
+            void *targetibleObj = nullptr;
             if (isBot) {
-                // In game matches, all AI bots are opponents/enemies to the player
-                isEnemy = true;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x60))) {
+                    targetibleObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x60);
+                }
+                if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
+                    targetibleObj = BotPlayer_GetTargetibleObject(entityObj);
+                }
+                if (netPlayer == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x50))) {
+                    netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x50);
+                }
             } else {
-                void *localNet = g_localPlayerNetPlayer.load();
-                if (localNet != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localNet)) {
-                    isEnemy = !NetworkPlayer_IsTeammate(entityObj, localNet);
-                } else {
-                    isEnemy = true;
+                if (NetworkPlayer_GetTargetibleObject != nullptr) {
+                    targetibleObj = NetworkPlayer_GetTargetibleObject(entityObj);
                 }
             }
 
+            // Check if local player via targetInfo
+            if (netPlayer != nullptr && isPointerReadable(netPlayer)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
+                    void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
+                    if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+                        int tType = 0;
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
+                            tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
+                        }
+                        if (tType == 0 && get_TargetType != nullptr) {
+                            tType = get_TargetType(targetInfo);
+                        }
+                        if (tType == 1) { // LocalPlayer
+                            g_localPlayerNetPlayer.store(netPlayer);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Exclude dead entities / corpses
+            if (isEntityDeadOrCorpse(netPlayer, isBot ? entityObj : nullptr, targetibleObj)) {
+                continue;
+            }
+
+            // Team & Enemy discrimination using game engine logic
+            bool isEnemy = isEntityEnemy(netPlayer, targetibleObj, isBot ? entityObj : nullptr);
+
+            // Filter out teammates (including AI bot teammates!) if enemyOnly is ON
             if (enemyOnly && !isEnemy) {
                 continue;
             }
