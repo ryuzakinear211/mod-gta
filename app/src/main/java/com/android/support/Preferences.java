@@ -40,6 +40,12 @@ public class Preferences {
         if (featureNum == 0 && Menu.instance != null) {
             Menu.instance.setStatusHudVisible(bool);
         }
+        if (featureNum == 6 && Menu.instance != null) {
+            Menu.instance.setEspLine(bool);
+        }
+        if (featureNum == 7 && Menu.instance != null) {
+            Menu.instance.setEspBox(bool);
+        }
     }
 
     public static int loadPrefInt(String featureName, int featureNum) {
@@ -64,6 +70,12 @@ public class Preferences {
         }
 
         Changes(context, featureNum, featureName, 0, bDef, null);
+        if (featureNum == 6 && Menu.instance != null) {
+            Menu.instance.setEspLine(bDef);
+        }
+        if (featureNum == 7 && Menu.instance != null) {
+            Menu.instance.setEspBox(bDef);
+        }
         return bDef;
     }
 

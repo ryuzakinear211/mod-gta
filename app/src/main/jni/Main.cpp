@@ -28,6 +28,7 @@
 #include "hook.h"
 #include "KittyMemory/MemoryPatch.h"
 #include "Menu/Setup.h"
+#include "espmanager.h"
 
 // =========================================================================
 // Advanced Debug Logger & Crash Handler
@@ -349,7 +350,10 @@ static uint64_t getCurrentTimeMs() {
 // Dynamic Player Weapon Memory Addresses (Atomic for cross-thread safety)
 static std::atomic<void*> g_localPlayerFPC{nullptr};
 static std::atomic<void*> g_localPlayerTargetibleObject{nullptr};
-static std::atomic<void*> g_localPlayerNetPlayer{nullptr};
+std::atomic<void*> g_localPlayerNetPlayer{nullptr};
+std::atomic<void*> g_activeAimingCamera{nullptr};
+static std::atomic<bool>  g_espLine{false};
+static std::atomic<bool>  g_espBox{false};
 static std::atomic<void*> g_localPlayerWeapon{nullptr};
 static std::atomic<void*> g_localPlayerShooter{nullptr};
 static std::atomic<void*> g_localWeaponProfile{nullptr};
@@ -989,7 +993,7 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 // Advanced Bone-Lock Aim Assist System
 // =========================================================================
 
-static bool isNetworkPlayerTeammate(void *netPlayer) {
+bool isNetworkPlayerTeammate(void *netPlayer) {
     if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return true;
     if (!isUnityObjectAlive(netPlayer)) return true; // Destroyed -> ignore
 
@@ -1103,7 +1107,7 @@ static bool isTargetibleObjectTeammate(void *targetibleObj) {
     return false;
 }
 
-static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj) {
+bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj) {
     // 1. If TargetibleObject is present, verify active state and enabled combat colliders
     if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
         if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(targetibleObj)) {
@@ -1590,6 +1594,9 @@ static void processAimAssistLock(void *aimingControl) {
     }
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20))) {
         cameraObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20);
+        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
+            g_activeAimingCamera.store(cameraObj);
+        }
     }
 
     if (azimuthNode == nullptr || elevationNode == nullptr) return;
@@ -1996,6 +2003,10 @@ void hook_NetworkPlayer_Update(void *instance) {
         setLastAction("NetworkPlayer_Update");
         onNetworkPlayerUpdate(instance);
 
+        if (espManager != nullptr && (g_espLine.load() || g_espBox.load())) {
+            espManager->tryAddEnemy(instance);
+        }
+
         if (g_bigHead.load()) {
             applyBigHeadToNetworkPlayer(instance, BIG_HEAD_SCALE);
         } else if (g_needsBigHeadReset.load()) {
@@ -2011,6 +2022,9 @@ void hook_NetworkPlayer_Update(void *instance) {
         }
     } else if (instance != nullptr) {
         onNetworkPlayerDestroy(instance);
+        if (espManager != nullptr) {
+            espManager->removeEnemyGivenObject(instance);
+        }
     }
     if (old_NetworkPlayer_Update != nullptr) {
         old_NetworkPlayer_Update(instance);
@@ -2023,6 +2037,9 @@ void hook_NetworkPlayer_OnDestroy(void *instance) {
     if (instance != nullptr) {
         setLastAction("NetworkPlayer_OnDestroy");
         onNetworkPlayerDestroy(instance);
+        if (espManager != nullptr) {
+            espManager->removeEnemyGivenObject(instance);
+        }
     }
     if (old_NetworkPlayer_OnDestroy != nullptr) {
         old_NetworkPlayer_OnDestroy(instance);
@@ -2035,6 +2052,10 @@ void hook_BotPlayer_Start(void *instance) {
     if (instance != nullptr && isUnityObjectAlive(instance)) {
         setLastAction("BotPlayer_Start");
         onBotPlayerUpdate(instance);
+
+        if (espManager != nullptr && (g_espLine.load() || g_espBox.load())) {
+            espManager->tryAddEnemy(instance);
+        }
     }
     if (old_BotPlayer_Start != nullptr) {
         old_BotPlayer_Start(instance);
@@ -2048,6 +2069,10 @@ void hook_BotPlayer_Update(void *instance) {
         setLastAction("BotPlayer_Update");
         onBotPlayerUpdate(instance);
 
+        if (espManager != nullptr && (g_espLine.load() || g_espBox.load())) {
+            espManager->tryAddEnemy(instance);
+        }
+
         if (g_bigHead.load()) {
             applyBigHeadToBotPlayer(instance, BIG_HEAD_SCALE);
         } else if (g_needsBigHeadReset.load()) {
@@ -2055,6 +2080,9 @@ void hook_BotPlayer_Update(void *instance) {
         }
     } else if (instance != nullptr) {
         onBotPlayerDestroy(instance);
+        if (espManager != nullptr) {
+            espManager->removeEnemyGivenObject(instance);
+        }
     }
     if (old_BotPlayer_Update != nullptr) {
         old_BotPlayer_Update(instance);
@@ -2067,6 +2095,9 @@ void hook_BotPlayer_OnDestroy(void *instance) {
     if (instance != nullptr) {
         setLastAction("BotPlayer_OnDestroy");
         onBotPlayerDestroy(instance);
+        if (espManager != nullptr) {
+            espManager->removeEnemyGivenObject(instance);
+        }
     }
     if (old_BotPlayer_OnDestroy != nullptr) {
         old_BotPlayer_OnDestroy(instance);
@@ -2147,6 +2178,11 @@ void *hack_thread(void *) {
     registerAllHooks();
     HookManager::getInstance().installAll(base);
 
+    if (espManager == nullptr) {
+        espManager = new ESPManager();
+        ModLog("[ESP] ESPManager initialized successfully.");
+    }
+
     ModLog("[THREAD] All core hooks installed successfully!");
     setLastAction("Hooks installed and ready");
 #else
@@ -2171,8 +2207,11 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
         OBFUSCATE("Toggle_Aim Assist (Auto-Lock Radius)"), // featNum 4
         OBFUSCATE("SeekBar_Aim Smoothness (Sticky Lock)_0_100"), // featNum 5
+        OBFUSCATE("Collapse_🎯 TAB ESP OVERLAY_True"),
+        OBFUSCATE("CollapseAdd_6_Toggle_ESP Line (Kuning)"),
+        OBFUSCATE("CollapseAdd_7_Toggle_ESP Box"),
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian. Saat nilai di-mentokkan (100), bidikan akan selalu lengket (100% magnetic sticky lock) pada bone body atau head musuh (seperti Big Head). Nilai rendah memberikan assist natural.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>ESP Line (Kuning):</b> Garis pelacak berwarna kuning dari atas layar langsung ke posisi kepala musuh & bot secara real-time.<br><br>• <b>ESP Box:</b> Kotak 2D bounding box berwarna kuning di sekeliling musuh & bot dengan indikator jarak.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci target saat arah bidikan dekat dengan bone musuh.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian. Saat nilai di-mentokkan (100), bidikan akan selalu lengket (100% magnetic sticky lock) pada bone body atau head musuh.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2284,6 +2323,32 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
+        case 6: { // Toggle_ESP Line (Kuning)
+            g_espLine.store(boolean);
+            ModLog("[TOGGLE] Feature #6 [ESP Line (Kuning)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle ESP Line: ON" : "Toggle ESP Line: OFF");
+
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("ESP Line (Kuning): ON"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("ESP Line (Kuning): OFF"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
+
+        case 7: { // Toggle_ESP Box
+            g_espBox.store(boolean);
+            ModLog("[TOGGLE] Feature #7 [ESP Box] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle ESP Box: ON" : "Toggle ESP Box: OFF");
+
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("ESP Box: ON"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("ESP Box: OFF"), ToastLength::LENGTH_SHORT);
+            }
+            break;
+        }
+
         default:
             ModLog("[TOGGLE] Unknown Feature #%d changed to: val=%d, bool=%d", featNum, value, static_cast<int>(boolean));
             break;
@@ -2334,6 +2399,125 @@ void lib_main() {
     pthread_create(&ptid, NULL, hack_thread, NULL);
 }
 
+jfloatArray GetEspData(JNIEnv *env, jclass clazz, jint screenWidth, jint screenHeight) {
+    if (!g_espLine.load() && !g_espBox.load()) {
+        return nullptr;
+    }
+
+    if (espManager == nullptr || espManager->enemies == nullptr) {
+        return nullptr;
+    }
+
+    void *cam = get_camera();
+    if (cam == nullptr || !isUnityObjectAlive(cam)) {
+        return nullptr;
+    }
+
+    std::vector<float> drawList;
+    drawList.reserve(64);
+
+    {
+        std::lock_guard<std::mutex> lock(espManager->getMutex());
+        auto &enemies = *espManager->enemies;
+        void *localPlayer = g_localPlayerNetPlayer.load();
+
+        for (size_t i = 0; i < enemies.size(); i++) {
+            enemy_t *enemy = enemies[i];
+            if (enemy == nullptr || enemy->object == nullptr) continue;
+            void *playerObj = enemy->object;
+
+            if (!isUnityObjectAlive(playerObj)) continue;
+            if (localPlayer != nullptr && playerObj == localPlayer) continue;
+            if (isNetworkPlayerTeammate(playerObj)) continue;
+            if (IsPlayerDead(playerObj)) continue;
+
+            Vector3 rootPos = GetPlayerLocation(playerObj);
+            if (rootPos.x == 0.0f && rootPos.y == 0.0f && rootPos.z == 0.0f) continue;
+
+            Vector3 headWorldPos = rootPos + Vector3(0.0f, 1.80f, 0.0f);
+            Vector3 feetWorldPos = rootPos;
+
+            void *headBone = nullptr;
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(playerObj) + 0x88))) {
+                void *dollsMgr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(playerObj) + 0x88);
+                if (dollsMgr != nullptr && isUnityObjectAlive(dollsMgr)) {
+                    void *tpCtrl = nullptr;
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50))) {
+                        tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50);
+                    }
+                    if (tpCtrl == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60))) {
+                        tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60);
+                    }
+                    if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78))) {
+                            void *animator = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78);
+                            if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
+                                void *hb = GetBoneTransform(animator, 10);
+                                if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (headBone != nullptr) {
+                Vector3 hp = getTransformPosition(headBone);
+                if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
+                    headWorldPos = hp;
+                    feetWorldPos = Vector3(hp.x, rootPos.y, hp.z);
+                }
+            }
+
+            Vector3 screenHead = WorldToScreenPoint(cam, headWorldPos);
+            Vector3 screenFeet = WorldToScreenPoint(cam, feetWorldPos);
+
+            if (screenHead.z < 0.5f) continue; // In front of camera check
+
+            float canvasHeadX = screenHead.x;
+            float canvasHeadY = static_cast<float>(screenHeight) - screenHead.y;
+            float canvasFeetY = static_cast<float>(screenHeight) - screenFeet.y;
+
+            float topY = canvasHeadY;
+            float bottomY = canvasFeetY;
+            if (topY > bottomY) std::swap(topY, bottomY);
+
+            float boxHeight = bottomY - topY;
+            if (boxHeight < 15.0f) boxHeight = 15.0f;
+            topY -= (boxHeight * 0.12f);
+            boxHeight = bottomY - topY;
+            float boxWidth = boxHeight * 0.55f;
+
+            float boxLeft = canvasHeadX - (boxWidth * 0.5f);
+            float boxRight = canvasHeadX + (boxWidth * 0.5f);
+
+            if (boxRight < -200.0f || boxLeft > screenWidth + 200.0f ||
+                bottomY < -200.0f || topY > screenHeight + 200.0f) {
+                continue;
+            }
+
+            float distance = screenHead.z;
+
+            drawList.push_back(canvasHeadX);
+            drawList.push_back(topY);
+            drawList.push_back(boxLeft);
+            drawList.push_back(topY);
+            drawList.push_back(boxRight);
+            drawList.push_back(bottomY);
+            drawList.push_back(distance);
+        }
+    }
+
+    if (drawList.empty()) {
+        return nullptr;
+    }
+
+    jfloatArray result = env->NewFloatArray(static_cast<jsize>(drawList.size()));
+    if (result != nullptr) {
+        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(drawList.size()), drawList.data());
+    }
+    return result;
+}
+
 int RegisterMenu(JNIEnv *env) {
     JNINativeMethod methods[] = {
             {OBFUSCATE("Icon"), OBFUSCATE("()Ljava/lang/String;"), reinterpret_cast<void *>(Icon)},
@@ -2348,6 +2532,7 @@ int RegisterMenu(JNIEnv *env) {
             {OBFUSCATE("GetTotalCount"), OBFUSCATE("()I"), reinterpret_cast<void *>(GetTotalCount)},
             {OBFUSCATE("IsInGame"), OBFUSCATE("()Z"), reinterpret_cast<void *>(IsInGame)},
             {OBFUSCATE("ResetEntityCounters"), OBFUSCATE("()V"), reinterpret_cast<void *>(ResetEntityCounters)},
+            {OBFUSCATE("GetEspData"), OBFUSCATE("(II)[F"), reinterpret_cast<void *>(GetEspData)},
     };
 
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Menu"));

@@ -117,6 +117,10 @@ public class Menu {
     private Handler statusHandler;
     private Runnable statusRunnable;
 
+    //ESP Overlay
+    public ESPOverlayView mEspOverlay;
+    public WindowManager.LayoutParams espParams;
+
     //initialize methods from the native library
     native void Init(Context context, TextView title, TextView subTitle);
 
@@ -141,6 +145,15 @@ public class Menu {
     native boolean IsInGame();
 
     native void ResetEntityCounters();
+
+    native static float[] GetEspData(int screenWidth, int screenHeight);
+
+    public static float[] getEspDrawData(int width, int height) {
+        if (instance != null) {
+            return GetEspData(width, height);
+        }
+        return null;
+    }
 
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
@@ -305,6 +318,11 @@ public class Menu {
                         mWindowManager.removeView(mStatusHud);
                     } catch (Exception ignored) {}
                 }
+                if (mEspOverlay != null) {
+                    try {
+                        mWindowManager.removeView(mEspOverlay);
+                    } catch (Exception ignored) {}
+                }
                 return false;
             }
         });
@@ -349,6 +367,7 @@ public class Menu {
 
         Init(context, title, subTitle);
         createStatusHud(context);
+        createEspOverlay(context);
     }
 
     public void ShowMenu() {
@@ -394,6 +413,11 @@ public class Menu {
                 mWindowManager.addView(mStatusHud, hudParams);
             } catch (Exception ignored) {}
         }
+        if (mEspOverlay != null) {
+            try {
+                mWindowManager.addView(mEspOverlay, espParams);
+            } catch (Exception ignored) {}
+        }
 
         overlayRequired = true;
     }
@@ -421,6 +445,11 @@ public class Menu {
         if (mStatusHud != null) {
             try {
                 mWindowManager.addView(mStatusHud, hudParams);
+            } catch (Exception ignored) {}
+        }
+        if (mEspOverlay != null) {
+            try {
+                mWindowManager.addView(mEspOverlay, espParams);
             } catch (Exception ignored) {}
         }
     }
@@ -1217,6 +1246,38 @@ public class Menu {
         return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, (float) i, getContext.getResources().getDisplayMetrics());
     }
 
+    private void createEspOverlay(final Context context) {
+        int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
+        espParams = new WindowManager.LayoutParams(
+                MATCH_PARENT,
+                MATCH_PARENT,
+                context instanceof Activity ? WindowManager.LayoutParams.TYPE_APPLICATION : iparams,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+        );
+        espParams.gravity = Gravity.TOP | Gravity.START;
+        espParams.x = 0;
+        espParams.y = 0;
+
+        mEspOverlay = new ESPOverlayView(context);
+        mEspOverlay.setVisibility(View.GONE);
+    }
+
+    public void setEspLine(final boolean enabled) {
+        if (mEspOverlay != null) {
+            mEspOverlay.setEspLine(enabled);
+        }
+    }
+
+    public void setEspBox(final boolean enabled) {
+        if (mEspOverlay != null) {
+            mEspOverlay.setEspBox(enabled);
+        }
+    }
+
     public void setVisibility(int view) {
         if (rootFrame != null) {
             rootFrame.setVisibility(view);
@@ -1226,6 +1287,11 @@ public class Menu {
     public void onDestroy() {
         if (rootFrame != null) {
             mWindowManager.removeView(rootFrame);
+        }
+        if (mEspOverlay != null) {
+            try {
+                mWindowManager.removeView(mEspOverlay);
+            } catch (Exception ignored) {}
         }
     }
 }
