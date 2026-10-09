@@ -424,6 +424,20 @@ struct Quaternion {
     static Quaternion LookRotation(Vector3 forward, Vector3 up = Vector3(0.0f, 1.0f, 0.0f));
 };
 
+struct Ray {
+    Vector3 origin;
+    Vector3 direction;
+    Ray() : origin(0.0f, 0.0f, 0.0f), direction(0.0f, 0.0f, 0.0f) {}
+    Ray(Vector3 o, Vector3 d) : origin(o), direction(d) {}
+};
+
+struct PhysicsScene {
+    int index;
+    int version;
+    PhysicsScene() : index(0), version(0) {}
+    PhysicsScene(int i, int v) : index(i), version(v) {}
+};
+
 // =========================================================================
 // User-Provided Math Methods: NormalizeAngle, NormalizeAngles & ToEulerRad
 // =========================================================================
@@ -1402,6 +1416,12 @@ static void (*AimingControl_ClearTargetibleObject)(void *) = nullptr;
 static void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
 static bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
 
+static bool (*Collider_get_enabled)(void *) = nullptr;
+static bool (*Behaviour_get_isActiveAndEnabled)(void *) = nullptr;
+static float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
+static PhysicsScene (*Physics_get_defaultPhysicsScene)() = nullptr;
+static bool (*Internal_RaycastTest_Injected)(const void *, const Ray *, float, int, int) = nullptr;
+
 static void *g_activeAimAssistManager = nullptr;
 static void *g_activeNewAutoAim = nullptr;
 static void *g_activeBaseAimAssist = nullptr;
@@ -1442,6 +1462,26 @@ static void initAimAssistPointers() {
     if (NetworkPlayer_IsTeammate == nullptr) {
         NetworkPlayer_IsTeammate = (bool (*)(void *, void *)) getAbsoluteAddress(targetLibName, 0x42CE9CC);
         ModLog("[AIM_ASSIST] NetworkPlayer.IsTeammate pointer: %p", NetworkPlayer_IsTeammate);
+    }
+    if (Collider_get_enabled == nullptr) {
+        Collider_get_enabled = (bool (*)(void *)) getAbsoluteAddress(targetLibName, 0x864B404);
+        ModLog("[AIM_ASSIST] Collider.get_enabled pointer: %p", Collider_get_enabled);
+    }
+    if (Behaviour_get_isActiveAndEnabled == nullptr) {
+        Behaviour_get_isActiveAndEnabled = (bool (*)(void *)) getAbsoluteAddress(targetLibName, 0x85974E0);
+        ModLog("[AIM_ASSIST] Behaviour.get_isActiveAndEnabled pointer: %p", Behaviour_get_isActiveAndEnabled);
+    }
+    if (BotPlayerHealth_GetHealth == nullptr) {
+        BotPlayerHealth_GetHealth = (float (*)(void *)) getAbsoluteAddress(targetLibName, 0x4BEE4FC);
+        ModLog("[AIM_ASSIST] BotPlayerHealth.GetHealth pointer: %p", BotPlayerHealth_GetHealth);
+    }
+    if (Physics_get_defaultPhysicsScene == nullptr) {
+        Physics_get_defaultPhysicsScene = (PhysicsScene (*)()) getAbsoluteAddress(targetLibName, 0x864C91C);
+        ModLog("[AIM_ASSIST] Physics.get_defaultPhysicsScene pointer: %p", Physics_get_defaultPhysicsScene);
+    }
+    if (Internal_RaycastTest_Injected == nullptr) {
+        Internal_RaycastTest_Injected = (bool (*)(const void *, const Ray *, float, int, int)) getAbsoluteAddress(targetLibName, 0x8654A80);
+        ModLog("[AIM_ASSIST] PhysicsScene.Internal_RaycastTest_Injected pointer: %p", Internal_RaycastTest_Injected);
     }
 }
 
@@ -1596,6 +1636,105 @@ static inline bool worldToViewport(void *cameraObj, const Vector3 &worldPos, Vec
     return (viewportPos.z > 0.1f); // In front of camera
 }
 
+static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj) {
+    // 1. If TargetibleObject is present, verify active state and enabled combat colliders
+    if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
+        if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(targetibleObj)) {
+            return true; // TargetibleObject component disabled -> Corpse!
+        }
+
+        // Check head & body colliders: on death / ragdoll, combat colliders are turned off
+        if (Collider_get_enabled != nullptr) {
+            void *headCol = nullptr;
+            void *bodyCol = nullptr;
+            if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0x40))) {
+                headCol = *(void **)((uintptr_t)targetibleObj + 0x40);
+            }
+            if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0x48))) {
+                bodyCol = *(void **)((uintptr_t)targetibleObj + 0x48);
+            }
+            bool headAlive = (headCol != nullptr && isUnityObjectAlive(headCol) && Collider_get_enabled(headCol));
+            bool bodyAlive = (bodyCol != nullptr && isUnityObjectAlive(bodyCol) && Collider_get_enabled(bodyCol));
+            if (!headAlive && !bodyAlive && (headCol != nullptr || bodyCol != nullptr)) {
+                return true; // Both head and body colliders disabled -> Dead ragdoll body!
+            }
+        }
+
+        // Check TargetibleObjectCustomSettings at offset 0x90
+        if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0x90))) {
+            void *customSettings = *(void **)((uintptr_t)targetibleObj + 0x90);
+            if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
+                if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
+                    return true; // Auto-aim disallowed on dead/corpse entities
+                }
+                if (isPointerReadable((void *)((uintptr_t)customSettings + 0x28))) {
+                    void *enemyData = *(void **)((uintptr_t)customSettings + 0x28);
+                    if (enemyData != nullptr && isPointerReadable(enemyData) &&
+                        isPointerReadable((void *)((uintptr_t)enemyData + 0x11))) {
+                        if (!(*(bool *)((uintptr_t)enemyData + 0x11))) {
+                            return true; // Disallowed auto aim
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check BotPlayer health (BotPlayerHealth at 0x30)
+    if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
+        if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(botPlayer)) {
+            return true; // Bot component inactive -> Dead!
+        }
+        if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x30))) {
+            void *botHealth = *(void **)((uintptr_t)botPlayer + 0x30);
+            if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
+                if (isPointerReadable((void *)((uintptr_t)botHealth + 0x2C))) {
+                    float hp = *(float *)((uintptr_t)botHealth + 0x2C);
+                    if (hp <= 0.0f) {
+                        return true; // Current HP <= 0 -> Dead!
+                    }
+                }
+                if (BotPlayerHealth_GetHealth != nullptr) {
+                    float hp = BotPlayerHealth_GetHealth(botHealth);
+                    if (hp <= 0.0f) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Check NetworkPlayer
+    if (netPlayer != nullptr && isPointerReadable(netPlayer) && isUnityObjectAlive(netPlayer)) {
+        if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(netPlayer)) {
+            return true; // NetworkPlayer inactive -> Dead/Respawning!
+        }
+        // Check TargetInfo at 0xC0 (field at 0x34 is alive flag)
+        if (isPointerReadable((void *)((uintptr_t)netPlayer + 0xC0))) {
+            void *targetInfo = *(void **)((uintptr_t)netPlayer + 0xC0);
+            if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+                if (isPointerReadable((void *)((uintptr_t)targetInfo + 0x34))) {
+                    bool isAlive = *(bool *)((uintptr_t)targetInfo + 0x34);
+                    if (!isAlive) {
+                        return true; // Flag indicates dead!
+                    }
+                }
+            }
+        }
+        // Check NetworkPlayer collider at offset 0x90
+        if (Collider_get_enabled != nullptr && isPointerReadable((void *)((uintptr_t)netPlayer + 0x90))) {
+            void *col = *(void **)((uintptr_t)netPlayer + 0x90);
+            if (col != nullptr && isUnityObjectAlive(col)) {
+                if (!Collider_get_enabled(col)) {
+                    return true; // Main player collider disabled -> Dead body!
+                }
+            }
+        }
+    }
+
+    return false; // Confirmed alive
+}
+
 static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botPlayer = nullptr) {
     // 1. NetworkPlayer check
     if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
@@ -1632,6 +1771,37 @@ static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botP
     }
 
     return true;
+}
+
+// Check if the target bone is obstructed by a wall or solid obstacle
+static bool isTargetObstructedByWall(const Vector3 &camPos, const Vector3 &bonePos) {
+    if (Internal_RaycastTest_Injected == nullptr) return false;
+
+    Vector3 diff = bonePos - camPos;
+    float dist3D = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+    if (dist3D <= 0.8f) {
+        return false; // Point-blank range (< 0.8m), not obstructed
+    }
+
+    Vector3 dirNorm = diff / dist3D;
+
+    // Start 0.45m in front of camera to clear local player character model & gun
+    Ray ray;
+    ray.origin = camPos + dirNorm * 0.45f;
+    ray.direction = dirNorm;
+
+    // Stop 0.35m before target bone so we never hit the target enemy's own collider
+    float checkDist = dist3D - 0.80f;
+    if (checkDist <= 0.1f) checkDist = 0.1f;
+
+    PhysicsScene scene(0, 0);
+    if (Physics_get_defaultPhysicsScene != nullptr) {
+        scene = Physics_get_defaultPhysicsScene();
+    }
+
+    // layerMask: -5 (~4, all physical layers except IgnoreRaycast), QueryTriggerInteraction: 1 (Ignore trigger volumes)
+    bool isBlocked = Internal_RaycastTest_Injected(&scene, &ray, checkDist, -5, 1);
+    return isBlocked;
 }
 
 struct TargetBoneInfo {
@@ -1677,6 +1847,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 
     auto evaluateCandidate = [&](void *headTransform, void *bodyTransform, void *targetibleObj, void *netPlayer, void *fallbackEntity, void *botPlayer = nullptr) {
         if (!isEntityEnemy(netPlayer, targetibleObj, botPlayer)) return;
+        if (isEntityDeadOrCorpse(netPlayer, botPlayer, targetibleObj)) return; // Ignore corpses / dead bodies!
 
         auto checkBone = [&](void *boneTransform, bool isHead, const Vector3 &offset) {
             if (boneTransform == nullptr || !isPointerReadable(boneTransform) || !isUnityObjectAlive(boneTransform)) return;
@@ -1687,6 +1858,11 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             Vector3 aimDir = bonePos - camPos;
             float dist3D = sqrtf(aimDir.x * aimDir.x + aimDir.y * aimDir.y + aimDir.z * aimDir.z);
             if (dist3D < 0.2f || dist3D > 250.0f) return;
+
+            // Wallcheck: line of sight check - ignore target if obstructed behind a wall!
+            if (isTargetObstructedByWall(camPos, bonePos)) {
+                return;
+            }
 
             // User-provided method: Quaternion::LookRotation + ToEulerRad + angle.x normalization
             Quaternion boneLook = Quaternion::LookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
@@ -2068,11 +2244,11 @@ static void processAimAssistLock(void *aimingControl) {
     // Quadratic weighting: soft at periphery, firmer near center
     float weight = proximity * proximity;
 
-    // Smooth magnetic pull rate (Preferred natural smoothness):
+    // Smooth magnetic pull rate (Natural smoothness with slight boost at 100):
     // Low smoothness (0%): ~0.03 * weight
-    // Mid smoothness (50%): ~0.08 * weight
-    // High smoothness (100%): ~0.14 * weight
-    float assistRate = (0.03f + 0.11f * s) * weight;
+    // Mid smoothness (50%): ~0.105 * weight
+    // High smoothness (100%): ~0.18 * weight (slightly increased at 100 as requested, but never stiff)
+    float assistRate = (0.03f + 0.15f * s) * weight;
 
     // USER SWIPE AUTHORITY:
     // If player is actively swiping in the opposite direction of the enemy (trying to turn away),
@@ -2088,8 +2264,8 @@ static void processAimAssistLock(void *aimingControl) {
     float stepPitch = diffPitch * assistRate;
 
     // 9. Angular velocity clamp per frame (Smooth and never stiff/ketat)
-    // Max angular speed: 0.4 deg/frame (at s=0) to 1.2 deg/frame (at s=1.0)
-    float maxStepPerFrame = 0.4f + 0.8f * s;
+    // Max angular speed: 0.4 deg/frame (at s=0) to 1.6 deg/frame (at s=1.0)
+    float maxStepPerFrame = 0.4f + 1.2f * s;
     float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
     if (stepLen > maxStepPerFrame) {
         float scale = maxStepPerFrame / stepLen;
@@ -2364,6 +2540,9 @@ bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
     if (isTargetibleObjectTeammate(targetibleObject)) {
         return false; // Ignore teammates!
     }
+    if (isEntityDeadOrCorpse(nullptr, nullptr, targetibleObject)) {
+        return false; // Ignore dead bodies / corpses!
+    }
     return old_BaseAimAssist_IsValidTarget(instance, targetibleObject);
 }
 
@@ -2374,6 +2553,9 @@ bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
     if (isTargetibleObjectTeammate(targetibleObject)) {
         return false; // Ignore teammates!
+    }
+    if (isEntityDeadOrCorpse(nullptr, nullptr, targetibleObject)) {
+        return false; // Ignore dead bodies / corpses!
     }
     return old_NewAutoAim_IsValidTarget(instance, targetibleObject);
 }
