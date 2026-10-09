@@ -94,30 +94,12 @@ inline Vector3 GetPlayerLocation(void *player) {
     return get_position(tf);
 }
 
-// Camera helper matching tutorial with multiple resilient fallbacks
+// Safe camera helper reading cached camera pointer from Unity engine thread
 inline void *get_camera() {
-    // 1. AimingCamera from AimingControl (Active Player FPS Camera)
     void *aimCam = g_activeAimingCamera.load();
     if (aimCam != nullptr && isUnityObjectAlive(aimCam)) {
         return aimCam;
     }
-
-    // 2. Camera.main
-    if (Camera_get_main != nullptr) {
-        void *cam = Camera_get_main();
-        if (cam != nullptr && isUnityObjectAlive(cam)) {
-            return cam;
-        }
-    }
-
-    // 3. Camera.current
-    if (Camera_get_current != nullptr) {
-        void *curCam = Camera_get_current();
-        if (curCam != nullptr && isUnityObjectAlive(curCam)) {
-            return curCam;
-        }
-    }
-
     return nullptr;
 }
 
