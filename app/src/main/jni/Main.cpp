@@ -666,6 +666,7 @@ static inline void setTransformRotation(void *transformObj, const Quaternion &ro
     set_rotation_Injected(nativeTrans, &rot);
 }
 
+static void *g_activeAimingControl = nullptr;
 static void processAimAssistLock(void *aimingControl);
 
 // =========================================================================
@@ -891,13 +892,10 @@ void hook_FirstPersonController_Update(void *instance) {
         if (g_noRecoil) {
             applyNoRecoilMemoryEdits(instance);
         }
-        if (g_aimAssistBoost) {
-            void *aimingControl = nullptr;
-            if (isPointerReadable((void *)((uintptr_t)instance + 0xF0))) {
-                aimingControl = *(void **)((uintptr_t)instance + 0xF0);
-            }
-            if (aimingControl != nullptr && isUnityObjectAlive(aimingControl)) {
-                processAimAssistLock(aimingControl);
+        if (isPointerReadable((void *)((uintptr_t)instance + 0xF0))) {
+            void *aimingControl = *(void **)((uintptr_t)instance + 0xF0);
+            if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
+                g_activeAimingControl = aimingControl;
             }
         }
     }
@@ -1400,8 +1398,13 @@ static bool (*get_IsAutoAimAllowed)(void *) = nullptr;
 static void *(*NetworkPlayer_GetTargetibleObject)(void *) = nullptr;
 static void *(*BotPlayer_GetTargetibleObject)(void *) = nullptr;
 static void (*AimingControl_SetTargetibleObject)(void *, void *) = nullptr;
+static void (*AimingControl_ClearTargetibleObject)(void *) = nullptr;
 static void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
 static bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
+
+static void *g_activeAimAssistManager = nullptr;
+static void *g_activeNewAutoAim = nullptr;
+static void *g_activeBaseAimAssist = nullptr;
 
 static void initAimAssistPointers() {
     if (get_TargetType == nullptr) {
@@ -1427,6 +1430,10 @@ static void initAimAssistPointers() {
     if (AimingControl_SetTargetibleObject == nullptr) {
         AimingControl_SetTargetibleObject = (void (*)(void *, void *)) getAbsoluteAddress(targetLibName, 0x4D287F8);
         ModLog("[AIM_ASSIST] AimingControl.SetTargetibleObject pointer: %p", AimingControl_SetTargetibleObject);
+    }
+    if (AimingControl_ClearTargetibleObject == nullptr) {
+        AimingControl_ClearTargetibleObject = (void (*)(void *)) getAbsoluteAddress(targetLibName, 0x4D2883C);
+        ModLog("[AIM_ASSIST] AimingControl.ClearTargetibleObject pointer: %p", AimingControl_ClearTargetibleObject);
     }
     if (AimingControl_AddDelta == nullptr) {
         AimingControl_AddDelta = (void (*)(void *, Vector2)) getAbsoluteAddress(targetLibName, 0x4D281AC);
@@ -1953,6 +1960,9 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 
 static uint64_t g_lastAimAssistProcessMs = 0;
 static uint64_t g_lastAimAssistLogMs = 0;
+static float g_lastFrameYaw = 0.0f;
+static float g_lastFramePitch = 0.0f;
+static bool g_hasLastFrameAngles = false;
 
 static void processAimAssistLock(void *aimingControl) {
     if (aimingControl == nullptr || !isPointerReadable(aimingControl) || !isUnityObjectAlive(aimingControl)) return;
@@ -1993,7 +2003,23 @@ static void processAimAssistLock(void *aimingControl) {
     float currentYaw = azEuler.y;
     float currentPitch = (elEuler.x > 180.0f) ? (elEuler.x - 360.0f) : elEuler.x;
 
-    // 3. Resolve Camera Position
+    // 3. User Swipe Tracking (User Authority Protection)
+    float userDeltaYaw = 0.0f;
+    float userDeltaPitch = 0.0f;
+    if (g_hasLastFrameAngles) {
+        userDeltaYaw = currentYaw - g_lastFrameYaw;
+        while (userDeltaYaw > 180.0f) userDeltaYaw -= 360.0f;
+        while (userDeltaYaw < -180.0f) userDeltaYaw += 360.0f;
+
+        userDeltaPitch = currentPitch - g_lastFramePitch;
+        while (userDeltaPitch > 180.0f) userDeltaPitch -= 360.0f;
+        while (userDeltaPitch < -180.0f) userDeltaPitch += 360.0f;
+    }
+    g_lastFrameYaw = currentYaw;
+    g_lastFramePitch = currentPitch;
+    g_hasLastFrameAngles = true;
+
+    // 4. Resolve Camera Position
     Vector3 camPos = getTransformPosition(elevationNode);
     if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
         if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
@@ -2004,29 +2030,32 @@ static void processAimAssistLock(void *aimingControl) {
         camPos = getTransformPosition(g_localPlayerFPC) + Vector3(0.0f, 1.6f, 0.0f);
     }
 
-    // 4. Capture Cone in degrees (Natural, focused crosshair cone)
-    float maxFovAngle = g_bigHead ? 22.0f : 16.0f;
+    // 5. Crosshair Targeting Cone in degrees
+    float maxFovAngle = g_bigHead ? 20.0f : 15.0f;
 
-    // 5. Search Best Enemy Bone (Player or Bot)
+    // 6. Search Best Enemy Bone (Enemy Players or Bots only, Strictly Teammates Excluded)
     TargetBoneInfo targetInfo = findBestTargetBone(camPos, currentYaw, currentPitch, maxFovAngle, cameraObj);
     if (!targetInfo.found) {
-        // Clear locked target if no enemy is in cone
+        // No enemy in FOV cone -> ensure no target locked
         if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
             *(void **)((uintptr_t)aimingControl + 0xC8) = nullptr;
+        }
+        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xD0))) {
+            *(bool *)((uintptr_t)aimingControl + 0xD0) = false;
         }
         return;
     }
 
-    // 6. Angular Delta Calculation
+    // 7. Angular Delta Calculation
     float diffYaw = targetInfo.targetYaw - currentYaw;
     while (diffYaw > 180.0f) diffYaw -= 360.0f;
-    while (diffYaw < -180.0f) diffYaw += 360.0f;
+    while (diffYaw < -180.0f) diffYaw -= 360.0f;
 
     float diffPitch = targetInfo.targetPitch - currentPitch;
     while (diffPitch > 180.0f) diffPitch -= 360.0f;
     while (diffPitch < -180.0f) diffPitch += 360.0f;
 
-    // 7. Calculate Proximity Falloff & Smooth Pull
+    // 8. Calculate Proximity Falloff & Smooth Pull
     // Distance from crosshair center: 0 = directly on target, maxFovAngle = edge of cone
     float proximity = 1.0f - (targetInfo.angleOffset / (maxFovAngle + 0.001f));
     if (proximity < 0.0f) proximity = 0.0f;
@@ -2039,19 +2068,29 @@ static void processAimAssistLock(void *aimingControl) {
     if (sliderVal > 100) sliderVal = 100;
     float s = (float)sliderVal / 100.0f;
 
-    // Smooth assist pull rate:
-    // Low smoothness (0%): ~0.04 * weight
-    // Mid smoothness (50%): ~0.15 * weight
-    // High smoothness (100%): ~0.26 * weight
-    float assistRate = (0.04f + 0.22f * s) * weight;
+    // Smooth magnetic pull rate:
+    // Low smoothness (0%): ~0.03 * weight
+    // Mid smoothness (50%): ~0.08 * weight
+    // High smoothness (100%): ~0.14 * weight
+    float assistRate = (0.03f + 0.11f * s) * weight;
+
+    // USER SWIPE AUTHORITY:
+    // If player is actively swiping in the opposite direction of the enemy (trying to turn away),
+    // dramatically reduce assist pull so the player's swipe is 100% responsive and never blocked!
+    if ((userDeltaYaw > 0.3f && diffYaw < -0.2f) || (userDeltaYaw < -0.3f && diffYaw > 0.2f)) {
+        assistRate *= 0.15f; // Reduce by 85% when user swipes away
+    }
+    if ((userDeltaPitch > 0.3f && diffPitch < -0.2f) || (userDeltaPitch < -0.3f && diffPitch > 0.2f)) {
+        assistRate *= 0.15f;
+    }
 
     float stepYaw = diffYaw * assistRate;
     float stepPitch = diffPitch * assistRate;
 
-    // 8. Angular velocity clamp per frame
-    // This allows player finger swipes to ALWAYS easily overpower the assist
-    // Max angular speed: 0.8 deg/frame (at s=0) to 2.8 deg/frame (at s=1.0)
-    float maxStepPerFrame = 0.8f + 2.0f * s;
+    // 9. Angular velocity clamp per frame
+    // Player thumb swipes (typically 5-15 deg/frame) will easily overpower this assist
+    // Max angular speed: 0.4 deg/frame (at s=0) to 1.2 deg/frame (at s=1.0)
+    float maxStepPerFrame = 0.4f + 0.8f * s;
     float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
     if (stepLen > maxStepPerFrame) {
         float scale = maxStepPerFrame / stepLen;
@@ -2077,29 +2116,26 @@ static void processAimAssistLock(void *aimingControl) {
     if (newPitch < minPitch) newPitch = minPitch;
     if (newPitch > maxPitch) newPitch = maxPitch;
 
-    // 9. Update Euler Angles on Azimuth and Elevation Nodes
+    // 10. Update Euler Angles on Azimuth and Elevation Nodes
     azEuler.y = fmodf(newYaw + 360.0f, 360.0f);
     elEuler.x = (newPitch < 0.0f) ? (newPitch + 360.0f) : newPitch;
 
     setTransformLocalEulerAngles(azimuthNode, azEuler);
     setTransformLocalEulerAngles(elevationNode, elEuler);
 
-    // NOTICE: Direct world look rotation (setTransformRotation fullLook) is REMOVED!
-    // This ensures 100% free camera movement and swipe responsive control at all times!
-
-    // 10. Sync TargetibleObject in AimingControl
-    if (targetInfo.targetibleObj != nullptr && isUnityObjectAlive(targetInfo.targetibleObj)) {
-        if (AimingControl_SetTargetibleObject != nullptr) {
-            AimingControl_SetTargetibleObject(aimingControl, targetInfo.targetibleObj);
-        }
-        if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
-            *(void **)((uintptr_t)aimingControl + 0xC8) = targetInfo.targetibleObj;
-        }
+    // CRITICAL FIX: NEVER call AimingControl_SetTargetibleObject or set *(aimingControl + 0xC8)!
+    // Setting _target tells the game engine to activate hard-lock mode which freezes touch swipe controls.
+    // Instead, ALWAYS keep _target = nullptr and _isLocked = false so swipe controls are 100% free!
+    if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
+        *(void **)((uintptr_t)aimingControl + 0xC8) = nullptr;
+    }
+    if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xD0))) {
+        *(bool *)((uintptr_t)aimingControl + 0xD0) = false;
     }
 
     if (nowMs - g_lastAimAssistLogMs > 6000) {
         g_lastAimAssistLogMs = nowMs;
-        ModLog("[AIM_ASSIST] Bone Lock Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+        ModLog("[AIM_ASSIST] Smooth Assist Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
                targetInfo.isHead ? "HEAD BONE" : "BODY BONE",
                targetInfo.dist3D,
                targetInfo.angleOffset,
@@ -2111,10 +2147,38 @@ static void processAimAssistLock(void *aimingControl) {
 // 0. AimingControl.Update: RVA 0x4D27294
 void (*old_AimingControl_Update)(void *instance) = nullptr;
 void hook_AimingControl_Update(void *instance) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        g_activeAimingControl = instance;
+
+        // Ensure game engine's internal hard-lock target is null before update
+        if (isPointerReadable((void *)((uintptr_t)instance + 0xC8))) {
+            *(void **)((uintptr_t)instance + 0xC8) = nullptr;
+        }
+        if (isPointerReadable((void *)((uintptr_t)instance + 0xD0))) {
+            *(bool *)((uintptr_t)instance + 0xD0) = false;
+        }
+    }
+
     if (old_AimingControl_Update != nullptr) {
         old_AimingControl_Update(instance);
     }
-    if (g_aimAssistBoost && instance != nullptr && isUnityObjectAlive(instance)) {
+
+    if (!g_aimAssistBoost) {
+        // Aim assist is OFF: Ensure target is cleared, zero camera pull, 100% free movement!
+        if (instance != nullptr && isPointerReadable(instance)) {
+            if (isPointerReadable((void *)((uintptr_t)instance + 0xC8))) {
+                *(void **)((uintptr_t)instance + 0xC8) = nullptr;
+            }
+            if (isPointerReadable((void *)((uintptr_t)instance + 0xD0))) {
+                *(bool *)((uintptr_t)instance + 0xD0) = false;
+            }
+        }
+        g_hasLastFrameAngles = false;
+        return;
+    }
+
+    // Aim assist is ON: Apply smooth magnetic bone assist
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
         processAimAssistLock(instance);
     }
 }
@@ -2265,9 +2329,8 @@ Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vect
 // 4. AimAssistManager.SetEnabled (0x529060C)
 void (*old_AimAssistManager_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
-    if (g_aimAssistBoost) {
-        enabled = true;
-    }
+    g_activeAimAssistManager = instance;
+    enabled = g_aimAssistBoost;
     if (old_AimAssistManager_SetEnabled != nullptr) {
         old_AimAssistManager_SetEnabled(instance, enabled);
     }
@@ -2276,9 +2339,8 @@ void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
 // 5. NewAutoAim.SetEnabled (0x421C470)
 void (*old_NewAutoAim_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_NewAutoAim_SetEnabled(void *instance, bool enabled) {
-    if (g_aimAssistBoost) {
-        enabled = true;
-    }
+    g_activeNewAutoAim = instance;
+    enabled = g_aimAssistBoost;
     if (old_NewAutoAim_SetEnabled != nullptr) {
         old_NewAutoAim_SetEnabled(instance, enabled);
     }
@@ -2287,9 +2349,8 @@ void hook_NewAutoAim_SetEnabled(void *instance, bool enabled) {
 // 6. BaseAimAssist.SetEnabled (0x4478A30)
 void (*old_BaseAimAssist_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
-    if (g_aimAssistBoost) {
-        enabled = true;
-    }
+    g_activeBaseAimAssist = instance;
+    enabled = g_aimAssistBoost;
     if (old_BaseAimAssist_SetEnabled != nullptr) {
         old_BaseAimAssist_SetEnabled(instance, enabled);
     }
@@ -2298,32 +2359,48 @@ void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
 // 7. BaseAimAssist.IsValidTarget (0x4478A70) & NewAutoAim.IsValidTarget (0x421C254)
 bool (*old_BaseAimAssist_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
+    if (!g_aimAssistBoost) return false;
     if (old_BaseAimAssist_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
-    bool valid = old_BaseAimAssist_IsValidTarget(instance, targetibleObject);
-    if (!valid) return false;
-
-    if (g_aimAssistBoost) {
-        if (isTargetibleObjectTeammate(targetibleObject)) {
-            return false; // Ignore teammates!
-        }
+    if (isTargetibleObjectTeammate(targetibleObject)) {
+        return false; // Ignore teammates!
     }
-    return true;
+    return old_BaseAimAssist_IsValidTarget(instance, targetibleObject);
 }
 
 bool (*old_NewAutoAim_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
+    if (!g_aimAssistBoost) return false;
     if (old_NewAutoAim_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
-    bool valid = old_NewAutoAim_IsValidTarget(instance, targetibleObject);
-    if (!valid) return false;
+    if (isTargetibleObjectTeammate(targetibleObject)) {
+        return false; // Ignore teammates!
+    }
+    return old_NewAutoAim_IsValidTarget(instance, targetibleObject);
+}
 
-    if (g_aimAssistBoost) {
-        if (isTargetibleObjectTeammate(targetibleObject)) {
-            return false; // Ignore teammates!
+static void resetAimAssistState(void *aimingControlInstance = nullptr) {
+    void *ac = aimingControlInstance ? aimingControlInstance : g_activeAimingControl;
+    if (ac != nullptr && isPointerReadable(ac)) {
+        if (isPointerReadable((void *)((uintptr_t)ac + 0xC8))) {
+            *(void **)((uintptr_t)ac + 0xC8) = nullptr;
+        }
+        if (isPointerReadable((void *)((uintptr_t)ac + 0xD0))) {
+            *(bool *)((uintptr_t)ac + 0xD0) = false;
+        }
+        if (AimingControl_ClearTargetibleObject != nullptr) {
+            AimingControl_ClearTargetibleObject(ac);
         }
     }
-    return true;
+    if (old_AimAssistManager_SetEnabled != nullptr && g_activeAimAssistManager != nullptr && isPointerReadable(g_activeAimAssistManager)) {
+        old_AimAssistManager_SetEnabled(g_activeAimAssistManager, false);
+    }
+    if (old_NewAutoAim_SetEnabled != nullptr && g_activeNewAutoAim != nullptr && isPointerReadable(g_activeNewAutoAim)) {
+        old_NewAutoAim_SetEnabled(g_activeNewAutoAim, false);
+    }
+    if (old_BaseAimAssist_SetEnabled != nullptr && g_activeBaseAimAssist != nullptr && isPointerReadable(g_activeBaseAimAssist)) {
+        old_BaseAimAssist_SetEnabled(g_activeBaseAimAssist, false);
+    }
 }
 
 // =========================================================================
@@ -2659,8 +2736,18 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
 
             if (boolean) {
                 Toast(env, ctx, OBFUSCATE("Aim Assist (Auto-Lock): ON"), ToastLength::LENGTH_SHORT);
+                if (old_AimAssistManager_SetEnabled != nullptr && g_activeAimAssistManager != nullptr && isPointerReadable(g_activeAimAssistManager)) {
+                    old_AimAssistManager_SetEnabled(g_activeAimAssistManager, true);
+                }
+                if (old_NewAutoAim_SetEnabled != nullptr && g_activeNewAutoAim != nullptr && isPointerReadable(g_activeNewAutoAim)) {
+                    old_NewAutoAim_SetEnabled(g_activeNewAutoAim, true);
+                }
+                if (old_BaseAimAssist_SetEnabled != nullptr && g_activeBaseAimAssist != nullptr && isPointerReadable(g_activeBaseAimAssist)) {
+                    old_BaseAimAssist_SetEnabled(g_activeBaseAimAssist, true);
+                }
             } else {
                 Toast(env, ctx, OBFUSCATE("Aim Assist (Auto-Lock): OFF"), ToastLength::LENGTH_SHORT);
+                resetAimAssistState();
             }
             break;
         }
