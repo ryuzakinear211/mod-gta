@@ -332,6 +332,7 @@ static void installCrashHandler() {
 // =========================================================================
 
 static int g_safetyPipe[2] = {-1, -1};
+static std::mutex g_pipeMutex;
 
 static void initSafetyPipe() {
     if (g_safetyPipe[0] == -1) {
@@ -349,9 +350,9 @@ static bool isPointerReadable(const void *ptr) {
     if (ptr == nullptr) return false;
     uintptr_t addr = (uintptr_t)ptr;
     if (addr < 0x10000 || addr >= 0x0080000000000000ULL) return false;
-    if ((addr & 0x7) != 0) return false; // Pointers must be 8-byte aligned on aarch64
 
     if (g_safetyPipe[1] != -1) {
+        std::lock_guard<std::mutex> lock(g_pipeMutex);
         char dummy;
         while (read(g_safetyPipe[0], &dummy, 1) > 0); // Drain pipe
         ssize_t written = write(g_safetyPipe[1], ptr, 1);
@@ -362,6 +363,29 @@ static bool isPointerReadable(const void *ptr) {
         return false;
     }
     return true;
+}
+
+// Validates whether a managed UnityEngine.Object (Il2CppObject) is alive and has a non-null native C++ pointer
+static inline bool isUnityObjectAlive(const void *unityObj) {
+    if (unityObj == nullptr || !isPointerReadable(unityObj)) return false;
+    uintptr_t addr = (uintptr_t)unityObj;
+    if ((addr & 0x7) != 0) return false;
+
+    // Check klass at offset 0x00
+    void *klass = *(void **)addr;
+    if (klass == nullptr || !isPointerReadable(klass)) return false;
+
+    // Check m_CachedPtr at offset 0x10 (native C++ Unity engine object in libunity.so)
+    void *cachedPtr = *(void **)(addr + 0x10);
+    if (cachedPtr == nullptr || !isPointerReadable(cachedPtr)) return false;
+
+    return true;
+}
+
+// Extracts the native C++ Unity object pointer (m_CachedPtr at offset 0x10) from a managed UnityEngine.Object
+static inline void* getNativeUnityPointer(void *unityObj) {
+    if (!isUnityObjectAlive(unityObj)) return nullptr;
+    return *(void **)((uintptr_t)unityObj + 0x10);
 }
 
 // =========================================================================
@@ -586,8 +610,60 @@ static void initUnityPointers() {
 }
 
 static void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
-    if (transformObj == nullptr || !isPointerReadable(transformObj) || set_localScale_Injected == nullptr) return;
-    set_localScale_Injected(transformObj, &scale);
+    if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || set_localScale_Injected == nullptr) return;
+    void *t = transformObj;
+    if (get_transform != nullptr) {
+        void *resolved = get_transform(transformObj);
+        if (resolved != nullptr && isUnityObjectAlive(resolved)) {
+            t = resolved;
+        }
+    }
+    void *nativeTrans = getNativeUnityPointer(t);
+    if (nativeTrans == nullptr) return;
+    set_localScale_Injected(nativeTrans, &scale);
+}
+
+static inline bool getTransformLocalEulerAngles(void *transformObj, Vector3 &eulerOut) {
+    if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || GetLocalEulerAngles_Injected == nullptr) return false;
+    void *t = transformObj;
+    if (get_transform != nullptr) {
+        void *resolved = get_transform(transformObj);
+        if (resolved != nullptr && isUnityObjectAlive(resolved)) {
+            t = resolved;
+        }
+    }
+    void *nativeTrans = getNativeUnityPointer(t);
+    if (nativeTrans == nullptr) return false;
+    GetLocalEulerAngles_Injected(nativeTrans, 4, &eulerOut);
+    return true;
+}
+
+static inline void setTransformLocalEulerAngles(void *transformObj, const Vector3 &euler) {
+    if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || SetLocalEulerAngles_Injected == nullptr) return;
+    void *t = transformObj;
+    if (get_transform != nullptr) {
+        void *resolved = get_transform(transformObj);
+        if (resolved != nullptr && isUnityObjectAlive(resolved)) {
+            t = resolved;
+        }
+    }
+    void *nativeTrans = getNativeUnityPointer(t);
+    if (nativeTrans == nullptr) return;
+    SetLocalEulerAngles_Injected(nativeTrans, &euler, 4);
+}
+
+static inline void setTransformRotation(void *transformObj, const Quaternion &rot) {
+    if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || set_rotation_Injected == nullptr) return;
+    void *t = transformObj;
+    if (get_transform != nullptr) {
+        void *resolved = get_transform(transformObj);
+        if (resolved != nullptr && isUnityObjectAlive(resolved)) {
+            t = resolved;
+        }
+    }
+    void *nativeTrans = getNativeUnityPointer(t);
+    if (nativeTrans == nullptr) return;
+    set_rotation_Injected(nativeTrans, &rot);
 }
 
 static void processAimAssistLock(void *aimingControl);
@@ -626,6 +702,8 @@ struct ObscuredFloat {
 
 // Dynamic Player Weapon Memory Addresses (Client Only)
 static void *g_localPlayerFPC = nullptr;
+static void *g_localPlayerTargetibleObject = nullptr;
+static void *g_localPlayerNetPlayer = nullptr;
 static void *g_localPlayerWeapon = nullptr;
 static void *g_localPlayerShooter = nullptr;
 static void *g_localWeaponProfile = nullptr;
@@ -665,6 +743,19 @@ static bool isClientWeaponParams(void *instance) {
 static void updateLocalPlayerWeapon(void *fpc) {
     if (fpc == nullptr || !isPointerReadable(fpc)) return;
     g_localPlayerFPC = fpc;
+
+    if (isPointerReadable((void *)((uintptr_t)fpc + 0x120))) {
+        void *tObj = *(void **)((uintptr_t)fpc + 0x120);
+        if (tObj != nullptr && isUnityObjectAlive(tObj)) {
+            g_localPlayerTargetibleObject = tObj;
+            if (isPointerReadable((void *)((uintptr_t)tObj + 0xD8))) {
+                void *np = *(void **)((uintptr_t)tObj + 0xD8);
+                if (np != nullptr && isUnityObjectAlive(np)) {
+                    g_localPlayerNetPlayer = np;
+                }
+            }
+        }
+    }
 
     void *currentWeapon = nullptr;
     if (get_CurrentWeapon != nullptr) {
@@ -784,7 +875,7 @@ static void applyNoRecoilMemoryEdits(void *fpc) {
 // 1. FirstPersonController.Update: RVA 0x40A1BF4
 void (*old_FirstPersonController_Update)(void *instance) = nullptr;
 void hook_FirstPersonController_Update(void *instance) {
-    if (instance != nullptr) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
         setLastAction("FirstPersonController_Update");
         updateLocalPlayerWeapon(instance);
         if (g_fastFireRate) {
@@ -804,7 +895,7 @@ void hook_FirstPersonController_Update(void *instance) {
             if (isPointerReadable((void *)((uintptr_t)instance + 0xF0))) {
                 aimingControl = *(void **)((uintptr_t)instance + 0xF0);
             }
-            if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
+            if (aimingControl != nullptr && isUnityObjectAlive(aimingControl)) {
                 processAimAssistLock(aimingControl);
             }
         }
@@ -1018,7 +1109,7 @@ static const Vector3 BIG_HEAD_SCALE(3.0f, 3.0f, 3.0f);
 static const Vector3 NORMAL_HEAD_SCALE(1.0f, 1.0f, 1.0f);
 
 static void onNetworkPlayerUpdate(void *instance) {
-    if (instance == nullptr) return;
+    if (instance == nullptr || !isUnityObjectAlive(instance)) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_networkPlayers[instance] = getCurrentTimeMs();
 }
@@ -1030,13 +1121,13 @@ static void onNetworkPlayerDestroy(void *instance) {
 }
 
 static void onBotPlayerUpdate(void *instance) {
-    if (instance == nullptr) return;
+    if (instance == nullptr || !isUnityObjectAlive(instance)) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_botPlayers[instance] = getCurrentTimeMs();
 
     if (isPointerReadable((void *)((uintptr_t)instance + 0x50))) {
         void *netPlayer = *(void **)((uintptr_t)instance + 0x50);
-        if (netPlayer != nullptr) {
+        if (netPlayer != nullptr && isUnityObjectAlive(netPlayer)) {
             g_botNetPlayers[instance] = netPlayer;
         }
     }
@@ -1063,7 +1154,7 @@ static EntityStats getEntityStats() {
 
     std::set<void*> activeBotNets;
     for (auto it = g_botPlayers.begin(); it != g_botPlayers.end(); ) {
-        if (now - it->second > TIMEOUT_MS) {
+        if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
             g_botNetPlayers.erase(it->first);
             it = g_botPlayers.erase(it);
         } else {
@@ -1078,7 +1169,7 @@ static EntityStats getEntityStats() {
     int totalNetPlayers = 0;
     int realCount = 0;
     for (auto it = g_networkPlayers.begin(); it != g_networkPlayers.end(); ) {
-        if (now - it->second > TIMEOUT_MS) {
+        if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
             it = g_networkPlayers.erase(it);
         } else {
             totalNetPlayers++;
@@ -1114,6 +1205,8 @@ static void resetEntityCounters() {
     g_networkPlayers.clear();
     g_botPlayers.clear();
     g_botNetPlayers.clear();
+    g_localPlayerTargetibleObject = nullptr;
+    g_localPlayerNetPlayer = nullptr;
     ModLog("[STATS] Entity counters reset manually.");
 }
 
@@ -1124,21 +1217,21 @@ static void resetEntityCounters() {
 static uint64_t g_lastBigHeadLogMs = 0;
 
 static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
-    if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return;
+    if (netPlayer == nullptr || !isUnityObjectAlive(netPlayer)) return;
 
     // 1. DollsManager at offset 0x88
     if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x88))) {
         void *dollsMgr = *(void **)((uintptr_t)netPlayer + 0x88);
-        if (dollsMgr != nullptr && isPointerReadable(dollsMgr)) {
+        if (dollsMgr != nullptr && isUnityObjectAlive(dollsMgr)) {
             // Remote player: ThirdPersonController at 0x50
             if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x50))) {
                 void *tpCtrl = *(void **)((uintptr_t)dollsMgr + 0x50);
-                if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+                if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
                     if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
                         void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
-                        if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                        if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
                             void *headBone = GetBoneTransform(animator, 10); // 10 = HumanBodyBones.Head
-                            if (headBone != nullptr && isPointerReadable(headBone)) {
+                            if (headBone != nullptr && isUnityObjectAlive(headBone)) {
                                 safeSetLocalScale(headBone, scale);
                             }
                         }
@@ -1148,12 +1241,12 @@ static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
             // Bot player doll: ThirdPersonController at 0x60
             if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x60))) {
                 void *tpBotCtrl = *(void **)((uintptr_t)dollsMgr + 0x60);
-                if (tpBotCtrl != nullptr && isPointerReadable(tpBotCtrl)) {
+                if (tpBotCtrl != nullptr && isUnityObjectAlive(tpBotCtrl)) {
                     if (isPointerReadable((void *)((uintptr_t)tpBotCtrl + 0x78))) {
                         void *animator = *(void **)((uintptr_t)tpBotCtrl + 0x78);
-                        if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                        if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
                             void *headBone = GetBoneTransform(animator, 10);
-                            if (headBone != nullptr && isPointerReadable(headBone)) {
+                            if (headBone != nullptr && isUnityObjectAlive(headBone)) {
                                 safeSetLocalScale(headBone, scale);
                             }
                         }
@@ -1163,17 +1256,17 @@ static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
             // 0x38: FirstPerson DollView (Local player)
             if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x38))) {
                 void *fpDoll = *(void **)((uintptr_t)dollsMgr + 0x38);
-                if (fpDoll != nullptr && isPointerReadable(fpDoll) && get_transform != nullptr) {
+                if (fpDoll != nullptr && isUnityObjectAlive(fpDoll) && get_transform != nullptr) {
                     void *t = get_transform(fpDoll);
-                    if (t != nullptr) safeSetLocalScale(t, scale);
+                    if (t != nullptr && isUnityObjectAlive(t)) safeSetLocalScale(t, scale);
                 }
             }
             // 0x48: ThirdPerson DollView (Remote player)
             if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x48))) {
                 void *tpDoll = *(void **)((uintptr_t)dollsMgr + 0x48);
-                if (tpDoll != nullptr && isPointerReadable(tpDoll) && get_transform != nullptr) {
+                if (tpDoll != nullptr && isUnityObjectAlive(tpDoll) && get_transform != nullptr) {
                     void *t = get_transform(tpDoll);
-                    if (t != nullptr) safeSetLocalScale(t, scale);
+                    if (t != nullptr && isUnityObjectAlive(t)) safeSetLocalScale(t, scale);
                 }
             }
         }
@@ -1182,7 +1275,7 @@ static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
     // 2. Head Hitbox in BodyPointsManager at offset 0xC8
     if (isPointerReadable((void *)((uintptr_t)netPlayer + 0xC8))) {
         void *bpm = *(void **)((uintptr_t)netPlayer + 0xC8);
-        if (bpm != nullptr && isPointerReadable(bpm)) {
+        if (bpm != nullptr && isUnityObjectAlive(bpm)) {
             if (isPointerReadable((void *)((uintptr_t)bpm + 0x20))) {
                 void *bodyPointsArr = *(void **)((uintptr_t)bpm + 0x20);
                 if (bodyPointsArr != nullptr && isPointerReadable(bodyPointsArr)) {
@@ -1196,13 +1289,13 @@ static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
                                     if (bodyPoint != nullptr && isPointerReadable(bodyPoint)) {
                                         if (isPointerReadable((void *)((uintptr_t)bodyPoint + 0x10))) {
                                             void *bpView = *(void **)((uintptr_t)bodyPoint + 0x10);
-                                            if (bpView != nullptr && isPointerReadable(bpView)) {
+                                            if (bpView != nullptr && isUnityObjectAlive(bpView)) {
                                                 if (isPointerReadable((void *)((uintptr_t)bpView + 0x20))) {
                                                     int pointType = *(int *)((uintptr_t)bpView + 0x20);
                                                     if (pointType == 0) { // Head
                                                         if (get_transform != nullptr) {
                                                             void *headHitbox = get_transform(bpView);
-                                                            if (headHitbox != nullptr) {
+                                                            if (headHitbox != nullptr && isUnityObjectAlive(headHitbox)) {
                                                                 safeSetLocalScale(headHitbox, scale);
                                                             }
                                                         }
@@ -1228,17 +1321,17 @@ static void applyBigHeadToNetworkPlayer(void *netPlayer, const Vector3 &scale) {
 }
 
 static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
-    if (botPlayer == nullptr || !isPointerReadable(botPlayer)) return;
+    if (botPlayer == nullptr || !isUnityObjectAlive(botPlayer)) return;
 
     // 0. ThirdPersonController at offset 0x58
     if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x58))) {
         void *tpCtrl = *(void **)((uintptr_t)botPlayer + 0x58);
-        if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+        if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
             if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
                 void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
-                if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
+                if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
                     void *headBone = GetBoneTransform(animator, 10);
-                    if (headBone != nullptr && isPointerReadable(headBone)) {
+                    if (headBone != nullptr && isUnityObjectAlive(headBone)) {
                         safeSetLocalScale(headBone, scale);
                     }
                 }
@@ -1249,10 +1342,10 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
     // 1. BotPlayerLook at offset 0x28 -> Transform at offset 0x28 (Head look bone)
     if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x28))) {
         void *botLook = *(void **)((uintptr_t)botPlayer + 0x28);
-        if (botLook != nullptr && isPointerReadable(botLook)) {
+        if (botLook != nullptr && isUnityObjectAlive(botLook)) {
             if (isPointerReadable((void *)((uintptr_t)botLook + 0x28))) {
                 void *headBone = *(void **)((uintptr_t)botLook + 0x28);
-                if (headBone != nullptr && isPointerReadable(headBone)) {
+                if (headBone != nullptr && isUnityObjectAlive(headBone)) {
                     safeSetLocalScale(headBone, scale);
                 }
             }
@@ -1262,7 +1355,7 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
     // 2. NetworkPlayer at offset 0x50
     if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x50))) {
         void *netPlayer = *(void **)((uintptr_t)botPlayer + 0x50);
-        if (netPlayer != nullptr && isPointerReadable(netPlayer)) {
+        if (netPlayer != nullptr && isUnityObjectAlive(netPlayer)) {
             applyBigHeadToNetworkPlayer(netPlayer, scale);
         }
     }
@@ -1325,11 +1418,14 @@ static bool isTargetTeammate(void *targetibleObj) {
     if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) {
         return false;
     }
+    if (!isUnityObjectAlive(targetibleObj)) {
+        return true; // Destroyed object -> Ignore as aim target!
+    }
 
     // 1. Check TargetibleObjectCustomSettings at offset 0x90
     if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0x90))) {
         void *customSettings = *(void **)((uintptr_t)targetibleObj + 0x90);
-        if (customSettings != nullptr && isPointerReadable(customSettings)) {
+        if (customSettings != nullptr && isUnityObjectAlive(customSettings)) {
             // Direct memory check for backing field <AllyObjectToogle>k__BackingField at offset 0x20
             if (isPointerReadable((void *)((uintptr_t)customSettings + 0x20))) {
                 bool isAllyField = *(bool *)((uintptr_t)customSettings + 0x20);
@@ -1338,28 +1434,37 @@ static bool isTargetTeammate(void *targetibleObj) {
                 }
             }
 
-            // Method call check: TargetibleObjectCustomSettings.get_AllyObjectToogle (0x4DED164)
-            if (get_AllyObjectToogle != nullptr) {
-                if (get_AllyObjectToogle(customSettings)) {
-                    return true;
-                }
-            }
-
-            // Check if game explicitly disallows auto aim for this object: TargetibleObjectCustomSettings.get_IsAutoAimAllowed (0x4DED124)
-            if (get_IsAutoAimAllowed != nullptr) {
-                if (!get_IsAutoAimAllowed(customSettings)) {
-                    return true; // Not an allowed aim target (e.g. ally) -> Ignore!
+            // Direct check on _enemyData at offset 0x28 -> TargetibleObjectCustomSettingsData.IsAutoAimAllowed (0x11)
+            if (isPointerReadable((void *)((uintptr_t)customSettings + 0x28))) {
+                void *enemyData = *(void **)((uintptr_t)customSettings + 0x28);
+                if (enemyData != nullptr && isPointerReadable(enemyData) &&
+                    isPointerReadable((void *)((uintptr_t)enemyData + 0x11))) {
+                    bool autoAimAllowed = *(bool *)((uintptr_t)enemyData + 0x11);
+                    if (!autoAimAllowed) {
+                        return true; // Game explicitly disallows auto aim for this object
+                    }
                 }
             }
         }
     }
 
     // 2. Ignore self if targetibleObject belongs to local player
+    if (g_localPlayerTargetibleObject != nullptr && targetibleObj == g_localPlayerTargetibleObject) {
+        return true;
+    }
+
+    // 3. NetworkPlayer teammate check
     if (isPointerReadable((void *)((uintptr_t)targetibleObj + 0xD8))) {
         void *targetNetPlayer = *(void **)((uintptr_t)targetibleObj + 0xD8);
         if (targetNetPlayer != nullptr && isPointerReadable(targetNetPlayer)) {
-            if (g_localPlayerFPC != nullptr && targetNetPlayer == g_localPlayerFPC) {
+            if (g_localPlayerNetPlayer != nullptr && targetNetPlayer == g_localPlayerNetPlayer) {
                 return true;
+            }
+            if (g_localPlayerNetPlayer != nullptr && NetworkPlayer_IsTeammate != nullptr &&
+                isUnityObjectAlive(targetNetPlayer) && isUnityObjectAlive(g_localPlayerNetPlayer)) {
+                if (NetworkPlayer_IsTeammate(targetNetPlayer, g_localPlayerNetPlayer)) {
+                    return true;
+                }
             }
         }
     }
@@ -1369,28 +1474,38 @@ static bool isTargetTeammate(void *targetibleObj) {
 
 static inline Vector3 getTransformPosition(void *transformObj) {
     Vector3 pos(0.0f, 0.0f, 0.0f);
-    if (transformObj == nullptr || !isPointerReadable(transformObj)) return pos;
-    if (get_position_Injected != nullptr) {
-        get_position_Injected(transformObj, &pos);
+    if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || get_position_Injected == nullptr) return pos;
+    void *t = transformObj;
+    if (get_transform != nullptr) {
+        void *resolved = get_transform(transformObj);
+        if (resolved != nullptr && isUnityObjectAlive(resolved)) {
+            t = resolved;
+        }
     }
+    void *nativeTrans = getNativeUnityPointer(t);
+    if (nativeTrans == nullptr) return pos;
+    get_position_Injected(nativeTrans, &pos);
     return pos;
 }
 
 static inline bool worldToViewport(void *cameraObj, const Vector3 &worldPos, Vector3 &viewportPos) {
-    if (cameraObj == nullptr || !isPointerReadable(cameraObj) || WorldToViewportPoint_Injected == nullptr) return false;
-    WorldToViewportPoint_Injected(cameraObj, &worldPos, 2, &viewportPos); // 2 = Mono
+    if (cameraObj == nullptr || !isUnityObjectAlive(cameraObj) || WorldToViewportPoint_Injected == nullptr) return false;
+    void *nativeCam = getNativeUnityPointer(cameraObj);
+    if (nativeCam == nullptr) return false;
+    WorldToViewportPoint_Injected(nativeCam, &worldPos, 2, &viewportPos); // 2 = Mono
     return (viewportPos.z > 0.1f); // In front of camera
 }
 
 static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj) {
     if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
         // Ignore self
-        if (g_localPlayerFPC != nullptr && entityNetPlayer == g_localPlayerFPC) {
+        if (g_localPlayerNetPlayer != nullptr && entityNetPlayer == g_localPlayerNetPlayer) {
             return false;
         }
         // Teammate check via NetworkPlayer method
-        if (g_localPlayerFPC != nullptr && NetworkPlayer_IsTeammate != nullptr) {
-            if (NetworkPlayer_IsTeammate(entityNetPlayer, g_localPlayerFPC)) {
+        if (g_localPlayerNetPlayer != nullptr && NetworkPlayer_IsTeammate != nullptr &&
+            isUnityObjectAlive(entityNetPlayer) && isUnityObjectAlive(g_localPlayerNetPlayer)) {
+            if (NetworkPlayer_IsTeammate(entityNetPlayer, g_localPlayerNetPlayer)) {
                 return false;
             }
         }
@@ -1447,7 +1562,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
         if (!isEntityEnemy(netPlayer, targetibleObj)) return;
 
         auto checkBone = [&](void *boneTransform, bool isHead, const Vector3 &offset) {
-            if (boneTransform == nullptr || !isPointerReadable(boneTransform)) return;
+            if (boneTransform == nullptr || !isPointerReadable(boneTransform) || !isUnityObjectAlive(boneTransform)) return;
             Vector3 rawPos = getTransformPosition(boneTransform);
             if (rawPos.x == 0.0f && rawPos.y == 0.0f && rawPos.z == 0.0f) return;
             Vector3 bonePos = rawPos + offset;
@@ -1497,17 +1612,17 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             }
         };
 
-        if (headTransform != nullptr) {
+        if (headTransform != nullptr && isUnityObjectAlive(headTransform)) {
             checkBone(headTransform, true, Vector3(0.0f, 0.0f, 0.0f));
         }
-        if (bodyTransform != nullptr) {
+        if (bodyTransform != nullptr && isUnityObjectAlive(bodyTransform)) {
             checkBone(bodyTransform, false, Vector3(0.0f, 0.0f, 0.0f));
         }
 
         // Fallback to entity root transform with human height offsets
-        if (headTransform == nullptr && bodyTransform == nullptr && fallbackEntity != nullptr && get_transform != nullptr) {
+        if (headTransform == nullptr && bodyTransform == nullptr && fallbackEntity != nullptr && isUnityObjectAlive(fallbackEntity) && get_transform != nullptr) {
             void *rootTransform = get_transform(fallbackEntity);
-            if (rootTransform != nullptr && isPointerReadable(rootTransform)) {
+            if (rootTransform != nullptr && isUnityObjectAlive(rootTransform)) {
                 checkBone(rootTransform, true, Vector3(0.0f, 1.60f, 0.0f));  // Head offset
                 checkBone(rootTransform, false, Vector3(0.0f, 1.25f, 0.0f)); // Chest offset
             }
@@ -1516,8 +1631,8 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 
     // 1. Process Real Players (NetworkPlayer)
     for (void *netPlayer : candidateNetPlayers) {
-        if (netPlayer == nullptr || !isPointerReadable(netPlayer)) continue;
-        if (g_localPlayerFPC != nullptr && netPlayer == g_localPlayerFPC) continue;
+        if (netPlayer == nullptr || !isPointerReadable(netPlayer) || !isUnityObjectAlive(netPlayer)) continue;
+        if (g_localPlayerNetPlayer != nullptr && netPlayer == g_localPlayerNetPlayer) continue;
 
         void *headBone = nullptr;
         void *bodyBone = nullptr;
@@ -1525,12 +1640,15 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 
         if (NetworkPlayer_GetTargetibleObject != nullptr) {
             targetibleObj = NetworkPlayer_GetTargetibleObject(netPlayer);
+            if (targetibleObj != nullptr && !isUnityObjectAlive(targetibleObj)) {
+                targetibleObj = nullptr;
+            }
         }
 
         // Check DollsManager (0x88) -> ThirdPersonController -> Animator
         if (isPointerReadable((void *)((uintptr_t)netPlayer + 0x88))) {
             void *dollsMgr = *(void **)((uintptr_t)netPlayer + 0x88);
-            if (dollsMgr != nullptr && isPointerReadable(dollsMgr)) {
+            if (dollsMgr != nullptr && isUnityObjectAlive(dollsMgr)) {
                 void *tpCtrl = nullptr;
                 if (isPointerReadable((void *)((uintptr_t)dollsMgr + 0x50))) {
                     tpCtrl = *(void **)((uintptr_t)dollsMgr + 0x50);
@@ -1538,15 +1656,17 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
                 if (tpCtrl == nullptr && isPointerReadable((void *)((uintptr_t)dollsMgr + 0x60))) {
                     tpCtrl = *(void **)((uintptr_t)dollsMgr + 0x60);
                 }
-                if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+                if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
                     if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
                         void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
-                        if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
-                            headBone = GetBoneTransform(animator, 10); // HumanBodyBones.Head
-                            bodyBone = GetBoneTransform(animator, 9);  // HumanBodyBones.Chest
-                            if (bodyBone == nullptr) {
-                                bodyBone = GetBoneTransform(animator, 8); // Spine
+                        if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
+                            void *hb = GetBoneTransform(animator, 10); // HumanBodyBones.Head
+                            if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
+                            void *bb = GetBoneTransform(animator, 9);  // HumanBodyBones.Chest
+                            if (bb == nullptr || !isUnityObjectAlive(bb)) {
+                                bb = GetBoneTransform(animator, 8); // Spine
                             }
+                            if (bb != nullptr && isUnityObjectAlive(bb)) bodyBone = bb;
                         }
                     }
                 }
@@ -1569,12 +1689,14 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
                                         void *bp = items[i];
                                         if (bp != nullptr && isPointerReadable((void *)((uintptr_t)bp + 0x10))) {
                                             void *bpView = *(void **)((uintptr_t)bp + 0x10);
-                                            if (bpView != nullptr && isPointerReadable((void *)((uintptr_t)bpView + 0x20))) {
+                                            if (bpView != nullptr && isUnityObjectAlive(bpView) && isPointerReadable((void *)((uintptr_t)bpView + 0x20))) {
                                                 int pType = *(int *)((uintptr_t)bpView + 0x20);
                                                 if (pType == 0 && headBone == nullptr && get_transform != nullptr) {
-                                                    headBone = get_transform(bpView);
+                                                    void *t = get_transform(bpView);
+                                                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
                                                 } else if (pType != 0 && bodyBone == nullptr && get_transform != nullptr) {
-                                                    bodyBone = get_transform(bpView);
+                                                    void *t = get_transform(bpView);
+                                                    if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
                                                 }
                                             }
                                         }
@@ -1588,23 +1710,31 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
         }
 
         // Fallback: TargetibleObject colliders
-        if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+        if (targetibleObj != nullptr && isUnityObjectAlive(targetibleObj)) {
             if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x40))) {
                 void *col = *(void **)((uintptr_t)targetibleObj + 0x40);
-                if (col != nullptr && get_transform != nullptr) headBone = get_transform(col);
+                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
+                    void *t = get_transform(col);
+                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
+                }
             }
             if (bodyBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x48))) {
                 void *col = *(void **)((uintptr_t)targetibleObj + 0x48);
-                if (col != nullptr && get_transform != nullptr) bodyBone = get_transform(col);
+                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
+                    void *t = get_transform(col);
+                    if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
+                }
             }
             if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x38))) {
-                headBone = *(void **)((uintptr_t)targetibleObj + 0x38);
+                void *t = *(void **)((uintptr_t)targetibleObj + 0x38);
+                if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
             }
         }
 
         // Fallback: NetworkPlayer transform
         if (headBone == nullptr && bodyBone == nullptr && get_transform != nullptr) {
-            bodyBone = get_transform(netPlayer);
+            void *t = get_transform(netPlayer);
+            if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
         }
 
         evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer, netPlayer);
@@ -1612,7 +1742,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 
     // 2. Process AI Bots (BotPlayer)
     for (void *botPlayer : candidateBotPlayers) {
-        if (botPlayer == nullptr || !isPointerReadable(botPlayer)) continue;
+        if (botPlayer == nullptr || !isPointerReadable(botPlayer) || !isUnityObjectAlive(botPlayer)) continue;
 
         void *headBone = nullptr;
         void *bodyBone = nullptr;
@@ -1622,8 +1752,12 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
         // BotPlayer -> NetworkPlayer at 0x50
         if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x50))) {
             netPlayer = *(void **)((uintptr_t)botPlayer + 0x50);
-            if (netPlayer != nullptr && g_localPlayerFPC != nullptr && netPlayer == g_localPlayerFPC) {
-                continue;
+            if (netPlayer != nullptr) {
+                if (!isUnityObjectAlive(netPlayer)) {
+                    netPlayer = nullptr;
+                } else if (g_localPlayerNetPlayer != nullptr && netPlayer == g_localPlayerNetPlayer) {
+                    continue;
+                }
             }
         }
 
@@ -1634,17 +1768,24 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
         if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
             targetibleObj = BotPlayer_GetTargetibleObject(botPlayer);
         }
+        if (targetibleObj != nullptr && !isUnityObjectAlive(targetibleObj)) {
+            targetibleObj = nullptr;
+        }
 
         // BotPlayer -> ThirdPersonController at 0x58
         if (isPointerReadable((void *)((uintptr_t)botPlayer + 0x58))) {
             void *tpCtrl = *(void **)((uintptr_t)botPlayer + 0x58);
-            if (tpCtrl != nullptr && isPointerReadable(tpCtrl)) {
+            if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
                 if (isPointerReadable((void *)((uintptr_t)tpCtrl + 0x78))) {
                     void *animator = *(void **)((uintptr_t)tpCtrl + 0x78);
-                    if (animator != nullptr && isPointerReadable(animator) && GetBoneTransform != nullptr) {
-                        headBone = GetBoneTransform(animator, 10);
-                        bodyBone = GetBoneTransform(animator, 9);
-                        if (bodyBone == nullptr) bodyBone = GetBoneTransform(animator, 8);
+                    if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
+                        void *hb = GetBoneTransform(animator, 10);
+                        if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
+                        void *bb = GetBoneTransform(animator, 9);
+                        if (bb == nullptr || !isUnityObjectAlive(bb)) {
+                            bb = GetBoneTransform(animator, 8);
+                        }
+                        if (bb != nullptr && isUnityObjectAlive(bb)) bodyBone = bb;
                     }
                 }
             }
@@ -1653,29 +1794,40 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
         // BotPlayer -> BotPlayerLook at 0x28 -> Transform at 0x28
         if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)botPlayer + 0x28))) {
             void *botLook = *(void **)((uintptr_t)botPlayer + 0x28);
-            if (botLook != nullptr && isPointerReadable((void *)((uintptr_t)botLook + 0x28))) {
-                headBone = *(void **)((uintptr_t)botLook + 0x28);
+            if (botLook != nullptr && isUnityObjectAlive(botLook)) {
+                if (isPointerReadable((void *)((uintptr_t)botLook + 0x28))) {
+                    void *t = *(void **)((uintptr_t)botLook + 0x28);
+                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
+                }
             }
         }
 
         // BotPlayer -> TargetibleObject colliders
-        if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+        if (targetibleObj != nullptr && isUnityObjectAlive(targetibleObj)) {
             if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x40))) {
                 void *col = *(void **)((uintptr_t)targetibleObj + 0x40);
-                if (col != nullptr && get_transform != nullptr) headBone = get_transform(col);
+                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
+                    void *t = get_transform(col);
+                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
+                }
             }
             if (bodyBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x48))) {
                 void *col = *(void **)((uintptr_t)targetibleObj + 0x48);
-                if (col != nullptr && get_transform != nullptr) bodyBone = get_transform(col);
+                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
+                    void *t = get_transform(col);
+                    if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
+                }
             }
             if (headBone == nullptr && isPointerReadable((void *)((uintptr_t)targetibleObj + 0x38))) {
-                headBone = *(void **)((uintptr_t)targetibleObj + 0x38);
+                void *t = *(void **)((uintptr_t)targetibleObj + 0x38);
+                if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
             }
         }
 
         // Fallback: BotPlayer transform
         if (headBone == nullptr && bodyBone == nullptr && get_transform != nullptr) {
-            bodyBone = get_transform(botPlayer);
+            void *t = get_transform(botPlayer);
+            if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
         }
 
         evaluateCandidate(headBone, bodyBone, targetibleObj, netPlayer, botPlayer);
@@ -1688,7 +1840,7 @@ static uint64_t g_lastAimAssistProcessMs = 0;
 static uint64_t g_lastAimAssistLogMs = 0;
 
 static void processAimAssistLock(void *aimingControl) {
-    if (aimingControl == nullptr || !isPointerReadable(aimingControl)) return;
+    if (aimingControl == nullptr || !isPointerReadable(aimingControl) || !isUnityObjectAlive(aimingControl)) return;
 
     uint64_t nowMs = getCurrentTimeMs();
     if (nowMs - g_lastAimAssistProcessMs < 4) {
@@ -1712,16 +1864,14 @@ static void processAimAssistLock(void *aimingControl) {
     }
 
     if (azimuthNode == nullptr || elevationNode == nullptr) return;
-    if (!isPointerReadable(azimuthNode) || !isPointerReadable(elevationNode)) return;
+    if (!isUnityObjectAlive(azimuthNode) || !isUnityObjectAlive(elevationNode)) return;
 
     // 2. Read Current Local Euler Angles
     Vector3 azEuler(0.0f, 0.0f, 0.0f);
     Vector3 elEuler(0.0f, 0.0f, 0.0f);
 
-    if (GetLocalEulerAngles_Injected != nullptr) {
-        GetLocalEulerAngles_Injected(azimuthNode, 4, &azEuler);   // 4 = OrderZXY
-        GetLocalEulerAngles_Injected(elevationNode, 4, &elEuler); // 4 = OrderZXY
-    } else {
+    if (!getTransformLocalEulerAngles(azimuthNode, azEuler) ||
+        !getTransformLocalEulerAngles(elevationNode, elEuler)) {
         return;
     }
 
@@ -1731,11 +1881,11 @@ static void processAimAssistLock(void *aimingControl) {
     // 3. Resolve Camera Position
     Vector3 camPos = getTransformPosition(elevationNode);
     if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
-        if (cameraObj != nullptr && isPointerReadable(cameraObj)) {
+        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
             camPos = getTransformPosition(cameraObj);
         }
     }
-    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f && g_localPlayerFPC != nullptr) {
+    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f && g_localPlayerFPC != nullptr && isUnityObjectAlive(g_localPlayerFPC)) {
         camPos = getTransformPosition(g_localPlayerFPC) + Vector3(0.0f, 1.6f, 0.0f);
     }
 
@@ -1747,13 +1897,7 @@ static void processAimAssistLock(void *aimingControl) {
     if (!targetInfo.found) {
         // Clear locked target if no enemy is in cone
         if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
-            void *currTarget = *(void **)((uintptr_t)aimingControl + 0xC8);
-            if (currTarget != nullptr) {
-                if (AimingControl_SetTargetibleObject != nullptr) {
-                    AimingControl_SetTargetibleObject(aimingControl, nullptr);
-                }
-                *(void **)((uintptr_t)aimingControl + 0xC8) = nullptr;
-            }
+            *(void **)((uintptr_t)aimingControl + 0xC8) = nullptr;
         }
         return;
     }
@@ -1812,30 +1956,27 @@ static void processAimAssistLock(void *aimingControl) {
     azEuler.y = fmodf(newYaw + 360.0f, 360.0f);
     elEuler.x = (newPitch < 0.0f) ? (newPitch + 360.0f) : newPitch;
 
-    if (SetLocalEulerAngles_Injected != nullptr) {
-        SetLocalEulerAngles_Injected(azimuthNode, &azEuler, 4);
-        SetLocalEulerAngles_Injected(elevationNode, &elEuler, 4);
-    }
+    setTransformLocalEulerAngles(azimuthNode, azEuler);
+    setTransformLocalEulerAngles(elevationNode, elEuler);
 
-    // 9. When slider >= 95, also apply direct world look rotation
-    if (sliderVal >= 95 && set_rotation_Injected != nullptr) {
+    // 9. When slider >= 95, also apply direct world look rotation if direction is valid
+    if (sliderVal >= 95) {
         Vector3 aimDir = targetInfo.bonePos - camPos;
-        Quaternion fullLook = Quaternion::LookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
-        set_rotation_Injected(elevationNode, &fullLook);
+        float magSq = aimDir.x * aimDir.x + aimDir.y * aimDir.y + aimDir.z * aimDir.z;
+        if (magSq > 0.0001f) {
+            Quaternion fullLook = Quaternion::LookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
+            setTransformRotation(elevationNode, fullLook);
+        }
     }
 
-    // 10. Sync TargetibleObject and Internal Delta in AimingControl
-    if (targetInfo.targetibleObj != nullptr && isPointerReadable(targetInfo.targetibleObj)) {
+    // 10. Sync TargetibleObject in AimingControl
+    if (targetInfo.targetibleObj != nullptr && isUnityObjectAlive(targetInfo.targetibleObj)) {
         if (AimingControl_SetTargetibleObject != nullptr) {
             AimingControl_SetTargetibleObject(aimingControl, targetInfo.targetibleObj);
         }
         if (isPointerReadable((void *)((uintptr_t)aimingControl + 0xC8))) {
             *(void **)((uintptr_t)aimingControl + 0xC8) = targetInfo.targetibleObj;
         }
-    }
-
-    if (AimingControl_AddDelta != nullptr) {
-        AimingControl_AddDelta(aimingControl, Vector2(applyYaw, applyPitch));
     }
 
     if (nowMs - g_lastAimAssistLogMs > 6000) {
@@ -1855,7 +1996,7 @@ void hook_AimingControl_Update(void *instance) {
     if (old_AimingControl_Update != nullptr) {
         old_AimingControl_Update(instance);
     }
-    if (g_aimAssistBoost && instance != nullptr) {
+    if (g_aimAssistBoost && instance != nullptr && isUnityObjectAlive(instance)) {
         processAimAssistLock(instance);
     }
 }
@@ -2039,6 +2180,7 @@ void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
 bool (*old_BaseAimAssist_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
     if (old_BaseAimAssist_IsValidTarget == nullptr) return false;
+    if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
     bool valid = old_BaseAimAssist_IsValidTarget(instance, targetibleObject);
     if (!valid) return false;
 
@@ -2053,6 +2195,7 @@ bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
 bool (*old_NewAutoAim_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
     if (old_NewAutoAim_IsValidTarget == nullptr) return false;
+    if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
     bool valid = old_NewAutoAim_IsValidTarget(instance, targetibleObject);
     if (!valid) return false;
 
@@ -2071,7 +2214,7 @@ bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
 // NetworkPlayer.Update: RVA 0x42CC8C8
 void (*old_NetworkPlayer_Update)(void *instance) = nullptr;
 void hook_NetworkPlayer_Update(void *instance) {
-    if (instance != nullptr) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
         setLastAction("NetworkPlayer_Update");
         // Always track active network players unconditionally
         onNetworkPlayerUpdate(instance);
@@ -2088,6 +2231,8 @@ void hook_NetworkPlayer_Update(void *instance) {
                 }
             }
         }
+    } else if (instance != nullptr) {
+        onNetworkPlayerDestroy(instance);
     }
     if (old_NetworkPlayer_Update != nullptr) {
         old_NetworkPlayer_Update(instance);
@@ -2109,7 +2254,7 @@ void hook_NetworkPlayer_OnDestroy(void *instance) {
 // BotPlayer.Start: RVA 0x44493F4
 void (*old_BotPlayer_Start)(void *instance) = nullptr;
 void hook_BotPlayer_Start(void *instance) {
-    if (instance != nullptr) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
         setLastAction("BotPlayer_Start");
         onBotPlayerUpdate(instance);
     }
@@ -2121,7 +2266,7 @@ void hook_BotPlayer_Start(void *instance) {
 // BotPlayer.Update: RVA 0x444A310
 void (*old_BotPlayer_Update)(void *instance) = nullptr;
 void hook_BotPlayer_Update(void *instance) {
-    if (instance != nullptr) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
         setLastAction("BotPlayer_Update");
         // Always track active bot players unconditionally
         onBotPlayerUpdate(instance);
@@ -2131,6 +2276,8 @@ void hook_BotPlayer_Update(void *instance) {
         } else if (g_needsBigHeadReset) {
             applyBigHeadToBotPlayer(instance, NORMAL_HEAD_SCALE);
         }
+    } else if (instance != nullptr) {
+        onBotPlayerDestroy(instance);
     }
     if (old_BotPlayer_Update != nullptr) {
         old_BotPlayer_Update(instance);
