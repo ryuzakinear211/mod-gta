@@ -154,14 +154,14 @@ public class ESPOverlayView extends View {
                 boolean isBot = entityData[base + 7] > 0.5f;
                 boolean isEnemy = entityData[base + 8] > 0.5f;
 
-                // Box dimensions
-                float boxMidX = (rootX + headX) / 2.0f;
+                // Box dimensions centered directly on character body centerline
+                float boxMidX = headX;
                 float boxHeight = Math.abs(rootY - headY);
                 if (boxHeight < dp(14)) boxHeight = dp(14);
-                float boxWidth = boxHeight * 0.50f;
+                float boxWidth = boxHeight * 0.45f;
 
-                float boxTop = Math.min(headY, rootY) - (boxHeight * 0.08f);
-                float boxBottom = Math.max(headY, rootY) + (boxHeight * 0.04f);
+                float boxTop = Math.min(headY, rootY);
+                float boxBottom = Math.max(headY, rootY);
                 float boxLeft = boxMidX - (boxWidth / 2.0f);
                 float boxRight = boxMidX + (boxWidth / 2.0f);
 
@@ -200,9 +200,9 @@ public class ESPOverlayView extends View {
                     canvas.drawRect(barLeft, filledTop, barRight, boxBottom, hpPaint);
                 }
 
-                // 4. Name & Entity Info (Player / Bot label above box)
+                // 4. Name & Entity Info (Simplified: "Bot" if AI bot, "Player" if human player)
                 if (drawName) {
-                    String label = (isBot ? "[BOT]" : "[PLAYER]") + (isEnemy ? " [E]" : " [A]");
+                    String label = isBot ? "Bot" : "Player";
                     float labelY = boxTop - dp(4.0f);
                     drawTextWithOutline(canvas, label, boxMidX, labelY, boxPaint.getColor());
                 }

@@ -744,7 +744,6 @@ static void onNetworkPlayerUpdate(void *instance) {
     if (instance == nullptr || !isUnityObjectAlive(instance)) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_networkPlayers[instance] = getCurrentTimeMs();
-    onESPPlayerUpdate(instance, false);
 
     // Dynamically detect local player if TargetType == 1 (LocalPlayer)
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC0))) {
@@ -778,7 +777,6 @@ static void onBotPlayerUpdate(void *instance) {
     if (instance == nullptr || !isUnityObjectAlive(instance)) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_botPlayers[instance] = getCurrentTimeMs();
-    onESPPlayerUpdate(instance, true);
 
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x50))) {
         void *netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x50);
@@ -1001,75 +999,61 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 static bool isTargetibleObjectTeammate(void *targetibleObj);
 
 static bool isNetworkPlayerTeammate(void *netPlayer) {
-    if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return false;
-    if (!isUnityObjectAlive(netPlayer)) return false;
-
-    // Ignore self
-    void *localNet = g_localPlayerNetPlayer.load();
-    if (localNet != nullptr && netPlayer == localNet) {
-        return true;
+    if (netPlayer == nullptr || !isPointerReadable(netPlayer) || !isUnityObjectAlive(netPlayer)) {
+        return false;
     }
 
-    // 1. Check targetInfo at offset 0xC0
+    void *localPlayer = g_localPlayerNetPlayer.load();
+    if (localPlayer != nullptr && netPlayer == localPlayer) {
+        return true; // Local player is own team
+    }
+
+    // 1. Direct TargetType check
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
         void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
         if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-            int tType = 0;
+            int targetType = 0;
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
-                tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
+                targetType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
             }
-            if (tType == 0 && get_TargetType != nullptr) {
-                tType = get_TargetType(targetInfo);
+            if (targetType == 0 && get_TargetType != nullptr) {
+                targetType = get_TargetType(targetInfo);
             }
-
-            if (tType != 0) {
-                if (tType == 1) { // LocalPlayer
-                    g_localPlayerNetPlayer.store(netPlayer);
-                    return true;
+            if (targetType != 0) {
+                if ((targetType & (2 | 8 | 32)) != 0) {
+                    return true; // Teammate/Ally
                 }
-                // Bitmask: LocalPlayer (1) | OtherPlayerAlly (2) | VehicleAlly (8) | BotAlly (32) = 43
-                if ((tType & (1 | 2 | 8 | 32)) != 0) {
-                    return true; // Marked as ally by game engine!
-                }
-                // Bitmask: OtherPlayerEnemy (4) | VehicleEnemy (16) | BotEnemy (64) | BotDeathmatch (128) = 212
-                if ((tType & (4 | 16 | 64 | 128)) != 0) {
-                    return false; // Confirmed enemy!
+                if ((targetType & (4 | 16 | 64 | 128)) != 0) {
+                    return false; // Enemy
                 }
             }
         }
     }
 
-    // 2. Check TargetibleObject customSettings
-    if (NetworkPlayer_GetTargetibleObject != nullptr) {
-        void *tObj = NetworkPlayer_GetTargetibleObject(netPlayer);
-        if (tObj != nullptr && isPointerReadable(tObj) && isUnityObjectAlive(tObj)) {
-            if (isTargetibleObjectTeammate(tObj)) {
-                return true;
-            }
-        }
-    }
-
-    // 3. Check NetworkPlayer.IsTeammate if local player is known
-    if (localNet != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localNet)) {
-        if (NetworkPlayer_IsTeammate(netPlayer, localNet)) {
-            return true;
-        }
+    // 2. Call NetworkPlayer.IsTeammate(this, localPlayer)
+    if (localPlayer != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localPlayer)) {
+        return NetworkPlayer_IsTeammate(netPlayer, localPlayer);
     }
 
     return false;
 }
 
 static bool isTargetibleObjectTeammate(void *targetibleObj) {
-    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return false;
-    if (!isUnityObjectAlive(targetibleObj)) return false;
-
-    // Ignore self if targetibleObject belongs to local player
-    void *localTObj = g_localPlayerTargetibleObject.load();
-    if (localTObj != nullptr && targetibleObj == localTObj) {
-        return true;
+    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj) || !isUnityObjectAlive(targetibleObj)) {
+        return false;
     }
 
-    // 1. Check TargetibleObjectCustomSettings at offset 0x90
+    // 1. Check associated NetworkPlayer at offset 0xD8
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8))) {
+        void *targetNetPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8);
+        if (targetNetPlayer != nullptr && isPointerReadable(targetNetPlayer) && isUnityObjectAlive(targetNetPlayer)) {
+            if (isNetworkPlayerTeammate(targetNetPlayer)) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Check TargetibleObjectCustomSettings at offset 0x90
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
         void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
         if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
@@ -1083,15 +1067,30 @@ static bool isTargetibleObjectTeammate(void *targetibleObj) {
                     return true;
                 }
             }
-        }
-    }
-
-    // 2. Check associated NetworkPlayer at offset 0xD8
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8))) {
-        void *targetNetPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8);
-        if (targetNetPlayer != nullptr && isPointerReadable(targetNetPlayer) && isUnityObjectAlive(targetNetPlayer)) {
-            if (isNetworkPlayerTeammate(targetNetPlayer)) {
+            // C. Call get_IsAutoAimAllowed (RVA 0x4DED124)
+            if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
                 return true;
+            }
+            // D. Direct check on _allyData at offset 0x30
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x30))) {
+                void *allyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x30);
+                if (allyData != nullptr && isPointerReadable(allyData) &&
+                    isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(allyData) + 0x10))) {
+                    if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(allyData) + 0x10)) {
+                        return true;
+                    }
+                }
+            }
+            // E. Direct check on _enemyData at offset 0x28 -> IsAutoAimAllowed (0x11)
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x28))) {
+                void *enemyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x28);
+                if (enemyData != nullptr && isPointerReadable(enemyData) &&
+                    isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
+                    bool autoAimAllowed = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11);
+                    if (!autoAimAllowed) {
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -1121,6 +1120,24 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
                 return true;
             }
         }
+
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
+            void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
+            if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
+                if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
+                    return true;
+                }
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x28))) {
+                    void *enemyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x28);
+                    if (enemyData != nullptr && isPointerReadable(enemyData) &&
+                        isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
+                        if (!(*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // 2. Check BotPlayer health (BotPlayerHealth at 0x30)
@@ -1133,6 +1150,12 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
             if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
                     float hp = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
+                    if (hp <= 0.0f) {
+                        return true;
+                    }
+                }
+                if (BotPlayerHealth_GetHealth != nullptr) {
+                    float hp = BotPlayerHealth_GetHealth(botHealth);
                     if (hp <= 0.0f) {
                         return true;
                     }
@@ -1157,35 +1180,39 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
                 }
             }
         }
+        if (Collider_get_enabled != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0x90))) {
+            void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0x90);
+            if (col != nullptr && isUnityObjectAlive(col)) {
+                if (!Collider_get_enabled(col)) {
+                    return true;
+                }
+            }
+        }
     }
 
     return false;
 }
 
 static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botPlayer = nullptr) {
+    if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
+        if (isNetworkPlayerTeammate(entityNetPlayer)) return false;
+    }
+    if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+        if (isTargetibleObjectTeammate(targetibleObj)) return false;
+    }
     if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
-        // AI Bots are enemies by default
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
-            void *botTObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
-            if (botTObj != nullptr && isPointerReadable(botTObj) && isUnityObjectAlive(botTObj)) {
-                if (isTargetibleObjectTeammate(botTObj)) return false;
-            }
-        }
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50))) {
             void *botNet = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50);
             if (botNet != nullptr && isPointerReadable(botNet) && isUnityObjectAlive(botNet)) {
                 if (isNetworkPlayerTeammate(botNet)) return false;
             }
         }
-        return true;
-    }
-
-    if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
-        if (isNetworkPlayerTeammate(entityNetPlayer)) return false;
-    }
-
-    if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
-        if (isTargetibleObjectTeammate(targetibleObj)) return false;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
+            void *botTObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
+            if (botTObj != nullptr && isPointerReadable(botTObj) && isUnityObjectAlive(botTObj)) {
+                if (isTargetibleObjectTeammate(botTObj)) return false;
+            }
+        }
     }
 
     return true;
@@ -1250,12 +1277,6 @@ void onESPClear() {
 }
 
 static void *getGameCamera() {
-    if (Camera_get_main != nullptr) {
-        void *mainCam = Camera_get_main();
-        if (mainCam != nullptr && isUnityObjectAlive(mainCam)) {
-            return mainCam;
-        }
-    }
     void *aimingControl = g_activeAimingControl.load();
     if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20))) {
@@ -1263,6 +1284,12 @@ static void *getGameCamera() {
             if (cam != nullptr && isUnityObjectAlive(cam)) {
                 return cam;
             }
+        }
+    }
+    if (Camera_get_main != nullptr) {
+        void *mainCam = Camera_get_main();
+        if (mainCam != nullptr && isUnityObjectAlive(mainCam)) {
+            return mainCam;
         }
     }
     return nullptr;
@@ -1281,11 +1308,59 @@ jfloatArray GetESPData(JNIEnv *env, jobject thiz, jint screenWidth, jint screenH
     std::vector<float> buffer;
     buffer.reserve(32 * 9);
 
-    void *localPlayer = g_localPlayerNetPlayer.load();
     float maxDist = static_cast<float>(g_espMaxDistance.load());
     bool enemyOnly = g_espEnemyOnly.load();
 
-    int count = espManager->collectESPData(cam, screenWidth, screenHeight, maxDist, enemyOnly, localPlayer, buffer);
+    // Collect active entities directly from g_entityMutex matching status panel overlay logic
+    std::vector<ESPEntityItem> activeEntities;
+    {
+        std::lock_guard<std::mutex> lock(g_entityMutex);
+        uint64_t now = getCurrentTimeMs();
+        const uint64_t TIMEOUT_MS = 2500;
+
+        // 1. Gather all active bot NetworkPlayer pointers
+        std::set<void*> activeBotNets;
+        for (auto it = g_botPlayers.begin(); it != g_botPlayers.end(); ) {
+            if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
+                g_botNetPlayers.erase(it->first);
+                it = g_botPlayers.erase(it);
+            } else {
+                void *botObj = it->first;
+                void *botNet = nullptr;
+                auto netIt = g_botNetPlayers.find(botObj);
+                if (netIt != g_botNetPlayers.end()) {
+                    botNet = netIt->second;
+                } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botObj) + 0x50))) {
+                    botNet = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botObj) + 0x50);
+                    if (botNet != nullptr && isUnityObjectAlive(botNet)) {
+                        g_botNetPlayers[botObj] = botNet;
+                    }
+                }
+                if (botNet != nullptr && isUnityObjectAlive(botNet)) {
+                    activeBotNets.insert(botNet);
+                }
+                activeEntities.push_back({botObj, true, botNet});
+                ++it;
+            }
+        }
+
+        // 2. Gather NetworkPlayers that are NOT bots and NOT local player
+        void *localPlayer = g_localPlayerNetPlayer.load();
+        for (auto it = g_networkPlayers.begin(); it != g_networkPlayers.end(); ) {
+            if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
+                it = g_networkPlayers.erase(it);
+            } else {
+                void *netObj = it->first;
+                if (netObj != localPlayer && activeBotNets.find(netObj) == activeBotNets.end()) {
+                    // Real other player in match
+                    activeEntities.push_back({netObj, false, netObj});
+                }
+                ++it;
+            }
+        }
+    }
+
+    int count = espManager->collectESPDataFromList(cam, screenWidth, screenHeight, maxDist, enemyOnly, activeEntities, buffer);
     if (count <= 0 || buffer.empty()) {
         return env->NewFloatArray(0);
     }
