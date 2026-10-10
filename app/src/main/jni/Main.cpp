@@ -359,6 +359,11 @@ static std::atomic<void*> g_activeAimAssistManager{nullptr};
 static std::atomic<void*> g_activeNewAutoAim{nullptr};
 static std::atomic<void*> g_activeBaseAimAssist{nullptr};
 
+// Forward declarations for lifecycle handlers
+static void resetAimAssistState(void *aimingControlInstance = nullptr);
+static void resetEntityCounters();
+void onESPClear();
+
 static uint64_t g_lastWeaponLogMs = 0;
 static int g_origShootAction = -1;
 static bool g_hasOrigShootAction = false;
@@ -403,6 +408,13 @@ static void updateLocalPlayerWeapon(void *fpc) {
                     g_localPlayerNetPlayer.store(np);
                 }
             }
+        }
+    }
+
+    if (g_localPlayerNetPlayer.load() == nullptr && FPC_GetNetworkPlayer != nullptr) {
+        void *np = FPC_GetNetworkPlayer(fpc);
+        if (np != nullptr && isUnityObjectAlive(np)) {
+            g_localPlayerNetPlayer.store(np);
         }
     }
 
@@ -522,32 +534,58 @@ static void applyNoRecoilMemoryEdits(void *fpc) {
 // 1. FirstPersonController.Update: RVA 0x40A1BF4
 void (*old_FirstPersonController_Update)(void *instance) = nullptr;
 void hook_FirstPersonController_Update(void *instance) {
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        setLastAction("FirstPersonController_Update");
-        updateLocalPlayerWeapon(instance);
-        if (g_fastFireRate.load()) {
-            applyPlayerWeaponMemoryEdits();
-        } else if (g_hasOrigShootAction) {
-            void *shooter = g_localPlayerShooter.load();
-            if (shooter != nullptr && isPointerReadable(shooter)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x150))) {
-                    *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(shooter) + 0x150) = g_origShootAction;
-                    g_hasOrigShootAction = false;
-                }
+    if (instance == nullptr || !isUnityObjectAlive(instance)) {
+        return;
+    }
+    setLastAction("FirstPersonController_Update");
+    updateLocalPlayerWeapon(instance);
+    if (g_fastFireRate.load()) {
+        applyPlayerWeaponMemoryEdits();
+    } else if (g_hasOrigShootAction) {
+        void *shooter = g_localPlayerShooter.load();
+        if (shooter != nullptr && isPointerReadable(shooter)) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x150))) {
+                *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(shooter) + 0x150) = g_origShootAction;
+                g_hasOrigShootAction = false;
             }
         }
-        if (g_noRecoil.load()) {
-            applyNoRecoilMemoryEdits(instance);
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xF0))) {
-            void *aimingControl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xF0);
-            if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
-                g_activeAimingControl.store(aimingControl);
-            }
+    }
+    if (g_noRecoil.load()) {
+        applyNoRecoilMemoryEdits(instance);
+    }
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xF0))) {
+        void *aimingControl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xF0);
+        if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
+            g_activeAimingControl.store(aimingControl);
         }
     }
     if (old_FirstPersonController_Update != nullptr) {
         old_FirstPersonController_Update(instance);
+    }
+}
+
+// FirstPersonController.OnDestroy: RVA 0x40A3A84
+void (*old_FirstPersonController_OnDestroy)(void *instance) = nullptr;
+void hook_FirstPersonController_OnDestroy(void *instance) {
+    setLastAction("FirstPersonController_OnDestroy");
+    if (instance != nullptr && instance == g_localPlayerFPC.load()) {
+        g_localPlayerFPC.store(nullptr);
+        g_localPlayerWeapon.store(nullptr);
+        g_localPlayerShooter.store(nullptr);
+        g_localWeaponProfile.store(nullptr);
+        g_localWeaponParams.store(nullptr);
+        g_localPlayerTargetibleObject.store(nullptr);
+        g_localPlayerNetPlayer.store(nullptr);
+        g_activeAimingControl.store(nullptr);
+        g_activeAimAssistManager.store(nullptr);
+        g_activeNewAutoAim.store(nullptr);
+        g_activeBaseAimAssist.store(nullptr);
+        resetEntityCounters();
+        onESPClear();
+        resetAimAssistState();
+    }
+    if (old_FirstPersonController_OnDestroy != nullptr) {
+        old_FirstPersonController_OnDestroy(instance);
     }
 }
 
@@ -740,6 +778,71 @@ void onESPPlayerUpdate(void *instance, bool isBot);
 void onESPPlayerDestroy(void *instance);
 void onESPClear();
 
+static inline bool isValidTargetType(int val) {
+    return (val > 0 && (val & 0xFF) != 0 && (val & ~0xFF) == 0);
+}
+
+static inline int extractTargetType(void *targetInfo) {
+    if (targetInfo == nullptr || !isPointerReadable(targetInfo)) return 0;
+
+    // 1. Direct getter call for Remote TargetInfo (TypeDefIndex 1590, RVA 0x4B9B610)
+    if (TargetInfo_GetTargetType_Remote != nullptr) {
+        int val = TargetInfo_GetTargetType_Remote(targetInfo);
+        if (isValidTargetType(val)) {
+            return val;
+        }
+    }
+
+    // 2. Direct getter call for Local TargetInfo (TypeDefIndex 6459, RVA 0x40AAA58)
+    if (get_TargetType != nullptr) {
+        int val = get_TargetType(targetInfo);
+        if (isValidTargetType(val)) {
+            return val;
+        }
+    }
+
+    // 3. Direct memory read for Remote TargetInfo (TypeDefIndex 1590: TargetType is at offset 0x34)
+    if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
+        int val34 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
+        if (isValidTargetType(val34)) {
+            return val34;
+        }
+    }
+
+    // 4. Direct memory read for Local TargetInfo (TypeDefIndex 6459 & 3806: TargetType is at offset 0x30)
+    if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
+        int val30 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
+        if (isValidTargetType(val30)) {
+            return val30;
+        }
+    }
+
+    return 0;
+}
+
+static inline bool isTargetInfoAlive(void *targetInfo) {
+    if (targetInfo == nullptr || !isPointerReadable(targetInfo)) return true;
+    // For TypeDefIndex 1590 (Remote players & bots), isAlive bool is at 0x38
+    if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x38))) {
+        if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
+            int tType34 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
+            if (isValidTargetType(tType34)) {
+                return *reinterpret_cast<const bool *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x38);
+            }
+        }
+    }
+    // For TypeDefIndex 6459 & 3806 (Local player), isAlive bool is at 0x34
+    if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
+        if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
+            int tType30 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
+            if (isValidTargetType(tType30)) {
+                return *reinterpret_cast<const bool *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
+            }
+        }
+    }
+    return true;
+}
+
 static void onNetworkPlayerUpdate(void *instance) {
     if (instance == nullptr || !isUnityObjectAlive(instance)) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
@@ -749,13 +852,7 @@ static void onNetworkPlayerUpdate(void *instance) {
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC0))) {
         void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC0);
         if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-            int tType = 0;
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
-                tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
-            }
-            if (tType == 0 && get_TargetType != nullptr) {
-                tType = get_TargetType(targetInfo);
-            }
+            int tType = extractTargetType(targetInfo);
             if (tType == 1) { // LocalPlayer
                 g_localPlayerNetPlayer.store(instance);
             }
@@ -804,7 +901,7 @@ static EntityStats getEntityStats() {
 
     std::set<void*> activeBotNets;
     for (auto it = g_botPlayers.begin(); it != g_botPlayers.end(); ) {
-        if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
+        if (now - it->second > TIMEOUT_MS) {
             g_botNetPlayers.erase(it->first);
             it = g_botPlayers.erase(it);
         } else {
@@ -819,7 +916,7 @@ static EntityStats getEntityStats() {
     int totalNetPlayers = 0;
     int realCount = 0;
     for (auto it = g_networkPlayers.begin(); it != g_networkPlayers.end(); ) {
-        if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
+        if (now - it->second > TIMEOUT_MS) {
             it = g_networkPlayers.erase(it);
         } else {
             totalNetPlayers++;
@@ -1016,14 +1113,7 @@ static bool isNetworkPlayerTeammate(void *netPlayer) {
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
         void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
         if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-            int tType = 0;
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
-                tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
-            }
-            if (tType == 0 && get_TargetType != nullptr) {
-                tType = get_TargetType(targetInfo);
-            }
-
+            int tType = extractTargetType(targetInfo);
             if (tType != 0) {
                 if (tType == 1) { // LocalPlayer
                     g_localPlayerNetPlayer.store(netPlayer);
@@ -1042,8 +1132,18 @@ static bool isNetworkPlayerTeammate(void *netPlayer) {
     }
 
     // 2. Check NetworkPlayer.IsTeammate if local player is known
+    if (localNet == nullptr) {
+        void *fpc = g_localPlayerFPC.load();
+        if (fpc != nullptr && isUnityObjectAlive(fpc) && FPC_GetNetworkPlayer != nullptr) {
+            localNet = FPC_GetNetworkPlayer(fpc);
+            if (localNet != nullptr && isUnityObjectAlive(localNet)) {
+                g_localPlayerNetPlayer.store(localNet);
+            }
+        }
+    }
+
     if (localNet != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localNet)) {
-        if (NetworkPlayer_IsTeammate(netPlayer, localNet)) {
+        if (NetworkPlayer_IsTeammate(netPlayer, localNet) || NetworkPlayer_IsTeammate(localNet, netPlayer)) {
             return true;
         }
     }
@@ -1052,8 +1152,8 @@ static bool isNetworkPlayerTeammate(void *netPlayer) {
 }
 
 static bool isTargetibleObjectTeammate(void *targetibleObj) {
-    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return true;
-    if (!isUnityObjectAlive(targetibleObj)) return true;
+    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return false;
+    if (!isUnityObjectAlive(targetibleObj)) return false;
 
     // Ignore self if targetibleObject belongs to local player
     void *localTObj = g_localPlayerTargetibleObject.load();
@@ -1085,28 +1185,30 @@ static bool isTargetibleObjectTeammate(void *targetibleObj) {
                     return true;
                 }
             }
-            // C. Call get_IsAutoAimAllowed (RVA 0x4DED124)
+            // C. Call get_IsAutoAimAllowed (RVA 0x4DED124) -> false means auto-aim is forbidden because entity is ally
             if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
                 return true;
             }
             // D. Direct check on _allyData at offset 0x30
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x30))) {
                 void *allyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x30);
-                if (allyData != nullptr && isPointerReadable(allyData) &&
-                    isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(allyData) + 0x10))) {
-                    if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(allyData) + 0x10)) {
-                        return true;
+                if (allyData != nullptr && isPointerReadable(allyData)) {
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(allyData) + 0x10))) {
+                        if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(allyData) + 0x10)) {
+                            return true;
+                        }
                     }
                 }
             }
             // E. Direct check on _enemyData at offset 0x28 -> IsAutoAimAllowed (0x11)
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x28))) {
                 void *enemyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x28);
-                if (enemyData != nullptr && isPointerReadable(enemyData) &&
-                    isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
-                    bool autoAimAllowed = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11);
-                    if (!autoAimAllowed) {
-                        return true;
+                if (enemyData != nullptr && isPointerReadable(enemyData)) {
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
+                        bool autoAimAllowed = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11);
+                        if (!autoAimAllowed) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -1136,24 +1238,6 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
             bool bodyAlive = (bodyCol != nullptr && isUnityObjectAlive(bodyCol) && Collider_get_enabled(bodyCol));
             if (!headAlive && !bodyAlive && (headCol != nullptr || bodyCol != nullptr)) {
                 return true;
-            }
-        }
-
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
-            void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
-            if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
-                if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
-                    return true;
-                }
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x28))) {
-                    void *enemyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x28);
-                    if (enemyData != nullptr && isPointerReadable(enemyData) &&
-                        isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
-                        if (!(*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
-                            return true;
-                        }
-                    }
-                }
             }
         }
     }
@@ -1190,11 +1274,8 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
             void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
             if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
-                    bool isAlive = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
-                    if (!isAlive) {
-                        return true;
-                    }
+                if (!isTargetInfoAlive(targetInfo)) {
+                    return true;
                 }
             }
         }
@@ -1212,22 +1293,62 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
 }
 
 static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botPlayer = nullptr) {
-    if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
+    // 1. Cross-resolve pointers so neither is missing
+    if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
+        if (entityNetPlayer == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50))) {
+            entityNetPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50);
+        }
+        if (targetibleObj == nullptr) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
+                targetibleObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
+            }
+            if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
+                targetibleObj = BotPlayer_GetTargetibleObject(botPlayer);
+            }
+        }
+    }
+
+    if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
+        if (entityNetPlayer == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8))) {
+            entityNetPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8);
+        }
+    }
+
+    if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer) && isUnityObjectAlive(entityNetPlayer)) {
+        if (targetibleObj == nullptr && NetworkPlayer_GetTargetibleObject != nullptr) {
+            targetibleObj = NetworkPlayer_GetTargetibleObject(entityNetPlayer);
+        }
+    }
+
+    // 2. Local player check
+    void *localNet = g_localPlayerNetPlayer.load();
+    if (localNet != nullptr && entityNetPlayer == localNet) return false;
+    void *localTObj = g_localPlayerTargetibleObject.load();
+    if (localTObj != nullptr && targetibleObj == localTObj) return false;
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc != nullptr && botPlayer == localFpc) return false;
+
+    // 3. Test NetworkPlayer teammate status
+    if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer) && isUnityObjectAlive(entityNetPlayer)) {
         if (isNetworkPlayerTeammate(entityNetPlayer)) return false;
     }
-    if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
+
+    // 4. Test TargetibleObject teammate status
+    if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
         if (isTargetibleObjectTeammate(targetibleObj)) return false;
     }
+
+    // 5. Test BotPlayer specific components
     if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50))) {
             void *botNet = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50);
-            if (botNet != nullptr && isPointerReadable(botNet) && isUnityObjectAlive(botNet)) {
+            if (botNet != nullptr && isUnityObjectAlive(botNet)) {
                 if (isNetworkPlayerTeammate(botNet)) return false;
             }
         }
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
             void *botTObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
-            if (botTObj != nullptr && isPointerReadable(botTObj) && isUnityObjectAlive(botTObj)) {
+            if (botTObj != nullptr && isUnityObjectAlive(botTObj)) {
                 if (isTargetibleObjectTeammate(botTObj)) return false;
             }
         }
@@ -1309,6 +1430,12 @@ void onESPClear() {
 // Executes synchronously on the Unity Main Engine Thread inside hook_AimingControl_Update
 static void updateEspData(void *aimingControl) {
     if (aimingControl == nullptr || !isUnityObjectAlive(aimingControl) || espManager == nullptr) {
+        return;
+    }
+
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc == nullptr || !isUnityObjectAlive(localFpc)) {
+        onESPClear();
         return;
     }
 
@@ -1771,6 +1898,12 @@ static bool g_hasLastFrameAngles = false;
 static void processAimAssistLock(void *aimingControl) {
     if (aimingControl == nullptr || !isPointerReadable(aimingControl) || !isUnityObjectAlive(aimingControl)) return;
 
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc == nullptr || !isUnityObjectAlive(localFpc)) {
+        resetAimAssistState(aimingControl);
+        return;
+    }
+
     uint64_t nowMs = getCurrentTimeMs();
     if (nowMs - g_lastAimAssistProcessMs < 4) {
         return; // Debounce duplicate calls within the same frame (~16ms)
@@ -1826,7 +1959,7 @@ static void processAimAssistLock(void *aimingControl) {
             camPos = getTransformPosition(cameraObj);
         }
     }
-    void *localFpc = g_localPlayerFPC.load();
+    localFpc = g_localPlayerFPC.load();
     if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f && localFpc != nullptr && isUnityObjectAlive(localFpc)) {
         camPos = getTransformPosition(localFpc) + Vector3(0.0f, 1.6f, 0.0f);
     }
@@ -1926,42 +2059,61 @@ static void processAimAssistLock(void *aimingControl) {
 // 0. AimingControl.Update: RVA 0x4D27294
 void (*old_AimingControl_Update)(void *instance) = nullptr;
 void hook_AimingControl_Update(void *instance) {
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        g_activeAimingControl.store(instance);
+    if (instance == nullptr || !isUnityObjectAlive(instance)) {
+        return;
+    }
 
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
-            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
-        }
+    g_activeAimingControl.store(instance);
+
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
+        *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
+    }
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+        *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
     }
 
     if (old_AimingControl_Update != nullptr) {
         old_AimingControl_Update(instance);
     }
 
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        if (g_espMaster.load() && espManager != nullptr) {
-            updateEspData(instance);
-        }
+    if (instance == nullptr || !isUnityObjectAlive(instance)) {
+        return;
+    }
+
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc == nullptr || !isUnityObjectAlive(localFpc)) {
+        return;
+    }
+
+    if (g_espMaster.load() && espManager != nullptr) {
+        updateEspData(instance);
     }
 
     if (!g_aimAssistBoost.load()) {
-        if (instance != nullptr && isPointerReadable(instance)) {
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
-                *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
-            }
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
-                *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
-            }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
         }
         g_hasLastFrameAngles = false;
         return;
     }
 
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        processAimAssistLock(instance);
+    processAimAssistLock(instance);
+}
+
+// AimingControl.OnDestroy: RVA 0x4D28714
+void (*old_AimingControl_OnDestroy)(void *instance) = nullptr;
+void hook_AimingControl_OnDestroy(void *instance) {
+    setLastAction("AimingControl_OnDestroy");
+    if (instance != nullptr && instance == g_activeAimingControl.load()) {
+        g_activeAimingControl.store(nullptr);
+        onESPClear();
+        resetAimAssistState(instance);
+    }
+    if (old_AimingControl_OnDestroy != nullptr) {
+        old_AimingControl_OnDestroy(instance);
     }
 }
 
@@ -2137,7 +2289,9 @@ void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
 // 7. BaseAimAssist.IsValidTarget (0x4478A70) & NewAutoAim.IsValidTarget (0x421C254)
 bool (*old_BaseAimAssist_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
-    if (!g_aimAssistBoost.load()) return false;
+    if (!g_aimAssistBoost.load()) {
+        return old_BaseAimAssist_IsValidTarget ? old_BaseAimAssist_IsValidTarget(instance, targetibleObject) : false;
+    }
     if (old_BaseAimAssist_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
     if (isTargetibleObjectTeammate(targetibleObject)) {
@@ -2151,7 +2305,9 @@ bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
 
 bool (*old_NewAutoAim_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
-    if (!g_aimAssistBoost.load()) return false;
+    if (!g_aimAssistBoost.load()) {
+        return old_NewAutoAim_IsValidTarget ? old_NewAutoAim_IsValidTarget(instance, targetibleObject) : false;
+    }
     if (old_NewAutoAim_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
     if (isTargetibleObjectTeammate(targetibleObject)) {
@@ -2163,9 +2319,9 @@ bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
     return old_NewAutoAim_IsValidTarget(instance, targetibleObject);
 }
 
-static void resetAimAssistState(void *aimingControlInstance = nullptr) {
+static void resetAimAssistState(void *aimingControlInstance) {
     void *ac = aimingControlInstance ? aimingControlInstance : g_activeAimingControl.load();
-    if (ac != nullptr && isPointerReadable(ac)) {
+    if (ac != nullptr && isPointerReadable(ac) && isUnityObjectAlive(ac)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xC8))) {
             *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0xC8) = nullptr;
         }
@@ -2177,15 +2333,15 @@ static void resetAimAssistState(void *aimingControlInstance = nullptr) {
         }
     }
     void *mgr = g_activeAimAssistManager.load();
-    if (old_AimAssistManager_SetEnabled != nullptr && mgr != nullptr && isPointerReadable(mgr)) {
+    if (old_AimAssistManager_SetEnabled != nullptr && mgr != nullptr && isPointerReadable(mgr) && isUnityObjectAlive(mgr)) {
         old_AimAssistManager_SetEnabled(mgr, false);
     }
     void *na = g_activeNewAutoAim.load();
-    if (old_NewAutoAim_SetEnabled != nullptr && na != nullptr && isPointerReadable(na)) {
+    if (old_NewAutoAim_SetEnabled != nullptr && na != nullptr && isPointerReadable(na) && isUnityObjectAlive(na)) {
         old_NewAutoAim_SetEnabled(na, false);
     }
     void *ba = g_activeBaseAimAssist.load();
-    if (old_BaseAimAssist_SetEnabled != nullptr && ba != nullptr && isPointerReadable(ba)) {
+    if (old_BaseAimAssist_SetEnabled != nullptr && ba != nullptr && isPointerReadable(ba) && isUnityObjectAlive(ba)) {
         old_BaseAimAssist_SetEnabled(ba, false);
     }
 }
@@ -2300,6 +2456,8 @@ static void registerAllHooks() {
     mgr.registerHook(Offsets::AIMING_CONTROL_RECOIL3,        reinterpret_cast<void*>(hook_AimingControl_Recoil3),               reinterpret_cast<void**>(&old_AimingControl_Recoil3),               "AimingControl.RecoilShift3");
 
     // 3. Entity Lifecycle Hooks
+    mgr.registerHook(Offsets::FPC_ON_DESTROY,                reinterpret_cast<void*>(hook_FirstPersonController_OnDestroy),     reinterpret_cast<void**>(&old_FirstPersonController_OnDestroy),     "FirstPersonController.OnDestroy");
+    mgr.registerHook(Offsets::AIMING_CONTROL_ON_DESTROY,     reinterpret_cast<void*>(hook_AimingControl_OnDestroy),             reinterpret_cast<void**>(&old_AimingControl_OnDestroy),             "AimingControl.OnDestroy");
     mgr.registerHook(Offsets::NETWORK_PLAYER_UPDATE,         reinterpret_cast<void*>(hook_NetworkPlayer_Update),                reinterpret_cast<void**>(&old_NetworkPlayer_Update),                "NetworkPlayer.Update");
     mgr.registerHook(Offsets::NETWORK_PLAYER_ON_DESTROY,     reinterpret_cast<void*>(hook_NetworkPlayer_OnDestroy),            reinterpret_cast<void**>(&old_NetworkPlayer_OnDestroy),            "NetworkPlayer.OnDestroy");
     mgr.registerHook(Offsets::BOT_PLAYER_START,              reinterpret_cast<void*>(hook_BotPlayer_Start),                     reinterpret_cast<void**>(&old_BotPlayer_Start),                     "BotPlayer.Start");

@@ -13,6 +13,8 @@
 static bool isNetworkPlayerTeammate(void *netPlayer);
 static bool isEntityEnemy(void *netPlayer, void *targetibleObj, void *botPlayer);
 static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj);
+static inline int extractTargetType(void *targetInfo);
+static inline bool isTargetInfoAlive(void *targetInfo);
 
 // Struct for passing active entities directly from Status Overlay synchronization
 struct ESPEntityItem {
@@ -183,23 +185,14 @@ public:
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0))) {
                     void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0);
                     if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
-                            bool isAlive = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
-                            if (!isAlive) {
-                                isDead = true;
-                            }
+                        if (!isTargetInfoAlive(targetInfo)) {
+                            isDead = true;
                         }
                     }
                 }
             }
 
             if (isDead) {
-                continue;
-            }
-
-            // Skip local player
-            void *localNet = g_localPlayerNetPlayer.load();
-            if (localNet != nullptr && (entityObj == localNet || netPlayer == localNet)) {
                 continue;
             }
 
@@ -221,18 +214,32 @@ public:
                 }
             }
 
+            if (targetibleObj != nullptr && netPlayer == nullptr && isPointerReadable(targetibleObj)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8))) {
+                    netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8);
+                }
+            }
+
+            // Skip local player
+            void *localNet = g_localPlayerNetPlayer.load();
+            if (localNet != nullptr && (entityObj == localNet || netPlayer == localNet)) {
+                continue;
+            }
+            void *localTObj = g_localPlayerTargetibleObject.load();
+            if (localTObj != nullptr && targetibleObj == localTObj) {
+                continue;
+            }
+            void *localFpc = g_localPlayerFPC.load();
+            if (localFpc != nullptr && entityObj == localFpc) {
+                continue;
+            }
+
             // Check if local player via targetInfo
             if (netPlayer != nullptr && isPointerReadable(netPlayer)) {
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
                     void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
                     if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-                        int tType = 0;
-                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
-                            tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
-                        }
-                        if (tType == 0 && get_TargetType != nullptr) {
-                            tType = get_TargetType(targetInfo);
-                        }
+                        int tType = extractTargetType(targetInfo);
                         if (tType == 1) { // LocalPlayer
                             g_localPlayerNetPlayer.store(netPlayer);
                             continue;

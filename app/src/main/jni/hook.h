@@ -63,6 +63,8 @@ namespace Offsets {
     constexpr uintptr_t WEAPON_SET_CLIP_AMMO                = 0x405A39C;
     constexpr uintptr_t ACTK_OP_IMPLICIT_FLOAT              = 0x3D6E4DC;
     constexpr uintptr_t TARGET_INFO_GET_TARGET_TYPE         = 0x40AAA58;
+    constexpr uintptr_t TARGET_INFO_GET_TARGET_TYPE_REMOTE  = 0x4B9B610;
+    constexpr uintptr_t FPC_GET_NETWORK_PLAYER              = 0x40A1050;
     constexpr uintptr_t WEAPON_CAN_SHOOT                    = 0x405BBF0;
     constexpr uintptr_t WEAPON_SET_COOLDOWN                 = 0x405D084;
     constexpr uintptr_t WEAPON_SHOOT_ACTION_GETTER          = 0x405C8DC;
@@ -93,6 +95,8 @@ namespace Offsets {
     constexpr uintptr_t AIMING_CONTROL_ADD_DELTA            = 0x4D281AC;
     constexpr uintptr_t NETWORK_PLAYER_IS_TEAMMATE          = 0x42CE9CC;
     constexpr uintptr_t BOT_PLAYER_HEALTH_GET_HEALTH        = 0x4BEE4FC;
+    constexpr uintptr_t FPC_ON_DESTROY                      = 0x40A3A84;
+    constexpr uintptr_t AIMING_CONTROL_ON_DESTROY           = 0x4D28714;
 
     // ---------------------------------------------------------------------
     // Native Aim Assist & Sensitivity RVAs
@@ -401,6 +405,8 @@ inline void* (*get_ShooterBehaviour)(void *fpc, void *item) = nullptr;
 inline void (*set_ClipAmmo)(void *shooter, int ammo) = nullptr;
 inline ObscuredFloat (*actk_op_Implicit_Float)(float val) = nullptr;
 inline int (*get_TargetType)(void *targetInfo) = nullptr;
+inline int (*TargetInfo_GetTargetType_Remote)(void *targetInfo) = nullptr;
+inline void *(*FPC_GetNetworkPlayer)(void *fpc) = nullptr;
 
 inline bool (*get_AllyObjectToogle)(void *) = nullptr;
 inline bool (*get_IsAutoAimAllowed)(void *) = nullptr;
@@ -512,6 +518,8 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::WEAPON_SET_CLIP_AMMO,                set_ClipAmmo,                  "set_ClipAmmo");
     resolvePointer(base, Offsets::ACTK_OP_IMPLICIT_FLOAT,              actk_op_Implicit_Float,        "actk_op_Implicit_Float");
     resolvePointer(base, Offsets::TARGET_INFO_GET_TARGET_TYPE,         get_TargetType,                "get_TargetType");
+    resolvePointer(base, Offsets::TARGET_INFO_GET_TARGET_TYPE_REMOTE,  TargetInfo_GetTargetType_Remote, "TargetInfo_GetTargetType_Remote");
+    resolvePointer(base, Offsets::FPC_GET_NETWORK_PLAYER,              FPC_GetNetworkPlayer,          "FPC_GetNetworkPlayer");
 
     // Aim Assist & Filtering Pointers
     resolvePointer(base, Offsets::TARGETIBLE_GET_ALLY_OBJECT_TOOGLE,   get_AllyObjectToogle,          "get_AllyObjectToogle");
