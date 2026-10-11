@@ -1185,33 +1185,6 @@ static bool isTargetibleObjectTeammate(void *targetibleObj) {
                     return true;
                 }
             }
-            // C. Call get_IsAutoAimAllowed (RVA 0x4DED124) -> false means auto-aim is forbidden because entity is ally
-            if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
-                return true;
-            }
-            // D. Direct check on _allyData at offset 0x30
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x30))) {
-                void *allyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x30);
-                if (allyData != nullptr && isPointerReadable(allyData)) {
-                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(allyData) + 0x10))) {
-                        if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(allyData) + 0x10)) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            // E. Direct check on _enemyData at offset 0x28 -> IsAutoAimAllowed (0x11)
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x28))) {
-                void *enemyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x28);
-                if (enemyData != nullptr && isPointerReadable(enemyData)) {
-                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
-                        bool autoAimAllowed = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11);
-                        if (!autoAimAllowed) {
-                            return true;
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1362,24 +1335,25 @@ static bool isTargetObstructedByWall(const Vector3 &camPos, const Vector3 &boneP
 
     Vector3 diff = bonePos - camPos;
     float dist3D = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
-    if (dist3D <= 0.8f) {
+    if (dist3D <= 1.0f) {
         return false;
     }
 
     Vector3 dirNorm = diff / dist3D;
     Ray ray;
-    ray.origin = camPos + dirNorm * 0.45f;
+    ray.origin = camPos + dirNorm * 0.75f;
     ray.direction = dirNorm;
 
-    float checkDist = dist3D - 0.80f;
-    if (checkDist <= 0.1f) checkDist = 0.1f;
+    float checkDist = dist3D - 1.10f;
+    if (checkDist <= 0.1f) return false;
 
     PhysicsScene scene(0, 0);
     if (Physics_get_defaultPhysicsScene != nullptr) {
         scene = Physics_get_defaultPhysicsScene();
     }
 
-    bool isBlocked = Internal_RaycastTest_Injected(&scene, &ray, checkDist, -5, 1);
+    // Layer mask 1: Test only static world geometry (Default layer 0), avoiding player/ragdoll/weapon colliders
+    bool isBlocked = Internal_RaycastTest_Injected(&scene, &ray, checkDist, 1, 1);
     return isBlocked;
 }
 
@@ -1633,16 +1607,20 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
                 return;
             }
 
-            Quaternion boneLook = Quaternion::LookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
-            Vector3 boneAngle = ToEulerRad(boneLook);
-            if (boneAngle.x >= 275.0f) boneAngle.x -= 360.0f;
-            if (boneAngle.x <= -275.0f) boneAngle.x += 360.0f;
+            float hyp = sqrtf(aimDir.x * aimDir.x + aimDir.z * aimDir.z);
+            if (hyp < 1e-4f) return;
 
-            float dyaw = boneAngle.y - currentYaw;
+            // Direct closed-form spherical angle calculation matching Unity camera orientation
+            float boneYaw = atan2f(aimDir.x, aimDir.z) * (180.0f / static_cast<float>(M_PI));
+            if (boneYaw < 0.0f) boneYaw += 360.0f;
+
+            float bonePitch = -atan2f(aimDir.y, hyp) * (180.0f / static_cast<float>(M_PI));
+
+            float dyaw = boneYaw - currentYaw;
             while (dyaw > 180.0f) dyaw -= 360.0f;
             while (dyaw < -180.0f) dyaw += 360.0f;
 
-            float dpitch = boneAngle.x - currentPitch;
+            float dpitch = bonePitch - currentPitch;
             while (dpitch > 180.0f) dpitch -= 360.0f;
             while (dpitch < -180.0f) dpitch += 360.0f;
 
@@ -1664,8 +1642,8 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
                     bestTarget.dist3D = dist3D;
                     bestTarget.bonePos = bonePos;
                     bestTarget.isHead = isHead;
-                    bestTarget.targetYaw = boneAngle.y;
-                    bestTarget.targetPitch = boneAngle.x;
+                    bestTarget.targetYaw = boneYaw;
+                    bestTarget.targetPitch = bonePitch;
                     bestTarget.targetibleObj = targetibleObj;
                 }
             }
@@ -1678,6 +1656,12 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             checkBone(bodyTransform, false, Vector3(0.0f, 0.0f, 0.0f));
         }
 
+        // If head was not found but body was found, synthesize head target above body
+        if (headTransform == nullptr && bodyTransform != nullptr && isUnityObjectAlive(bodyTransform)) {
+            checkBone(bodyTransform, true, Vector3(0.0f, 0.40f, 0.0f));
+        }
+
+        // Fallback using entity root transform if neither bone was available
         if (headTransform == nullptr && bodyTransform == nullptr && fallbackEntity != nullptr && isUnityObjectAlive(fallbackEntity) && get_transform != nullptr) {
             void *rootTransform = get_transform(fallbackEntity);
             if (rootTransform != nullptr && isUnityObjectAlive(rootTransform)) {
@@ -1949,19 +1933,15 @@ static void processAimAssistLock(void *aimingControl) {
         while (userDeltaPitch > 180.0f) userDeltaPitch -= 360.0f;
         while (userDeltaPitch < -180.0f) userDeltaPitch += 360.0f;
     }
-    g_lastFrameYaw = currentYaw;
-    g_lastFramePitch = currentPitch;
-    g_hasLastFrameAngles = true;
 
-    Vector3 camPos = getTransformPosition(elevationNode);
+    // Resolve true camera position (using Camera component's Transform)
+    void *camTrans = (cameraObj != nullptr && get_transform != nullptr) ? get_transform(cameraObj) : nullptr;
+    Vector3 camPos = (camTrans != nullptr && isUnityObjectAlive(camTrans)) ? getTransformPosition(camTrans) : getTransformPosition(elevationNode);
     if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
-        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
-            camPos = getTransformPosition(cameraObj);
+        localFpc = g_localPlayerFPC.load();
+        if (localFpc != nullptr && isUnityObjectAlive(localFpc)) {
+            camPos = getTransformPosition(localFpc) + Vector3(0.0f, 1.6f, 0.0f);
         }
-    }
-    localFpc = g_localPlayerFPC.load();
-    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f && localFpc != nullptr && isUnityObjectAlive(localFpc)) {
-        camPos = getTransformPosition(localFpc) + Vector3(0.0f, 1.6f, 0.0f);
     }
 
     int sliderVal = g_aimSmoothness.load();
@@ -1979,6 +1959,12 @@ static void processAimAssistLock(void *aimingControl) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
             *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = false;
         }
+        if (AimingControl_ClearTargetibleObject != nullptr) {
+            AimingControl_ClearTargetibleObject(aimingControl);
+        }
+        g_lastFrameYaw = currentYaw;
+        g_lastFramePitch = currentPitch;
+        g_hasLastFrameAngles = true;
         return;
     }
 
@@ -1993,21 +1979,29 @@ static void processAimAssistLock(void *aimingControl) {
     float proximity = 1.0f - (targetInfo.angleOffset / (maxFovAngle + 0.001f));
     if (proximity < 0.0f) proximity = 0.0f;
     if (proximity > 1.0f) proximity = 1.0f;
-    float weight = proximity * proximity;
 
-    float assistRate = (0.03f + 0.15f * s) * weight;
+    // Responsive linear-weighted pull curve
+    float weight = 0.40f + 0.60f * proximity;
 
-    if ((userDeltaYaw > 0.3f && diffYaw < -0.2f) || (userDeltaYaw < -0.3f && diffYaw > 0.2f)) {
-        assistRate *= 0.15f;
-    }
-    if ((userDeltaPitch > 0.3f && diffPitch < -0.2f) || (userDeltaPitch < -0.3f && diffPitch > 0.2f)) {
-        assistRate *= 0.15f;
+    // Magnetic pull rate:
+    // s = 0.0 (0%): assistRate ~ 0.15 * weight
+    // s = 0.8 (80% default): assistRate ~ 0.65 * weight (firm tracking)
+    // s = 1.0 (100%): assistRate = 1.00 (instant sticky lock)
+    float assistRate = (s >= 0.99f) ? 1.0f : ((0.15f + 0.70f * s) * weight);
+
+    // USER SWIPE AUTHORITY:
+    // Only yield when player makes a deliberate strong flick away from target
+    bool userFlickingAwayYaw = (userDeltaYaw > 1.0f && diffYaw < -0.3f) || (userDeltaYaw < -1.0f && diffYaw > 0.3f);
+    bool userFlickingAwayPitch = (userDeltaPitch > 1.0f && diffPitch < -0.3f) || (userDeltaPitch < -1.0f && diffPitch > 0.3f);
+    if (userFlickingAwayYaw || userFlickingAwayPitch) {
+        assistRate *= 0.20f;
     }
 
     float stepYaw = diffYaw * assistRate;
     float stepPitch = diffPitch * assistRate;
 
-    float maxStepPerFrame = 0.4f + 1.2f * s;
+    // Angular velocity clamp: allows full snap at 100% slider, smooth clamp at lower values
+    float maxStepPerFrame = (s >= 0.99f) ? 30.0f : (1.5f + 8.5f * s);
     float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
     if (stepLen > maxStepPerFrame) {
         float scale = maxStepPerFrame / stepLen;
@@ -2038,16 +2032,28 @@ static void processAimAssistLock(void *aimingControl) {
     setTransformLocalEulerAngles(azimuthNode, azEuler);
     setTransformLocalEulerAngles(elevationNode, elEuler);
 
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
-        *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8) = nullptr;
-    }
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
-        *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = false;
+    // Save post-assist angles so the next frame accurately isolates user swipe deltas
+    g_lastFrameYaw = newYaw;
+    g_lastFramePitch = newPitch;
+    g_hasLastFrameAngles = true;
+
+    // Synchronize AimingControl target with game engine
+    if (targetInfo.targetibleObj != nullptr) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8) = targetInfo.targetibleObj;
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
+            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = true;
+        }
+        if (AimingControl_SetTargetibleObject != nullptr) {
+            AimingControl_SetTargetibleObject(aimingControl, targetInfo.targetibleObj);
+        }
     }
 
     if (nowMs - g_lastAimAssistLogMs > 6000) {
         g_lastAimAssistLogMs = nowMs;
-        ModLog("[AIM_ASSIST] Smooth Assist Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+        ModLog("[AIM_ASSIST] %s -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+               (s >= 0.99f) ? "Sticky Lock Active" : "Smooth Assist Active",
                targetInfo.isHead ? "HEAD BONE" : "BODY BONE",
                targetInfo.dist3D,
                targetInfo.angleOffset,
@@ -2064,13 +2070,6 @@ void hook_AimingControl_Update(void *instance) {
     }
 
     g_activeAimingControl.store(instance);
-
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
-        *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
-    }
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
-        *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
-    }
 
     if (old_AimingControl_Update != nullptr) {
         old_AimingControl_Update(instance);
