@@ -165,6 +165,7 @@ static std::atomic<bool> g_noRecoil{false};
 static std::atomic<bool> g_aimAssistBoost{false};
 static std::atomic<int>  g_aimSmoothness{80}; // 0 - 100 slider (default: 80, 100 = sticky lock)
 #define g_aimSensitivity g_aimSmoothness
+static std::atomic<uint64_t> g_lastPlayerShootMs{0};
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -597,8 +598,11 @@ void hook_FirstPersonController_OnDestroy(void *instance) {
 // 2. WeaponShooterBehaviour.CanShoot: RVA 0x405BBF0
 bool (*old_WeaponShooterBehaviour_CanShoot)(void *instance) = nullptr;
 bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
-    if (g_fastFireRate.load() && isClientWeapon(instance)) {
-        return true; // Local weapon can always shoot instantly
+    if (instance != nullptr && isClientWeapon(instance)) {
+        g_lastPlayerShootMs.store(getCurrentTimeMs());
+        if (g_fastFireRate.load()) {
+            return true; // Local weapon can always shoot instantly
+        }
     }
     if (old_WeaponShooterBehaviour_CanShoot != nullptr) {
         return old_WeaponShooterBehaviour_CanShoot(instance);
@@ -660,6 +664,7 @@ bool hook_ShootCoroutine_MoveNext(void *instance) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x20))) {
             void *fpc = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x20);
             if (fpc == g_localPlayerFPC.load() && fpc != nullptr) {
+                g_lastPlayerShootMs.store(getCurrentTimeMs());
                 // Immediate fire without WaitForSeconds delay
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x28))) {
                     *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0x28) = true;
@@ -1886,9 +1891,34 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 
 static uint64_t g_lastAimAssistProcessMs = 0;
 static uint64_t g_lastAimAssistLogMs = 0;
-static float g_lastFrameYaw = 0.0f;
-static float g_lastFramePitch = 0.0f;
-static bool g_hasLastFrameAngles = false;
+static float g_lastEngineYaw = 0.0f;
+static float g_lastEnginePitch = 0.0f;
+static bool g_hasLastEngineAngles = false;
+
+static inline bool isLocalPlayerAiming(void *aimingControl, void *cameraObj) {
+    if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
+        // Offset 0x58: AimingControl bool backing field
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x58))) {
+            if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x58)) {
+                return true;
+            }
+        }
+        // Offset 0x68: AimingControl bool backing field
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x68))) {
+            if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x68)) {
+                return true;
+            }
+        }
+    }
+    // Camera FOV reduction check (when aiming/ADS, FOV drops below standard ~60.0 degrees)
+    if (cameraObj != nullptr && Camera_get_fieldOfView != nullptr && isUnityObjectAlive(cameraObj)) {
+        float fov = Camera_get_fieldOfView(cameraObj);
+        if (fov > 5.0f && fov < 56.0f) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void processAimAssistLock(void *aimingControl) {
     if (aimingControl == nullptr || !isPointerReadable(aimingControl) || !isUnityObjectAlive(aimingControl)) return;
@@ -1936,18 +1966,25 @@ static void processAimAssistLock(void *aimingControl) {
     float currentYaw = azEuler.y;
     float currentPitch = (elEuler.x > 180.0f) ? (elEuler.x - 360.0f) : elEuler.x;
 
-    // Isolate user touch / swipe delta before applying assist
+    // Isolate user touch / swipe delta cleanly from the engine's unassisted angles.
+    // We DO NOT feed our applied assist step into g_lastEngineYaw!
+    // This permanently breaks the -step feedback loop that caused the 30Hz micro-shake vibration.
     float userDeltaYaw = 0.0f;
     float userDeltaPitch = 0.0f;
-    if (g_hasLastFrameAngles) {
-        userDeltaYaw = currentYaw - g_lastFrameYaw;
+    if (g_hasLastEngineAngles) {
+        userDeltaYaw = currentYaw - g_lastEngineYaw;
         while (userDeltaYaw > 180.0f) userDeltaYaw -= 360.0f;
         while (userDeltaYaw < -180.0f) userDeltaYaw += 360.0f;
 
-        userDeltaPitch = currentPitch - g_lastFramePitch;
+        userDeltaPitch = currentPitch - g_lastEnginePitch;
         while (userDeltaPitch > 180.0f) userDeltaPitch -= 360.0f;
         while (userDeltaPitch < -180.0f) userDeltaPitch += 360.0f;
     }
+    g_lastEngineYaw = currentYaw;
+    g_lastEnginePitch = currentPitch;
+    g_hasLastEngineAngles = true;
+
+    float userSpeed = sqrtf(userDeltaYaw * userDeltaYaw + userDeltaPitch * userDeltaPitch);
 
     // Resolve true camera position
     void *camTrans = (cameraObj != nullptr && get_transform != nullptr) ? get_transform(cameraObj) : nullptr;
@@ -1964,24 +2001,38 @@ static void processAimAssistLock(void *aimingControl) {
     if (sliderVal > 100) sliderVal = 100;
     float s = static_cast<float>(sliderVal) / 100.0f;
 
-    // FOV cone scales moderately with smoothness setting
-    float maxFovAngle = g_bigHead.load() ? (20.0f + 5.0f * s) : (14.0f + 5.0f * s);
+    bool isAiming = isLocalPlayerAiming(aimingControl, cameraObj);
+    bool isFiring = (nowMs - g_lastPlayerShootMs.load() < 500);
+    bool isSwiping = (userSpeed > 0.025f);
+    bool isPlayerActive = isAiming || isFiring || isSwiping;
+
+    // Adaptive FOV cone based on player activity:
+    // When aiming (ADS) or firing: full combat lock cone (13-25 deg)
+    // When actively swiping: medium assist cone (9-16 deg)
+    // When completely idle in hipfire: focused close proximity cone (5-8 deg) so it NEVER snatches random peripheral peds!
+    float baseFov = 5.0f + 3.0f * s;
+    if (isAiming || isFiring) {
+        baseFov = g_bigHead.load() ? (18.0f + 5.0f * s) : (13.0f + 5.0f * s);
+    } else if (isSwiping) {
+        baseFov = g_bigHead.load() ? (12.0f + 4.0f * s) : (9.0f + 4.0f * s);
+    }
+    float maxFovAngle = baseFov;
 
     TargetBoneInfo targetInfo = findBestTargetBone(camPos, currentYaw, currentPitch, maxFovAngle, cameraObj);
     if (!targetInfo.found) {
-        // Keep _targetibleObject cleared so engine never forces camera
+        // Zero-write exit: ONLY clear if targetible pointer was non-null
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8) = nullptr;
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
+                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = false;
+                }
+                if (AimingControl_ClearTargetibleObject != nullptr) {
+                    AimingControl_ClearTargetibleObject(aimingControl);
+                }
+            }
         }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
-            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = false;
-        }
-        if (AimingControl_ClearTargetibleObject != nullptr) {
-            AimingControl_ClearTargetibleObject(aimingControl);
-        }
-        g_lastFrameYaw = currentYaw;
-        g_lastFramePitch = currentPitch;
-        g_hasLastFrameAngles = true;
         return;
     }
 
@@ -1995,49 +2046,38 @@ static void processAimAssistLock(void *aimingControl) {
 
     float targetAngularDist = sqrtf(diffYaw * diffYaw + diffPitch * diffPitch);
 
-    // Micro-deadzone suppression: prevent crosshair jitter when already on target
-    if (targetAngularDist < 0.15f) {
-        g_lastFrameYaw = currentYaw;
-        g_lastFramePitch = currentPitch;
-        g_hasLastFrameAngles = true;
+    // 1. Absolute zero-write inner deadband: directly on target center
+    if (targetAngularDist < 0.06f) {
         return;
     }
 
-    // HUMAN MANUAL SWIPE AUTHORITY & DIRECTIONAL ESCAPE:
-    // If the player is actively swiping away or flicking, yield 100% control immediately with ZERO resistance!
-    float userSpeed = sqrtf(userDeltaYaw * userDeltaYaw + userDeltaPitch * userDeltaPitch);
+    // 2. Idle Gating: when completely idle in hipfire (not aiming, not firing, not swiping),
+    // and target is outside close crosshair proximity (> 1.2 deg), DO NOT rotate camera!
+    if (!isPlayerActive && targetAngularDist > 1.20f) {
+        return;
+    }
+
+    // 3. Human Manual Swipe Authority & Directional Escape:
     if (userSpeed > 0.03f) {
-        // Rapid swipe / flick: immediately drop assist to respect player authority
+        // Flick escape: immediate drop
         if (userSpeed > 0.35f) {
-            g_lastFrameYaw = currentYaw;
-            g_lastFramePitch = currentPitch;
-            g_hasLastFrameAngles = true;
             return;
         }
-        // Direction check: if moving away from target, zero assist
+        // Direction check: if player is steering away from target, zero assist
         float dot = (userDeltaYaw * diffYaw + userDeltaPitch * diffPitch) / (userSpeed * targetAngularDist);
-        if (dot < -0.02f) {
-            // Player is steering away: 100% manual control, zero stiffness
-            g_lastFrameYaw = currentYaw;
-            g_lastFramePitch = currentPitch;
-            g_hasLastFrameAngles = true;
+        if (dot < -0.05f) {
             return;
         }
     }
 
-    // EXPONENTIAL DECAY SMOOTHING (Interpolated Smooth-Damp):
-    // Blend manual input dynamically: gentle swipe softly reduces assist pull
+    // 4. Dynamic manual swipe blend
     float manualFactor = 1.0f;
     if (userSpeed > 0.04f) {
         manualFactor = 1.0f - (userSpeed / 0.35f);
         if (manualFactor < 0.0f) manualFactor = 0.0f;
     }
 
-    // Lambda curve scales seamlessly with slider (s):
-    // s = 0.0 (0%): lambda = 1.0 -> gentle assist
-    // s = 0.5 (50%): lambda = 2.0 -> silky smooth tracking
-    // s = 0.8 (80% default): lambda = 3.5 -> responsive console-style tracking
-    // s = 1.0 (100%): lambda = 5.0 -> firm tracking without freezing
+    // Lambda curve scales with slider (s)
     float lambda = 1.0f + 4.0f * (s * s);
     float pullFactor = (1.0f - expf(-lambda * dt)) * manualFactor;
 
@@ -2047,13 +2087,31 @@ static void processAimAssistLock(void *aimingControl) {
     if (proximity > 1.0f) proximity = 1.0f;
     pullFactor *= (0.35f + 0.65f * (proximity * proximity));
 
+    // Continuous Hermite SmoothStep Deadzone Easing (eliminates chatter at deadzone boundary!)
+    if (targetAngularDist < 0.35f) {
+        float t = (targetAngularDist - 0.06f) / (0.35f - 0.06f);
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        pullFactor *= (t * t * (3.0f - 2.0f * t));
+    }
+
+    // Idle hipfire damping: softly rest on target without aggressive pull
+    if (!isAiming && !isFiring) {
+        pullFactor *= 0.40f;
+    }
+
     float stepYaw = diffYaw * pullFactor;
     float stepPitch = diffPitch * pullFactor;
 
-    // Angular velocity clamp: prevent abrupt camera snaps
-    // Clamp to max 0.20 to 0.85 degrees per frame
-    float maxSpeedPerFrame = 0.20f + 0.65f * s;
+    // Sub-pixel noise suppression: if angular step is less than 0.008 degrees,
+    // do not write to transforms at all!
     float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
+    if (stepLen < 0.008f) {
+        return;
+    }
+
+    // Angular velocity clamp: prevent abrupt camera snaps
+    float maxSpeedPerFrame = 0.20f + 0.65f * s;
     if (stepLen > maxSpeedPerFrame) {
         float scale = maxSpeedPerFrame / stepLen;
         stepYaw *= scale;
@@ -2083,11 +2141,6 @@ static void processAimAssistLock(void *aimingControl) {
     setTransformLocalEulerAngles(azimuthNode, azEuler);
     setTransformLocalEulerAngles(elevationNode, elEuler);
 
-    // Save post-assist angles so the next frame isolates user input deltas
-    g_lastFrameYaw = newYaw;
-    g_lastFramePitch = newPitch;
-    g_hasLastFrameAngles = true;
-
     // Keep AimingControl targetibleObject permanently cleared so the game engine's
     // internal forced lock-on NEVER fights manual player control!
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
@@ -2099,7 +2152,8 @@ static void processAimAssistLock(void *aimingControl) {
 
     if (nowMs - g_lastAimAssistLogMs > 6000) {
         g_lastAimAssistLogMs = nowMs;
-        ModLog("[AIM_ASSIST] Smooth Assist Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+        ModLog("[AIM_ASSIST] %s Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+               isAiming ? "ADS Lock" : (isFiring ? "Firing Assist" : (isSwiping ? "Swipe Tracking" : "Sticky Lock")),
                targetInfo.isHead ? "HEAD BONE" : "BODY BONE",
                targetInfo.dist3D,
                targetInfo.angleOffset,
@@ -2117,13 +2171,18 @@ void hook_AimingControl_Update(void *instance) {
 
     g_activeAimingControl.store(instance);
 
-    // Keep _targetibleObject and hasTarget cleared prior to engine update
-    // so the engine's internal forced lock-on routine never locks or resists manual player input!
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
-        *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
-    }
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
-        *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+    // Keep _targetibleObject and hasTarget cleared prior to engine update ONLY when aim assist is on
+    // and if pointer was non-null, so we don't do redundant memory writes
+    if (g_aimAssistBoost.load()) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+                }
+            }
+        }
     }
 
     if (old_AimingControl_Update != nullptr) {
@@ -2145,12 +2204,15 @@ void hook_AimingControl_Update(void *instance) {
 
     if (!g_aimAssistBoost.load()) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+                }
+            }
         }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
-            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
-        }
-        g_hasLastFrameAngles = false;
+        g_hasLastEngineAngles = false;
         return;
     }
 
@@ -2181,103 +2243,83 @@ static inline float getAimSensitivityFactor() {
 // 1. StrafeRotationConfig (0x52A6264, 0x52A6210, 0x52A624C, 0x52A65A4, 0x52A6598)
 float (*old_StrafeRotationConfig_get_MaxRotationPower)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
-    float power = old_StrafeRotationConfig_get_MaxRotationPower ? old_StrafeRotationConfig_get_MaxRotationPower(instance) : 0.2f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 0.25f + 0.45f * factor;
+    if (old_StrafeRotationConfig_get_MaxRotationPower != nullptr) {
+        return old_StrafeRotationConfig_get_MaxRotationPower(instance);
     }
-    return power;
+    return 0.2f;
 }
 
 float (*old_StrafeRotationConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
-    float fov = old_StrafeRotationConfig_get_FOVAreaMultiplier ? old_StrafeRotationConfig_get_FOVAreaMultiplier(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.05f + 0.25f * factor;
+    if (old_StrafeRotationConfig_get_FOVAreaMultiplier != nullptr) {
+        return old_StrafeRotationConfig_get_FOVAreaMultiplier(instance);
     }
-    return fov;
+    return 1.0f;
 }
 
 float (*old_StrafeRotationConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
-    float dist = old_StrafeRotationConfig_get_DefaultStateMaxDistance ? old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 70.0f + 50.0f * factor;
+    if (old_StrafeRotationConfig_get_DefaultStateMaxDistance != nullptr) {
+        return old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance);
     }
-    return dist;
+    return 50.0f;
 }
 
 float (*old_StrafeRotationConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
-    float dist = old_StrafeRotationConfig_get_ZoomedStateMaxDistance ? old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 140.0f + 110.0f * factor;
+    if (old_StrafeRotationConfig_get_ZoomedStateMaxDistance != nullptr) {
+        return old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance);
     }
-    return dist;
+    return 100.0f;
 }
 
 float (*old_StrafeRotationConfig_get_FOVPowerMultiplier)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
-    float fov = old_StrafeRotationConfig_get_FOVPowerMultiplier ? old_StrafeRotationConfig_get_FOVPowerMultiplier(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.10f + 0.40f * factor;
+    if (old_StrafeRotationConfig_get_FOVPowerMultiplier != nullptr) {
+        return old_StrafeRotationConfig_get_FOVPowerMultiplier(instance);
     }
-    return fov;
+    return 1.0f;
 }
 
 // 2. SpinSlowdownConfig (0x4600D68, 0x4600BCC, 0x4600BD8, 0x4600C44, 0x4600C5C)
 float (*old_SpinSlowdownConfig_get_MaxSlowdownValue)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
-    float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.3f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 0.15f + 0.20f * factor;
+    if (old_SpinSlowdownConfig_get_MaxSlowdownValue != nullptr) {
+        return old_SpinSlowdownConfig_get_MaxSlowdownValue(instance);
     }
-    return val;
+    return 0.3f;
 }
 
 float (*old_SpinSlowdownConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
-    float fov = old_SpinSlowdownConfig_get_FOVAreaMultiplier ? old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.05f + 0.20f * factor;
+    if (old_SpinSlowdownConfig_get_FOVAreaMultiplier != nullptr) {
+        return old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance);
     }
-    return fov;
+    return 1.0f;
 }
 
 float (*old_SpinSlowdownConfig_get_Radius)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_Radius(void *instance) {
-    float r = old_SpinSlowdownConfig_get_Radius ? old_SpinSlowdownConfig_get_Radius(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.05f + 0.25f * factor;
+    if (old_SpinSlowdownConfig_get_Radius != nullptr) {
+        return old_SpinSlowdownConfig_get_Radius(instance);
     }
-    return r;
+    return 1.0f;
 }
 
 float (*old_SpinSlowdownConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_DefaultStateMaxDistance(void *instance) {
-    float dist = old_SpinSlowdownConfig_get_DefaultStateMaxDistance ? old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 70.0f + 50.0f * factor;
+    if (old_SpinSlowdownConfig_get_DefaultStateMaxDistance != nullptr) {
+        return old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance);
     }
-    return dist;
+    return 50.0f;
 }
 
 float (*old_SpinSlowdownConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
-    float dist = old_SpinSlowdownConfig_get_ZoomedStateMaxDistance ? old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 140.0f + 110.0f * factor;
+    if (old_SpinSlowdownConfig_get_ZoomedStateMaxDistance != nullptr) {
+        return old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance);
     }
-    return dist;
+    return 100.0f;
 }
 
 // 3. StrafeRotationAimAssist.Calculate (0x4F0E254)
@@ -2292,7 +2334,7 @@ void (*old_AimAssistManager_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
     g_activeAimAssistManager.store(instance);
     if (old_AimAssistManager_SetEnabled != nullptr) {
-        old_AimAssistManager_SetEnabled(instance, g_aimAssistBoost.load());
+        old_AimAssistManager_SetEnabled(instance, enabled && g_aimAssistBoost.load());
     }
 }
 
@@ -2301,7 +2343,7 @@ void (*old_NewAutoAim_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_NewAutoAim_SetEnabled(void *instance, bool enabled) {
     g_activeNewAutoAim.store(instance);
     if (old_NewAutoAim_SetEnabled != nullptr) {
-        old_NewAutoAim_SetEnabled(instance, g_aimAssistBoost.load());
+        old_NewAutoAim_SetEnabled(instance, enabled && g_aimAssistBoost.load());
     }
 }
 
@@ -2310,7 +2352,7 @@ void (*old_BaseAimAssist_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
     g_activeBaseAimAssist.store(instance);
     if (old_BaseAimAssist_SetEnabled != nullptr) {
-        old_BaseAimAssist_SetEnabled(instance, g_aimAssistBoost.load());
+        old_BaseAimAssist_SetEnabled(instance, enabled && g_aimAssistBoost.load());
     }
 }
 
@@ -2357,15 +2399,19 @@ static void resetAimAssistState(void *aimingControlInstance) {
     void *ac = aimingControlInstance ? aimingControlInstance : g_activeAimingControl.load();
     if (ac != nullptr && isPointerReadable(ac) && isUnityObjectAlive(ac)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xC8))) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0xC8) = nullptr;
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xD0))) {
-            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(ac) + 0xD0) = false;
-        }
-        if (AimingControl_ClearTargetibleObject != nullptr) {
-            AimingControl_ClearTargetibleObject(ac);
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xD0))) {
+                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(ac) + 0xD0) = false;
+                }
+                if (AimingControl_ClearTargetibleObject != nullptr) {
+                    AimingControl_ClearTargetibleObject(ac);
+                }
+            }
         }
     }
+    g_hasLastEngineAngles = false;
     void *mgr = g_activeAimAssistManager.load();
     if (old_AimAssistManager_SetEnabled != nullptr && mgr != nullptr && isPointerReadable(mgr) && isUnityObjectAlive(mgr)) {
         old_AimAssistManager_SetEnabled(mgr, false);
