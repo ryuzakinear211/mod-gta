@@ -62,8 +62,6 @@ namespace Offsets {
     constexpr uintptr_t FPC_GET_SHOOTER_BEHAVIOUR           = 0x409188C;
     constexpr uintptr_t WEAPON_SET_CLIP_AMMO                = 0x405A39C;
     constexpr uintptr_t ACTK_OP_IMPLICIT_FLOAT              = 0x3D6E4DC;
-    constexpr uintptr_t TARGET_INFO_GET_TARGET_TYPE         = 0x40AAA58;
-    constexpr uintptr_t TARGET_INFO_GET_TARGET_TYPE_REMOTE  = 0x4B9B610;
     constexpr uintptr_t FPC_GET_NETWORK_PLAYER              = 0x40A1050;
     constexpr uintptr_t WEAPON_CAN_SHOOT                    = 0x405BBF0;
     constexpr uintptr_t WEAPON_SET_COOLDOWN                 = 0x405D084;
@@ -93,7 +91,6 @@ namespace Offsets {
     constexpr uintptr_t AIMING_CONTROL_SET_TARGETIBLE_OBJ   = 0x4D287F8;
     constexpr uintptr_t AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ = 0x4D2883C;
     constexpr uintptr_t AIMING_CONTROL_ADD_DELTA            = 0x4D281AC;
-    constexpr uintptr_t NETWORK_PLAYER_IS_TEAMMATE          = 0x42CE9CC;
     constexpr uintptr_t BOT_PLAYER_GET_TEAM                 = 0x4449610;
     constexpr uintptr_t BOT_PLAYER_HEALTH_GET_HEALTH        = 0x4BEE4FC;
     constexpr uintptr_t FPC_ON_DESTROY                      = 0x40A3A84;
@@ -405,8 +402,6 @@ inline void* (*get_CurrentWeapon)(void *fpc) = nullptr;
 inline void* (*get_ShooterBehaviour)(void *fpc, void *item) = nullptr;
 inline void (*set_ClipAmmo)(void *shooter, int ammo) = nullptr;
 inline ObscuredFloat (*actk_op_Implicit_Float)(float val) = nullptr;
-inline int (*get_TargetType)(void *targetInfo) = nullptr;
-inline int (*TargetInfo_GetTargetType_Remote)(void *targetInfo) = nullptr;
 inline void *(*FPC_GetNetworkPlayer)(void *fpc) = nullptr;
 
 inline bool (*get_AllyObjectToogle)(void *) = nullptr;
@@ -416,7 +411,6 @@ inline void *(*BotPlayer_GetTargetibleObject)(void *) = nullptr;
 inline void (*AimingControl_SetTargetibleObject)(void *, void *) = nullptr;
 inline void (*AimingControl_ClearTargetibleObject)(void *) = nullptr;
 inline void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
-inline bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
 inline int (*BotPlayer_GetTeam)(void *) = nullptr;
 inline float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
 
@@ -519,8 +513,6 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::FPC_GET_SHOOTER_BEHAVIOUR,           get_ShooterBehaviour,          "get_ShooterBehaviour");
     resolvePointer(base, Offsets::WEAPON_SET_CLIP_AMMO,                set_ClipAmmo,                  "set_ClipAmmo");
     resolvePointer(base, Offsets::ACTK_OP_IMPLICIT_FLOAT,              actk_op_Implicit_Float,        "actk_op_Implicit_Float");
-    resolvePointer(base, Offsets::TARGET_INFO_GET_TARGET_TYPE,         get_TargetType,                "get_TargetType");
-    resolvePointer(base, Offsets::TARGET_INFO_GET_TARGET_TYPE_REMOTE,  TargetInfo_GetTargetType_Remote, "TargetInfo_GetTargetType_Remote");
     resolvePointer(base, Offsets::FPC_GET_NETWORK_PLAYER,              FPC_GetNetworkPlayer,          "FPC_GetNetworkPlayer");
 
     // Aim Assist & Filtering Pointers
@@ -531,7 +523,6 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::AIMING_CONTROL_SET_TARGETIBLE_OBJ,   AimingControl_SetTargetibleObject, "AimingControl_SetTargetibleObject");
     resolvePointer(base, Offsets::AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ, AimingControl_ClearTargetibleObject, "AimingControl_ClearTargetibleObject");
     resolvePointer(base, Offsets::AIMING_CONTROL_ADD_DELTA,            AimingControl_AddDelta,        "AimingControl_AddDelta");
-    resolvePointer(base, Offsets::NETWORK_PLAYER_IS_TEAMMATE,          NetworkPlayer_IsTeammate,      "NetworkPlayer_IsTeammate");
     resolvePointer(base, Offsets::BOT_PLAYER_GET_TEAM,                 BotPlayer_GetTeam,             "BotPlayer_GetTeam");
     resolvePointer(base, Offsets::BOT_PLAYER_HEALTH_GET_HEALTH,        BotPlayerHealth_GetHealth,     "BotPlayerHealth_GetHealth");
 }
