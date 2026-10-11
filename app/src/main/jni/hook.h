@@ -94,6 +94,7 @@ namespace Offsets {
     constexpr uintptr_t AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ = 0x4D2883C;
     constexpr uintptr_t AIMING_CONTROL_ADD_DELTA            = 0x4D281AC;
     constexpr uintptr_t NETWORK_PLAYER_IS_TEAMMATE          = 0x42CE9CC;
+    constexpr uintptr_t BOT_PLAYER_GET_TEAM                 = 0x4449610;
     constexpr uintptr_t BOT_PLAYER_HEALTH_GET_HEALTH        = 0x4BEE4FC;
     constexpr uintptr_t FPC_ON_DESTROY                      = 0x40A3A84;
     constexpr uintptr_t AIMING_CONTROL_ON_DESTROY           = 0x4D28714;
@@ -416,6 +417,7 @@ inline void (*AimingControl_SetTargetibleObject)(void *, void *) = nullptr;
 inline void (*AimingControl_ClearTargetibleObject)(void *) = nullptr;
 inline void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
 inline bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
+inline int (*BotPlayer_GetTeam)(void *) = nullptr;
 inline float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
 
 // Safe wrapper to set local scale on a Transform
@@ -530,6 +532,7 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ, AimingControl_ClearTargetibleObject, "AimingControl_ClearTargetibleObject");
     resolvePointer(base, Offsets::AIMING_CONTROL_ADD_DELTA,            AimingControl_AddDelta,        "AimingControl_AddDelta");
     resolvePointer(base, Offsets::NETWORK_PLAYER_IS_TEAMMATE,          NetworkPlayer_IsTeammate,      "NetworkPlayer_IsTeammate");
+    resolvePointer(base, Offsets::BOT_PLAYER_GET_TEAM,                 BotPlayer_GetTeam,             "BotPlayer_GetTeam");
     resolvePointer(base, Offsets::BOT_PLAYER_HEALTH_GET_HEALTH,        BotPlayerHealth_GetHealth,     "BotPlayerHealth_GetHealth");
 }
 

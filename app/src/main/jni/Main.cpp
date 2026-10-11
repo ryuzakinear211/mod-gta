@@ -358,8 +358,11 @@ static std::atomic<void*> g_activeAimingControl{nullptr};
 static std::atomic<void*> g_activeAimAssistManager{nullptr};
 static std::atomic<void*> g_activeNewAutoAim{nullptr};
 static std::atomic<void*> g_activeBaseAimAssist{nullptr};
+static std::atomic<int>   g_localPlayerTeam{0}; // Default: TeamA (0)
 
-// Forward declarations for lifecycle handlers
+// Forward declarations for target validation & lifecycle handlers
+extern bool (*old_BaseAimAssist_IsValidTarget)(void *, void *);
+extern bool (*old_NewAutoAim_IsValidTarget)(void *, void *);
 static void resetAimAssistState(void *aimingControlInstance = nullptr);
 static void resetEntityCounters();
 void onESPClear();
@@ -1185,7 +1188,52 @@ static bool isTargetibleObjectTeammate(void *targetibleObj) {
                     return true;
                 }
             }
+            // C. Call get_IsAutoAimAllowed (RVA 0x4DED124):
+            // In the game engine, auto-aim is allowed ONLY on enemies. On allies/friendly peds, it returns false!
+            if (get_IsAutoAimAllowed != nullptr) {
+                if (!get_IsAutoAimAllowed(customSettings)) {
+                    return true;
+                }
+            }
+            // D. Direct check of active TargetibleObjectCustomSettingsData (0x11: IsAutoAimAllowed)
+            bool isAllyToggle = false;
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
+                isAllyToggle = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20);
+            }
+            uintptr_t dataOffset = isAllyToggle ? 0x30 : 0x28; // _allyData vs _enemyData
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + dataOffset))) {
+                void *dataObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + dataOffset);
+                if (dataObj != nullptr && isPointerReadable(dataObj)) {
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dataObj) + 0x11))) {
+                        bool isAimAllowed = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(dataObj) + 0x11);
+                        if (!isAimAllowed) {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    // 3. Engine Native AimAssist Target Validation
+    static thread_local bool t_inTeammateValidation = false;
+    if (!t_inTeammateValidation) {
+        t_inTeammateValidation = true;
+        void *baInst = g_activeBaseAimAssist.load();
+        if (baInst != nullptr && old_BaseAimAssist_IsValidTarget != nullptr && isUnityObjectAlive(baInst)) {
+            if (!old_BaseAimAssist_IsValidTarget(baInst, targetibleObj)) {
+                t_inTeammateValidation = false;
+                return true;
+            }
+        }
+        void *naInst = g_activeNewAutoAim.load();
+        if (naInst != nullptr && old_NewAutoAim_IsValidTarget != nullptr && isUnityObjectAlive(naInst)) {
+            if (!old_NewAutoAim_IsValidTarget(naInst, targetibleObj)) {
+                t_inTeammateValidation = false;
+                return true;
+            }
+        }
+        t_inTeammateValidation = false;
     }
 
     return false;
@@ -1265,6 +1313,36 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
     return false;
 }
 
+static inline int getBotTeam(void *botPlayer) {
+    if (botPlayer == nullptr || !isPointerReadable(botPlayer) || !isUnityObjectAlive(botPlayer)) return -1;
+    // 1. BotPlayer_GetTeam getter (RVA 0x4449610)
+    if (BotPlayer_GetTeam != nullptr) {
+        int t = BotPlayer_GetTeam(botPlayer);
+        if (t == 0 || t == 1) return t;
+    }
+    // 2. Direct read <Team>k__BackingField at offset 0xE0
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE0))) {
+        int tE0 = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE0);
+        if (tE0 == 0 || tE0 == 1) return tE0;
+    }
+    // 3. Direct read <Team>k__BackingField at offset 0xE4
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE4))) {
+        int tE4 = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE4);
+        if (tE4 == 0 || tE4 == 1) return tE4;
+    }
+    // 4. PlayerSpawnPoint at offset 0xB0 -> _team at offset 0x38
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xB0))) {
+        void *sp = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0xB0);
+        if (sp != nullptr && isPointerReadable(sp) && isUnityObjectAlive(sp)) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(sp) + 0x38))) {
+                int spTeam = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(sp) + 0x38);
+                if (spTeam == 0 || spTeam == 1) return spTeam;
+            }
+        }
+    }
+    return -1;
+}
+
 static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botPlayer = nullptr) {
     // 1. Cross-resolve pointers so neither is missing
     if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
@@ -1293,7 +1371,7 @@ static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botP
         }
     }
 
-    // 2. Local player check
+    // 2. Local player self check
     void *localNet = g_localPlayerNetPlayer.load();
     if (localNet != nullptr && entityNetPlayer == localNet) return false;
     void *localTObj = g_localPlayerTargetibleObject.load();
@@ -1311,7 +1389,7 @@ static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botP
         if (isTargetibleObjectTeammate(targetibleObj)) return false;
     }
 
-    // 5. Test BotPlayer specific components
+    // 5. Test BotPlayer specific components & Team affiliation
     if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50))) {
             void *botNet = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50);
@@ -1323,6 +1401,15 @@ static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botP
             void *botTObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
             if (botTObj != nullptr && isUnityObjectAlive(botTObj)) {
                 if (isTargetibleObjectTeammate(botTObj)) return false;
+            }
+        }
+
+        // Check bot team affiliation against local player team
+        int bTeam = getBotTeam(botPlayer);
+        if (bTeam >= 0) {
+            int myTeam = g_localPlayerTeam.load();
+            if (bTeam == myTeam) {
+                return false; // Friendly bot / teammate!
             }
         }
     }
@@ -1632,7 +1719,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             }
 
             if (angleOffset <= allowedAngle) {
-                float score = angleOffset;
+                float score = angleOffset * (1.0f + 0.003f * dist3D);
                 if (isHead) score *= 0.70f;
 
                 if (score < bestTarget.score) {
@@ -1949,7 +2036,7 @@ static void processAimAssistLock(void *aimingControl) {
     if (sliderVal > 100) sliderVal = 100;
     float s = static_cast<float>(sliderVal) / 100.0f;
 
-    float maxFovAngle = g_bigHead.load() ? (24.0f + 6.0f * s) : (18.0f + 6.0f * s);
+    float maxFovAngle = g_bigHead.load() ? (22.0f + 6.0f * s) : (16.0f + 6.0f * s);
 
     TargetBoneInfo targetInfo = findBestTargetBone(camPos, currentYaw, currentPitch, maxFovAngle, cameraObj);
     if (!targetInfo.found) {
@@ -1976,35 +2063,45 @@ static void processAimAssistLock(void *aimingControl) {
     while (diffPitch > 180.0f) diffPitch -= 360.0f;
     while (diffPitch < -180.0f) diffPitch += 360.0f;
 
+    float targetAngularDist = sqrtf(diffYaw * diffYaw + diffPitch * diffPitch);
+
     float proximity = 1.0f - (targetInfo.angleOffset / (maxFovAngle + 0.001f));
     if (proximity < 0.0f) proximity = 0.0f;
     if (proximity > 1.0f) proximity = 1.0f;
 
-    // Responsive linear-weighted pull curve
-    float weight = 0.40f + 0.60f * proximity;
+    // Cubic smoothstep curve for gradual proximity weight
+    float smoothProximity = proximity * proximity * (3.0f - 2.0f * proximity);
 
-    // Magnetic pull rate:
-    // s = 0.0 (0%): assistRate ~ 0.15 * weight
-    // s = 0.8 (80% default): assistRate ~ 0.65 * weight (firm tracking)
-    // s = 1.0 (100%): assistRate = 1.00 (instant sticky lock)
-    float assistRate = (s >= 0.99f) ? 1.0f : ((0.15f + 0.70f * s) * weight);
+    // Quadratic slider pull rate:
+    // s = 0.0 (0%): base ~ 0.03 (gentle slowdown friction)
+    // s = 0.5 (50%): base ~ 0.14 (natural smooth assistance)
+    // s = 0.8 (80% default): base ~ 0.31 (firm responsive tracking)
+    // s = 1.0 (100%): base = 0.90 (sticky snap)
+    float basePullRate = (s >= 0.99f) ? 0.90f : (0.03f + 0.44f * (s * s));
+    float pullRate = basePullRate * (0.30f + 0.70f * smoothProximity);
 
-    // USER SWIPE AUTHORITY:
-    // Only yield when player makes a deliberate strong flick away from target
-    bool userFlickingAwayYaw = (userDeltaYaw > 1.0f && diffYaw < -0.3f) || (userDeltaYaw < -1.0f && diffYaw > 0.3f);
-    bool userFlickingAwayPitch = (userDeltaPitch > 1.0f && diffPitch < -0.3f) || (userDeltaPitch < -1.0f && diffPitch > 0.3f);
-    if (userFlickingAwayYaw || userFlickingAwayPitch) {
-        assistRate *= 0.20f;
+    // HUMAN MANUAL SWIPE AUTHORITY & DIRECTIONAL ESCAPE:
+    // Seamlessly attenuate assist if player aims away from target
+    float userSpeed = sqrtf(userDeltaYaw * userDeltaYaw + userDeltaPitch * userDeltaPitch);
+    if (userSpeed > 0.03f && targetAngularDist > 0.1f) {
+        float dot = (userDeltaYaw * diffYaw + userDeltaPitch * diffPitch) / (userSpeed * targetAngularDist);
+        if (dot < -0.05f) {
+            float escapeSeverity = (-dot); // Range: ~0.05 to 1.0
+            float userIntensity = userSpeed / 0.6f;
+            if (userIntensity > 1.0f) userIntensity = 1.0f;
+            float escapeFactor = escapeSeverity * userIntensity;
+            pullRate *= (1.0f - 0.85f * escapeFactor);
+        }
     }
 
-    float stepYaw = diffYaw * assistRate;
-    float stepPitch = diffPitch * assistRate;
+    float stepYaw = diffYaw * pullRate;
+    float stepPitch = diffPitch * pullRate;
 
-    // Angular velocity clamp: allows full snap at 100% slider, smooth clamp at lower values
-    float maxStepPerFrame = (s >= 0.99f) ? 30.0f : (1.5f + 8.5f * s);
+    // Angular velocity clamp: prevent abrupt jerking / hard camera snatching
+    float maxSpeedPerFrame = (s >= 0.99f) ? 22.0f : (0.5f + 4.5f * s);
     float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
-    if (stepLen > maxStepPerFrame) {
-        float scale = maxStepPerFrame / stepLen;
+    if (stepLen > maxSpeedPerFrame) {
+        float scale = maxSpeedPerFrame / stepLen;
         stepYaw *= scale;
         stepPitch *= scale;
     }
@@ -2037,8 +2134,10 @@ static void processAimAssistLock(void *aimingControl) {
     g_lastFramePitch = newPitch;
     g_hasLastFrameAngles = true;
 
-    // Synchronize AimingControl target with game engine
-    if (targetInfo.targetibleObj != nullptr) {
+    // Synchronize AimingControl target ONLY when slider is set to 100% sticky lock.
+    // In smooth assist mode (< 100%), keeping _targetibleObject cleared prevents
+    // the game engine's internal forced lock-on from hijacking the camera!
+    if (s >= 0.99f && targetInfo.targetibleObj != nullptr) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
             *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8) = targetInfo.targetibleObj;
         }
@@ -2047,6 +2146,13 @@ static void processAimAssistLock(void *aimingControl) {
         }
         if (AimingControl_SetTargetibleObject != nullptr) {
             AimingControl_SetTargetibleObject(aimingControl, targetInfo.targetibleObj);
+        }
+    } else {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8) = nullptr;
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
+            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = false;
         }
     }
 
@@ -2070,6 +2176,15 @@ void hook_AimingControl_Update(void *instance) {
     }
 
     g_activeAimingControl.store(instance);
+
+    // Keep _targetibleObject and hasTarget cleared prior to engine update
+    // so the engine's internal forced lock-on routine never locks or resists manual player input!
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
+        *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
+    }
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+        *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+    }
 
     if (old_AimingControl_Update != nullptr) {
         old_AimingControl_Update(instance);
@@ -2288,6 +2403,9 @@ void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
 // 7. BaseAimAssist.IsValidTarget (0x4478A70) & NewAutoAim.IsValidTarget (0x421C254)
 bool (*old_BaseAimAssist_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        g_activeBaseAimAssist.store(instance);
+    }
     if (!g_aimAssistBoost.load()) {
         return old_BaseAimAssist_IsValidTarget ? old_BaseAimAssist_IsValidTarget(instance, targetibleObject) : false;
     }
@@ -2304,6 +2422,9 @@ bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
 
 bool (*old_NewAutoAim_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        g_activeNewAutoAim.store(instance);
+    }
     if (!g_aimAssistBoost.load()) {
         return old_NewAutoAim_IsValidTarget ? old_NewAutoAim_IsValidTarget(instance, targetibleObject) : false;
     }
