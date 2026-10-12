@@ -467,36 +467,21 @@ static void applyPlayerWeaponMemoryEdits() {
     void *shooter = g_localPlayerShooter.load();
     if (shooter == nullptr || !isPointerReadable(shooter)) return;
 
-    // 1. Force Full Auto (_shootAction at offset 0x150: AUTO = 0, BOLT_ACTION = 1)
+    // 1. Never force AUTO (0) onto BOLT_ACTION (1) weapons (such as sniper rifles).
+    // Forcing AUTO onto sniper rifles causes auto-scoping on kill and disables hip fire!
+    // Fast fire rate is already handled by CanShoot, SetCooldown, and shot interval hooks.
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x150))) {
         int *shootActionPtr = reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(shooter) + 0x150);
-        if (!g_hasOrigShootAction) {
-            g_origShootAction = *shootActionPtr;
-            g_hasOrigShootAction = true;
-        }
-        *shootActionPtr = 0; // AUTO
-    }
-
-    // 2. Zero out internal cooldown ObscuredFloat fields at offset 0x18C & 0x1B0
-    static ObscuredFloat s_cachedZeroVal = {0};
-    static bool s_hasCachedZero = false;
-    if (!s_hasCachedZero && actk_op_Implicit_Float != nullptr) {
-        s_cachedZeroVal = actk_op_Implicit_Float(0.0f);
-        s_hasCachedZero = true;
-    }
-    if (s_hasCachedZero) {
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x18C))) {
-            memcpy(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x18C), &s_cachedZeroVal, sizeof(ObscuredFloat));
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x1B0))) {
-            memcpy(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x1B0), &s_cachedZeroVal, sizeof(ObscuredFloat));
+        if (*shootActionPtr != 1) { // Only adjust semi-auto / burst, keep BOLT_ACTION intact
+            if (!g_hasOrigShootAction) {
+                g_origShootAction = *shootActionPtr;
+                g_hasOrigShootAction = true;
+            }
+            *shootActionPtr = 0; // AUTO
         }
     }
 
-    // 3. Keep clip ammo filled during high-speed firing
-    if (set_ClipAmmo != nullptr) {
-        set_ClipAmmo(shooter, 999);
-    }
+    // 2. Note: set_ClipAmmo is removed as it caused SIGSEGV (Fault Address 0x20) in FirstPersonController_Update
 }
 
 static void applyNoRecoilMemoryEdits(void *fpc) {
@@ -665,12 +650,10 @@ bool hook_ShootCoroutine_MoveNext(void *instance) {
             void *fpc = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x20);
             if (fpc == g_localPlayerFPC.load() && fpc != nullptr) {
                 g_lastPlayerShootMs.store(getCurrentTimeMs());
-                // Immediate fire without WaitForSeconds delay
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x28))) {
-                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0x28) = true;
-                }
+                // Do NOT force IsImmediate (at +0x28) to true!
+                // Forcing IsImmediate = true breaks hip fire and causes auto-scoping on sniper/rifle weapons.
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x2C))) {
-                    *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(instance) + 0x2C) = 100.0f;
+                    *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(instance) + 0x2C) = 10.0f;
                 }
             }
         }
@@ -1248,9 +1231,14 @@ static inline bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, voi
         if (bTeam >= 0 && myTeam >= 0) {
             return (bTeam != myTeam);
         }
+        // If myTeam is uncalibrated, default bot to enemy unless proven teammate (cls == -1)
+        return true;
     }
     void *localNet = g_localPlayerNetPlayer.load();
-    if (entityNetPlayer != nullptr && localNet != nullptr && entityNetPlayer != localNet) {
+    if (entityNetPlayer != nullptr) {
+        if (localNet != nullptr && entityNetPlayer == localNet) {
+            return false;
+        }
         return true;
     }
     return false;
@@ -1273,26 +1261,10 @@ static inline bool isTargetibleObjectTeammate(void *targetibleObj) {
 }
 
 static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj) {
-    // 1. If TargetibleObject is present, verify active state and enabled combat colliders
+    // 1. If TargetibleObject is present, verify active state
     if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
         if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(targetibleObj)) {
             return true;
-        }
-
-        if (Collider_get_enabled != nullptr) {
-            void *headCol = nullptr;
-            void *bodyCol = nullptr;
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40))) {
-                headCol = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40);
-            }
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48))) {
-                bodyCol = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48);
-            }
-            bool headAlive = (headCol != nullptr && isUnityObjectAlive(headCol) && Collider_get_enabled(headCol));
-            bool bodyAlive = (bodyCol != nullptr && isUnityObjectAlive(bodyCol) && Collider_get_enabled(bodyCol));
-            if (!headAlive && !bodyAlive && (headCol != nullptr || bodyCol != nullptr)) {
-                return true;
-            }
         }
     }
 
@@ -1304,12 +1276,6 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30))) {
             void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30);
             if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
-                    float hp = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
-                    if (hp <= 0.0f) {
-                        return true;
-                    }
-                }
                 if (BotPlayerHealth_GetHealth != nullptr) {
                     float hp = BotPlayerHealth_GetHealth(botHealth);
                     if (hp <= 0.0f) {
@@ -1329,14 +1295,6 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
             void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
             if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
                 if (!isTargetInfoAlive(targetInfo)) {
-                    return true;
-                }
-            }
-        }
-        if (Collider_get_enabled != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0x90))) {
-            void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0x90);
-            if (col != nullptr && isUnityObjectAlive(col)) {
-                if (!Collider_get_enabled(col)) {
                     return true;
                 }
             }
@@ -2171,9 +2129,24 @@ void hook_AimingControl_Update(void *instance) {
 
     g_activeAimingControl.store(instance);
 
-    // Keep _targetibleObject and hasTarget cleared prior to engine update ONLY when aim assist is on
-    // and if pointer was non-null, so we don't do redundant memory writes
-    if (g_aimAssistBoost.load()) {
+    // Keep _targetibleObject and hasTarget cleared prior to engine update.
+    // When Aim Assist is OFF, clearing targetibleObject and calling ClearTargetibleObject
+    // prevents the game engine's built-in target selection from acquiring/tracking enemies.
+    // When Aim Assist is ON, clearing it prevents the engine's internal forced lock from fighting custom assist.
+    if (!g_aimAssistBoost.load()) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+            }
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+        }
+        if (AimingControl_ClearTargetibleObject != nullptr) {
+            AimingControl_ClearTargetibleObject(instance);
+        }
+    } else {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
             void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
             if (*pObj != nullptr) {
@@ -2207,10 +2180,13 @@ void hook_AimingControl_Update(void *instance) {
             void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
             if (*pObj != nullptr) {
                 *pObj = nullptr;
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
-                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
-                }
             }
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+        }
+        if (AimingControl_ClearTargetibleObject != nullptr) {
+            AimingControl_ClearTargetibleObject(instance);
         }
         g_hasLastEngineAngles = false;
         return;
@@ -2243,6 +2219,9 @@ static inline float getAimSensitivityFactor() {
 // 1. StrafeRotationConfig (0x52A6264, 0x52A6210, 0x52A624C, 0x52A65A4, 0x52A6598)
 float (*old_StrafeRotationConfig_get_MaxRotationPower)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_StrafeRotationConfig_get_MaxRotationPower != nullptr) {
         return old_StrafeRotationConfig_get_MaxRotationPower(instance);
     }
@@ -2251,6 +2230,9 @@ float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
 
 float (*old_StrafeRotationConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_StrafeRotationConfig_get_FOVAreaMultiplier != nullptr) {
         return old_StrafeRotationConfig_get_FOVAreaMultiplier(instance);
     }
@@ -2259,6 +2241,9 @@ float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
 
 float (*old_StrafeRotationConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_StrafeRotationConfig_get_DefaultStateMaxDistance != nullptr) {
         return old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance);
     }
@@ -2267,6 +2252,9 @@ float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
 
 float (*old_StrafeRotationConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_StrafeRotationConfig_get_ZoomedStateMaxDistance != nullptr) {
         return old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance);
     }
@@ -2275,6 +2263,9 @@ float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
 
 float (*old_StrafeRotationConfig_get_FOVPowerMultiplier)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_StrafeRotationConfig_get_FOVPowerMultiplier != nullptr) {
         return old_StrafeRotationConfig_get_FOVPowerMultiplier(instance);
     }
@@ -2284,6 +2275,9 @@ float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
 // 2. SpinSlowdownConfig (0x4600D68, 0x4600BCC, 0x4600BD8, 0x4600C44, 0x4600C5C)
 float (*old_SpinSlowdownConfig_get_MaxSlowdownValue)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_SpinSlowdownConfig_get_MaxSlowdownValue != nullptr) {
         return old_SpinSlowdownConfig_get_MaxSlowdownValue(instance);
     }
@@ -2292,6 +2286,9 @@ float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
 
 float (*old_SpinSlowdownConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_SpinSlowdownConfig_get_FOVAreaMultiplier != nullptr) {
         return old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance);
     }
@@ -2300,6 +2297,9 @@ float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
 
 float (*old_SpinSlowdownConfig_get_Radius)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_Radius(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_SpinSlowdownConfig_get_Radius != nullptr) {
         return old_SpinSlowdownConfig_get_Radius(instance);
     }
@@ -2308,6 +2308,9 @@ float hook_SpinSlowdownConfig_get_Radius(void *instance) {
 
 float (*old_SpinSlowdownConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_DefaultStateMaxDistance(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_SpinSlowdownConfig_get_DefaultStateMaxDistance != nullptr) {
         return old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance);
     }
@@ -2316,6 +2319,9 @@ float hook_SpinSlowdownConfig_get_DefaultStateMaxDistance(void *instance) {
 
 float (*old_SpinSlowdownConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
+    }
     if (old_SpinSlowdownConfig_get_ZoomedStateMaxDistance != nullptr) {
         return old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance);
     }
@@ -2325,6 +2331,9 @@ float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
 // 3. StrafeRotationAimAssist.Calculate (0x4F0E254)
 Vector2 (*old_StrafeRotation_Calculate)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
 Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vector2 smoothed) {
+    if (!g_aimAssistBoost.load()) {
+        return currentDelta;
+    }
     if (old_StrafeRotation_Calculate == nullptr) return currentDelta;
     return old_StrafeRotation_Calculate(instance, currentDelta, smoothed);
 }
@@ -2363,7 +2372,7 @@ bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
         g_activeBaseAimAssist.store(instance);
     }
     if (!g_aimAssistBoost.load()) {
-        return old_BaseAimAssist_IsValidTarget ? old_BaseAimAssist_IsValidTarget(instance, targetibleObject) : false;
+        return false;
     }
     if (old_BaseAimAssist_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
@@ -2382,7 +2391,7 @@ bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
         g_activeNewAutoAim.store(instance);
     }
     if (!g_aimAssistBoost.load()) {
-        return old_NewAutoAim_IsValidTarget ? old_NewAutoAim_IsValidTarget(instance, targetibleObject) : false;
+        return false;
     }
     if (old_NewAutoAim_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
@@ -2399,16 +2408,13 @@ static void resetAimAssistState(void *aimingControlInstance) {
     void *ac = aimingControlInstance ? aimingControlInstance : g_activeAimingControl.load();
     if (ac != nullptr && isPointerReadable(ac) && isUnityObjectAlive(ac)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xC8))) {
-            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0xC8);
-            if (*pObj != nullptr) {
-                *pObj = nullptr;
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xD0))) {
-                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(ac) + 0xD0) = false;
-                }
-                if (AimingControl_ClearTargetibleObject != nullptr) {
-                    AimingControl_ClearTargetibleObject(ac);
-                }
-            }
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0xC8) = nullptr;
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xD0))) {
+            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(ac) + 0xD0) = false;
+        }
+        if (AimingControl_ClearTargetibleObject != nullptr) {
+            AimingControl_ClearTargetibleObject(ac);
         }
     }
     g_hasLastEngineAngles = false;

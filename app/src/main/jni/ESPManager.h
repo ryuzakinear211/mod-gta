@@ -158,20 +158,17 @@ public:
                 if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x30))) {
                     void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x30);
                     if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
-                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
-                            float hpVal = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
-                            if (hpVal <= 0.0f) {
-                                isDead = true;
-                            } else {
-                                currentHp = static_cast<int>(hpVal);
-                            }
-                        }
-                        if (!isDead && BotPlayerHealth_GetHealth != nullptr) {
+                        if (BotPlayerHealth_GetHealth != nullptr) {
                             float hp = BotPlayerHealth_GetHealth(botHealth);
                             if (hp <= 0.0f) {
                                 isDead = true;
-                            } else if (hp > 0.0f) {
+                            } else {
                                 currentHp = static_cast<int>(hp);
+                            }
+                        } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
+                            float hpVal = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
+                            if (hpVal > 0.0f) {
+                                currentHp = static_cast<int>(hpVal);
                             }
                         }
                         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x28))) {
