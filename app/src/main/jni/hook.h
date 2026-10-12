@@ -62,6 +62,7 @@ namespace Offsets {
     constexpr uintptr_t FPC_GET_CURRENT_WEAPON              = 0x408FC44;
     constexpr uintptr_t FPC_GET_SHOOTER_BEHAVIOUR           = 0x409188C;
     constexpr uintptr_t WEAPON_SET_CLIP_AMMO                = 0x405A39C;
+    constexpr uintptr_t WEAPON_GET_CLIP_AMMO                = 0x405A650;
     constexpr uintptr_t ACTK_OP_IMPLICIT_FLOAT              = 0x3D6E4DC;
     constexpr uintptr_t FPC_GET_NETWORK_PLAYER              = 0x40A1050;
     constexpr uintptr_t WEAPON_CAN_SHOOT                    = 0x405BBF0;

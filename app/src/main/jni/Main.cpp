@@ -165,6 +165,7 @@ static std::atomic<bool> g_noRecoil{false};
 static std::atomic<bool> g_aimAssistBoost{false};
 static std::atomic<int>  g_aimSmoothness{80}; // 0 - 100 slider (default: 80, 100 = sticky lock)
 #define g_aimSensitivity g_aimSmoothness
+static std::atomic<bool> g_unlimitedAmmo{false};
 static std::atomic<uint64_t> g_lastPlayerShootMs{0};
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
@@ -202,7 +203,7 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d, AimSmooth=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d, AimSmooth=%d, UnlimitedAmmo=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
         g_lastAction,
@@ -212,7 +213,8 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         static_cast<int>(g_fastFireRate.load()),
         static_cast<int>(g_noRecoil.load()),
         static_cast<int>(g_aimAssistBoost.load()),
-        g_aimSmoothness.load()
+        g_aimSmoothness.load(),
+        static_cast<int>(g_unlimitedAmmo.load())
     );
 
 #if defined(__aarch64__)
@@ -431,27 +433,42 @@ static void updateLocalPlayerWeapon(void *fpc) {
         currentWeapon = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50);
     }
 
-    if (currentWeapon != nullptr && isPointerReadable(currentWeapon)) {
+    if (currentWeapon != nullptr && isPointerReadable(currentWeapon) && isUnityObjectAlive(currentWeapon)) {
         g_localPlayerWeapon.store(currentWeapon);
 
         void *shooter = nullptr;
         if (get_ShooterBehaviour != nullptr) {
             shooter = get_ShooterBehaviour(fpc, currentWeapon);
         }
-        if (shooter != nullptr && isPointerReadable(shooter)) {
+        if (shooter != nullptr && isPointerReadable(shooter) && isUnityObjectAlive(shooter)) {
             g_localPlayerShooter.store(shooter);
         } else {
-            g_localPlayerShooter.store(currentWeapon); // WeaponShooterBehaviour inherits from ItemWeaponBehaviour
+            g_localPlayerShooter.store(nullptr);
         }
 
         // WeaponProfile at offset 0x80 of ItemBehaviour
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80))) {
-            g_localWeaponProfile.store(*reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80));
+            void *prof = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80);
+            if (prof != nullptr && isPointerReadable(prof) && isUnityObjectAlive(prof)) {
+                g_localWeaponProfile.store(prof);
+            } else {
+                g_localWeaponProfile.store(nullptr);
+            }
         }
         // WeaponParameters at offset 0x88 of ItemBehaviour
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88))) {
-            g_localWeaponParams.store(*reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88));
+            void *param = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88);
+            if (param != nullptr && isPointerReadable(param) && isUnityObjectAlive(param)) {
+                g_localWeaponParams.store(param);
+            } else {
+                g_localWeaponParams.store(nullptr);
+            }
         }
+    } else {
+        g_localPlayerWeapon.store(nullptr);
+        g_localPlayerShooter.store(nullptr);
+        g_localWeaponProfile.store(nullptr);
+        g_localWeaponParams.store(nullptr);
     }
 
     uint64_t now = getCurrentTimeMs();
@@ -463,9 +480,42 @@ static void updateLocalPlayerWeapon(void *fpc) {
     }
 }
 
+// Check that the weapon's ammo hierarchy is fully initialized and readable before calling set_ClipAmmo.
+// In libil2cpp, offset 0x178 is the ammo controller, and 0x28..0x40 are its internal sub-controllers.
+// If any of these are null or < 0x10000, calling set_ClipAmmo crashes at 0x425dd68 (Fault Address 0x20).
+static bool isSafeToSetClipAmmo(void *shooter) {
+    if (shooter == nullptr || !isPointerReadable(shooter) || !isUnityObjectAlive(shooter)) {
+        return false;
+    }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x178))) {
+        return false;
+    }
+    void *ammoCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(shooter) + 0x178);
+    if (ammoCtrl == nullptr || !isPointerReadable(ammoCtrl) || reinterpret_cast<uintptr_t>(ammoCtrl) < 0x10000) {
+        return false;
+    }
+    for (uintptr_t off = 0x28; off <= 0x40; off += 8) {
+        if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ammoCtrl) + off))) {
+            return false;
+        }
+        void *subObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ammoCtrl) + off);
+        if (subObj == nullptr || !isPointerReadable(subObj) || reinterpret_cast<uintptr_t>(subObj) < 0x10000) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void safeApplyUnlimitedClipAmmo(void *shooter, int ammoCount = 999) {
+    if (shooter == nullptr || !g_unlimitedAmmo.load()) return;
+    if (set_ClipAmmo != nullptr && isSafeToSetClipAmmo(shooter)) {
+        set_ClipAmmo(shooter, ammoCount);
+    }
+}
+
 static void applyPlayerWeaponMemoryEdits() {
     void *shooter = g_localPlayerShooter.load();
-    if (shooter == nullptr || !isPointerReadable(shooter)) return;
+    if (shooter == nullptr || !isPointerReadable(shooter) || !isUnityObjectAlive(shooter)) return;
 
     // 1. Never force AUTO (0) onto BOLT_ACTION (1) weapons (such as sniper rifles).
     // Forcing AUTO onto sniper rifles causes auto-scoping on kill and disables hip fire!
@@ -480,32 +530,26 @@ static void applyPlayerWeaponMemoryEdits() {
             *shootActionPtr = 0; // AUTO
         }
     }
-
-    // 2. Note: set_ClipAmmo is removed as it caused SIGSEGV (Fault Address 0x20) in FirstPersonController_Update
 }
 
 static void applyNoRecoilMemoryEdits(void *fpc) {
-    if (fpc == nullptr || !isPointerReadable(fpc)) return;
+    if (fpc == nullptr || !isPointerReadable(fpc) || !isUnityObjectAlive(fpc)) return;
 
     // 1. AnimController at offset 0xB8
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0xB8))) {
         void *animCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0xB8);
-        if (animCtrl != nullptr && isPointerReadable(animCtrl)) {
+        if (animCtrl != nullptr && isPointerReadable(animCtrl) && isUnityObjectAlive(animCtrl)) {
             // AnimEffectList at offset 0x30
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(animCtrl) + 0x30))) {
                 void *animList = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(animCtrl) + 0x30);
-                if (animList != nullptr && isPointerReadable(animList)) {
+                if (animList != nullptr && isPointerReadable(animList) && isUnityObjectAlive(animList)) {
                     // AttackAnimEffect at offset 0x38
                     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(animList) + 0x38))) {
                         void *attackAnim = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(animList) + 0x38);
-                        if (attackAnim != nullptr && isPointerReadable(attackAnim)) {
-                            // Zero current weapon/camera recoil vectors
-                            // 0x1F0: _currentWeaponRecoilPosition (Vector3)
-                            // 0x1FC: _currentWeaponRecoilRotation (Vector3)
-                            // 0x208: _currentCameraRecoilRotation (Vector3)
-                            // 0x214: _weaponRotationOutput (Vector3)
-                            // 0x220: _cameraRotationOutput (Vector3)
-                            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x1F0))) {
+                        if (attackAnim != nullptr && isPointerReadable(attackAnim) && isUnityObjectAlive(attackAnim)) {
+                            // Zero current weapon/camera recoil vectors safely with bounds checking
+                            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x1F0)) &&
+                                isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x228))) {
                                 memset(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x1F0), 0, 0x22C - 0x1F0);
                             }
                             // 0x244: _sumShift (Vector2)
@@ -533,11 +577,17 @@ void hook_FirstPersonController_Update(void *instance) {
         applyPlayerWeaponMemoryEdits();
     } else if (g_hasOrigShootAction) {
         void *shooter = g_localPlayerShooter.load();
-        if (shooter != nullptr && isPointerReadable(shooter)) {
+        if (shooter != nullptr && isPointerReadable(shooter) && isUnityObjectAlive(shooter)) {
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x150))) {
                 *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(shooter) + 0x150) = g_origShootAction;
                 g_hasOrigShootAction = false;
             }
+        }
+    }
+    if (g_unlimitedAmmo.load()) {
+        void *shooter = g_localPlayerShooter.load();
+        if (shooter != nullptr) {
+            safeApplyUnlimitedClipAmmo(shooter, 999);
         }
     }
     if (g_noRecoil.load()) {
@@ -585,6 +635,9 @@ bool (*old_WeaponShooterBehaviour_CanShoot)(void *instance) = nullptr;
 bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
     if (instance != nullptr && isClientWeapon(instance)) {
         g_lastPlayerShootMs.store(getCurrentTimeMs());
+        if (g_unlimitedAmmo.load()) {
+            safeApplyUnlimitedClipAmmo(instance, 999);
+        }
         if (g_fastFireRate.load()) {
             return true; // Local weapon can always shoot instantly
         }
@@ -593,6 +646,18 @@ bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
         return old_WeaponShooterBehaviour_CanShoot(instance);
     }
     return true;
+}
+
+// 2b. WeaponShooterBehaviour.GetClipAmmo: RVA 0x405A650
+int (*old_WeaponShooterBehaviour_GetClipAmmo)(void *instance) = nullptr;
+int hook_WeaponShooterBehaviour_GetClipAmmo(void *instance) {
+    if (g_unlimitedAmmo.load() && instance != nullptr && isClientWeapon(instance)) {
+        return 999;
+    }
+    if (old_WeaponShooterBehaviour_GetClipAmmo != nullptr) {
+        return old_WeaponShooterBehaviour_GetClipAmmo(instance);
+    }
+    return 30;
 }
 
 // 3. WeaponShooterBehaviour.SetCooldown: RVA 0x405D084
@@ -645,15 +710,23 @@ ObscuredFloat hook_FPC_GetShotInterval2(void *fpc, void *weapon) {
 // 7. ShootCoroutine.MoveNext: RVA 0x40B93A0
 bool (*old_ShootCoroutine_MoveNext)(void *instance) = nullptr;
 bool hook_ShootCoroutine_MoveNext(void *instance) {
-    if (g_fastFireRate.load() && instance != nullptr && isPointerReadable(instance)) {
+    if (instance != nullptr && isPointerReadable(instance)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x20))) {
             void *fpc = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x20);
             if (fpc == g_localPlayerFPC.load() && fpc != nullptr) {
                 g_lastPlayerShootMs.store(getCurrentTimeMs());
-                // Do NOT force IsImmediate (at +0x28) to true!
-                // Forcing IsImmediate = true breaks hip fire and causes auto-scoping on sniper/rifle weapons.
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x2C))) {
-                    *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(instance) + 0x2C) = 10.0f;
+                if (g_unlimitedAmmo.load()) {
+                    void *shooter = g_localPlayerShooter.load();
+                    if (shooter != nullptr) {
+                        safeApplyUnlimitedClipAmmo(shooter, 999);
+                    }
+                }
+                if (g_fastFireRate.load()) {
+                    // Do NOT force IsImmediate (at +0x28) to true!
+                    // Forcing IsImmediate = true breaks hip fire and causes auto-scoping on sniper/rifle weapons.
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x2C))) {
+                        *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(instance) + 0x2C) = 10.0f;
+                    }
                 }
             }
         }
@@ -2528,6 +2601,7 @@ static void registerAllHooks() {
     // 1. Client-Side Fast FireRate & Weapon Hooks
     mgr.registerHook(Offsets::FPC_UPDATE,                    reinterpret_cast<void*>(hook_FirstPersonController_Update),        reinterpret_cast<void**>(&old_FirstPersonController_Update),        "FirstPersonController.Update");
     mgr.registerHook(Offsets::WEAPON_CAN_SHOOT,              reinterpret_cast<void*>(hook_WeaponShooterBehaviour_CanShoot),     reinterpret_cast<void**>(&old_WeaponShooterBehaviour_CanShoot),     "WeaponShooterBehaviour.CanShoot");
+    mgr.registerHook(Offsets::WEAPON_GET_CLIP_AMMO,          reinterpret_cast<void*>(hook_WeaponShooterBehaviour_GetClipAmmo),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_GetClipAmmo),  "WeaponShooterBehaviour.GetClipAmmo");
     mgr.registerHook(Offsets::WEAPON_SET_COOLDOWN,           reinterpret_cast<void*>(hook_WeaponShooterBehaviour_SetCooldown),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_SetCooldown),  "WeaponShooterBehaviour.SetCooldown");
     mgr.registerHook(Offsets::FPC_GET_SHOT_INTERVAL1,        reinterpret_cast<void*>(hook_FPC_GetShotInterval1),                reinterpret_cast<void**>(&old_FPC_GetShotInterval1),                "FirstPersonController.GetShotInterval1");
     mgr.registerHook(Offsets::FPC_GET_SHOT_INTERVAL2,        reinterpret_cast<void*>(hook_FPC_GetShotInterval2),                reinterpret_cast<void**>(&old_FPC_GetShotInterval2),                "FirstPersonController.GetShotInterval2");
@@ -2620,6 +2694,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
         OBFUSCATE("Toggle_Aim Assist (Auto-Lock Radius)"), // featNum 4
         OBFUSCATE("SeekBar_Aim Smoothness (Sticky Lock)_0_100"), // featNum 5
+        OBFUSCATE("14_Toggle_Unlimited Ammo (Clip Ammo)"), // featNum 14
         OBFUSCATE("Category_👁️ ESP OVERLAY SYSTEM"),
         OBFUSCATE("Toggle_ESP Master Switch"),           // featNum 6
         OBFUSCATE("Toggle_ESP 2D Box_True"),             // featNum 7
@@ -2630,7 +2705,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_ESP Enemy Only_True"),         // featNum 12
         OBFUSCATE("SeekBar_ESP Max Distance_10_300"),    // featNum 13
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian. Saat nilai di-mentokkan (100), bidikan akan selalu lengket (100% magnetic sticky lock) pada bone body atau head musuh (seperti Big Head). Nilai rendah memberikan assist natural.<br><br>• <b>ESP Overlay System:</b> Visual overlay mendeteksi posisi Real Player & Bot secara real-time dari WorldToViewportPoint camera (Box 2D, Line tracer, Jarak meter, Health bar, dan info Bot/Player).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>Unlimited Ammo (Clip Ammo):</b> Peluru klip tidak pernah habis (999 peluru) dengan validasi hierarki pointer ammo controller aman tanpa crash.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian. Saat nilai di-mentokkan (100), bidikan akan selalu lengket (100% magnetic sticky lock) pada bone body atau head musuh (seperti Big Head). Nilai rendah memberikan assist natural.<br><br>• <b>ESP Overlay System:</b> Visual overlay mendeteksi posisi Real Player & Bot secara real-time dari WorldToViewportPoint camera (Box 2D, Line tracer, Jarak meter, Health bar, dan info Bot/Player).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2804,6 +2879,22 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             g_espMaxDistance.store(value);
             ModLog("[SLIDER] Feature #13 [ESP Max Distance] set to: %d meters", value);
             setLastAction("Slider ESP Max Distance changed");
+            break;
+        }
+
+        case 14: { // 14_Toggle_Unlimited Ammo (Clip Ammo)
+            g_unlimitedAmmo.store(boolean);
+            ModLog("[TOGGLE] Feature #14 [Unlimited Ammo (Clip Ammo)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Unlimited Ammo: ON" : "Toggle Unlimited Ammo: OFF");
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("Unlimited Ammo: ON (Peluru Tak Terbatas)"), ToastLength::LENGTH_SHORT);
+                void *shooter = g_localPlayerShooter.load();
+                if (shooter != nullptr) {
+                    safeApplyUnlimitedClipAmmo(shooter, 999);
+                }
+            } else {
+                Toast(env, ctx, OBFUSCATE("Unlimited Ammo: OFF (Normal)"), ToastLength::LENGTH_SHORT);
+            }
             break;
         }
 
