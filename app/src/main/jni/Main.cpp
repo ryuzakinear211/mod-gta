@@ -436,33 +436,40 @@ static void updateLocalPlayerWeapon(void *fpc) {
     if (currentWeapon != nullptr && isPointerReadable(currentWeapon) && isUnityObjectAlive(currentWeapon)) {
         g_localPlayerWeapon.store(currentWeapon);
 
-        void *shooter = nullptr;
-        if (get_ShooterBehaviour != nullptr) {
-            shooter = get_ShooterBehaviour(fpc, currentWeapon);
-        }
-        if (shooter != nullptr && isPointerReadable(shooter) && isUnityObjectAlive(shooter)) {
-            g_localPlayerShooter.store(shooter);
-        } else {
-            g_localPlayerShooter.store(nullptr);
-        }
-
         // WeaponProfile at offset 0x80 of ItemBehaviour
+        void *prof = nullptr;
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80))) {
-            void *prof = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80);
-            if (prof != nullptr && isPointerReadable(prof) && isUnityObjectAlive(prof)) {
-                g_localWeaponProfile.store(prof);
-            } else {
-                g_localWeaponProfile.store(nullptr);
+            void *p = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80);
+            if (p != nullptr && isPointerReadable(p) && isUnityObjectAlive(p)) {
+                prof = p;
             }
         }
+        g_localWeaponProfile.store(prof);
+
         // WeaponParameters at offset 0x88 of ItemBehaviour
+        void *param = nullptr;
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88))) {
-            void *param = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88);
-            if (param != nullptr && isPointerReadable(param) && isUnityObjectAlive(param)) {
-                g_localWeaponParams.store(param);
-            } else {
-                g_localWeaponParams.store(nullptr);
+            void *p = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88);
+            if (p != nullptr && isPointerReadable(p) && isUnityObjectAlive(p)) {
+                param = p;
             }
+        }
+        g_localWeaponParams.store(param);
+
+        // A valid firearm MUST have valid WeaponProfile and WeaponParameters!
+        if (prof != nullptr && param != nullptr) {
+            void *shooter = nullptr;
+            if (get_ShooterBehaviour != nullptr) {
+                shooter = get_ShooterBehaviour(fpc, currentWeapon);
+            }
+            if (shooter != nullptr && isPointerReadable(shooter) && isUnityObjectAlive(shooter)) {
+                g_localPlayerShooter.store(shooter);
+            } else {
+                g_localPlayerShooter.store(nullptr);
+            }
+        } else {
+            // Melee, knife, grenade, or empty hands - NOT a firearm!
+            g_localPlayerShooter.store(nullptr);
         }
     } else {
         g_localPlayerWeapon.store(nullptr);
@@ -482,9 +489,11 @@ static void updateLocalPlayerWeapon(void *fpc) {
 
 // Check that the weapon's ammo hierarchy is fully initialized and readable before calling set_ClipAmmo.
 // In libil2cpp, offset 0x178 is the ammo controller, and 0x28..0x40 are its internal sub-controllers.
-// If any of these are null or < 0x10000, calling set_ClipAmmo crashes at 0x425dd68 (Fault Address 0x20).
 static bool isSafeToSetClipAmmo(void *shooter) {
     if (shooter == nullptr || !isPointerReadable(shooter) || !isUnityObjectAlive(shooter)) {
+        return false;
+    }
+    if (g_localWeaponProfile.load() == nullptr || g_localWeaponParams.load() == nullptr) {
         return false;
     }
     if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x178))) {
@@ -504,13 +513,6 @@ static bool isSafeToSetClipAmmo(void *shooter) {
         }
     }
     return true;
-}
-
-static void safeApplyUnlimitedClipAmmo(void *shooter, int ammoCount = 999) {
-    if (shooter == nullptr || !g_unlimitedAmmo.load()) return;
-    if (set_ClipAmmo != nullptr && isSafeToSetClipAmmo(shooter)) {
-        set_ClipAmmo(shooter, ammoCount);
-    }
 }
 
 static void applyPlayerWeaponMemoryEdits() {
@@ -565,6 +567,9 @@ static void applyNoRecoilMemoryEdits(void *fpc) {
     }
 }
 
+// Forward declarations of weapon hooks
+void (*old_WeaponShooterBehaviour_SetClipAmmo)(void *instance, int ammo) = nullptr;
+
 // 1. FirstPersonController.Update: RVA 0x40A1BF4
 void (*old_FirstPersonController_Update)(void *instance) = nullptr;
 void hook_FirstPersonController_Update(void *instance) {
@@ -584,12 +589,38 @@ void hook_FirstPersonController_Update(void *instance) {
             }
         }
     }
-    if (g_unlimitedAmmo.load()) {
-        void *shooter = g_localPlayerShooter.load();
-        if (shooter != nullptr) {
-            safeApplyUnlimitedClipAmmo(shooter, 999);
+
+    // Unlimited Ammo: Top off ammo ONLY once on weapon change or toggle-on on the Unity thread
+    static void *s_lastRefilledShooter = nullptr;
+    static bool s_lastRefilledState = false;
+    bool curAmmoState = g_unlimitedAmmo.load();
+    void *curShooter = g_localPlayerShooter.load();
+    if (curAmmoState) {
+        if (!s_lastRefilledState || curShooter != s_lastRefilledShooter) {
+            s_lastRefilledState = true;
+            s_lastRefilledShooter = curShooter;
+            if (curShooter != nullptr && g_localWeaponProfile.load() != nullptr && g_localWeaponParams.load() != nullptr) {
+                if (isSafeToSetClipAmmo(curShooter)) {
+                    int maxCap = 30;
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curShooter) + 0x13C))) {
+                        int cap = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(curShooter) + 0x13C);
+                        if (cap > 0 && cap <= 500) {
+                            maxCap = cap;
+                        }
+                    }
+                    if (old_WeaponShooterBehaviour_SetClipAmmo != nullptr) {
+                        old_WeaponShooterBehaviour_SetClipAmmo(curShooter, maxCap);
+                    } else if (set_ClipAmmo != nullptr) {
+                        set_ClipAmmo(curShooter, maxCap);
+                    }
+                }
+            }
         }
+    } else {
+        s_lastRefilledState = false;
+        s_lastRefilledShooter = nullptr;
     }
+
     if (g_noRecoil.load()) {
         applyNoRecoilMemoryEdits(instance);
     }
@@ -635,9 +666,6 @@ bool (*old_WeaponShooterBehaviour_CanShoot)(void *instance) = nullptr;
 bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
     if (instance != nullptr && isClientWeapon(instance)) {
         g_lastPlayerShootMs.store(getCurrentTimeMs());
-        if (g_unlimitedAmmo.load()) {
-            safeApplyUnlimitedClipAmmo(instance, 999);
-        }
         if (g_fastFireRate.load()) {
             return true; // Local weapon can always shoot instantly
         }
@@ -648,11 +676,37 @@ bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
     return true;
 }
 
-// 2b. WeaponShooterBehaviour.GetClipAmmo: RVA 0x405A650
+// 2b. WeaponShooterBehaviour.SetClipAmmo: RVA 0x405A39C
+void hook_WeaponShooterBehaviour_SetClipAmmo(void *instance, int ammo) {
+    if (g_unlimitedAmmo.load() && instance != nullptr && isClientWeapon(instance)) {
+        int maxCap = 30;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x13C))) {
+            int cap = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(instance) + 0x13C);
+            if (cap > 0 && cap <= 500) {
+                maxCap = cap;
+            }
+        }
+        if (ammo < maxCap) {
+            ammo = maxCap;
+        }
+    }
+    if (old_WeaponShooterBehaviour_SetClipAmmo != nullptr) {
+        old_WeaponShooterBehaviour_SetClipAmmo(instance, ammo);
+    }
+}
+
+// 2c. WeaponShooterBehaviour.GetClipAmmo: RVA 0x405A650
 int (*old_WeaponShooterBehaviour_GetClipAmmo)(void *instance) = nullptr;
 int hook_WeaponShooterBehaviour_GetClipAmmo(void *instance) {
     if (g_unlimitedAmmo.load() && instance != nullptr && isClientWeapon(instance)) {
-        return 999;
+        int maxCap = 30;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x13C))) {
+            int cap = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(instance) + 0x13C);
+            if (cap > 0 && cap <= 500) {
+                maxCap = cap;
+            }
+        }
+        return maxCap;
     }
     if (old_WeaponShooterBehaviour_GetClipAmmo != nullptr) {
         return old_WeaponShooterBehaviour_GetClipAmmo(instance);
@@ -715,12 +769,6 @@ bool hook_ShootCoroutine_MoveNext(void *instance) {
             void *fpc = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x20);
             if (fpc == g_localPlayerFPC.load() && fpc != nullptr) {
                 g_lastPlayerShootMs.store(getCurrentTimeMs());
-                if (g_unlimitedAmmo.load()) {
-                    void *shooter = g_localPlayerShooter.load();
-                    if (shooter != nullptr) {
-                        safeApplyUnlimitedClipAmmo(shooter, 999);
-                    }
-                }
                 if (g_fastFireRate.load()) {
                     // Do NOT force IsImmediate (at +0x28) to true!
                     // Forcing IsImmediate = true breaks hip fire and causes auto-scoping on sniper/rifle weapons.
@@ -2601,6 +2649,7 @@ static void registerAllHooks() {
     // 1. Client-Side Fast FireRate & Weapon Hooks
     mgr.registerHook(Offsets::FPC_UPDATE,                    reinterpret_cast<void*>(hook_FirstPersonController_Update),        reinterpret_cast<void**>(&old_FirstPersonController_Update),        "FirstPersonController.Update");
     mgr.registerHook(Offsets::WEAPON_CAN_SHOOT,              reinterpret_cast<void*>(hook_WeaponShooterBehaviour_CanShoot),     reinterpret_cast<void**>(&old_WeaponShooterBehaviour_CanShoot),     "WeaponShooterBehaviour.CanShoot");
+    mgr.registerHook(Offsets::WEAPON_SET_CLIP_AMMO,          reinterpret_cast<void*>(hook_WeaponShooterBehaviour_SetClipAmmo),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_SetClipAmmo),  "WeaponShooterBehaviour.SetClipAmmo");
     mgr.registerHook(Offsets::WEAPON_GET_CLIP_AMMO,          reinterpret_cast<void*>(hook_WeaponShooterBehaviour_GetClipAmmo),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_GetClipAmmo),  "WeaponShooterBehaviour.GetClipAmmo");
     mgr.registerHook(Offsets::WEAPON_SET_COOLDOWN,           reinterpret_cast<void*>(hook_WeaponShooterBehaviour_SetCooldown),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_SetCooldown),  "WeaponShooterBehaviour.SetCooldown");
     mgr.registerHook(Offsets::FPC_GET_SHOT_INTERVAL1,        reinterpret_cast<void*>(hook_FPC_GetShotInterval1),                reinterpret_cast<void**>(&old_FPC_GetShotInterval1),                "FirstPersonController.GetShotInterval1");
@@ -2888,10 +2937,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             setLastAction(boolean ? "Toggle Unlimited Ammo: ON" : "Toggle Unlimited Ammo: OFF");
             if (boolean) {
                 Toast(env, ctx, OBFUSCATE("Unlimited Ammo: ON (Peluru Tak Terbatas)"), ToastLength::LENGTH_SHORT);
-                void *shooter = g_localPlayerShooter.load();
-                if (shooter != nullptr) {
-                    safeApplyUnlimitedClipAmmo(shooter, 999);
-                }
             } else {
                 Toast(env, ctx, OBFUSCATE("Unlimited Ammo: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             }
