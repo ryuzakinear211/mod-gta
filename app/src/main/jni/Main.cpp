@@ -488,7 +488,10 @@ static void updateLocalPlayerWeapon(void *fpc) {
 }
 
 // Check that the weapon's ammo hierarchy is fully initialized and readable before calling set_ClipAmmo.
-// In libil2cpp, offset 0x178 is the ammo controller, and 0x28..0x40 are its internal sub-controllers.
+// In libil2cpp:
+// - shooter + 0x178 is the ammo controller (TypeDefIndex: 2094).
+// - ammoCtrl + 0x28 is the primary clip ammo sub-controller (TypeDefIndex: 7341).
+// - subObj + 0x18 is the inventory ammo item link (if null, dereferencing +0x20 in 0x425dd68 causes SIGSEGV Fault Address 0x20).
 static bool isSafeToSetClipAmmo(void *shooter) {
     if (shooter == nullptr || !isPointerReadable(shooter) || !isUnityObjectAlive(shooter)) {
         return false;
@@ -503,16 +506,31 @@ static bool isSafeToSetClipAmmo(void *shooter) {
     if (ammoCtrl == nullptr || !isPointerReadable(ammoCtrl) || reinterpret_cast<uintptr_t>(ammoCtrl) < 0x10000) {
         return false;
     }
-    for (uintptr_t off = 0x28; off <= 0x40; off += 8) {
-        if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ammoCtrl) + off))) {
-            return false;
-        }
-        void *subObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ammoCtrl) + off);
-        if (subObj == nullptr || !isPointerReadable(subObj) || reinterpret_cast<uintptr_t>(subObj) < 0x10000) {
-            return false;
-        }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ammoCtrl) + 0x28))) {
+        return false;
+    }
+    void *subObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ammoCtrl) + 0x28);
+    if (subObj == nullptr || !isPointerReadable(subObj) || reinterpret_cast<uintptr_t>(subObj) < 0x10000) {
+        return false;
+    }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(subObj) + 0x18))) {
+        return false;
+    }
+    void *itemPtr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(subObj) + 0x18);
+    if (itemPtr == nullptr || !isPointerReadable(itemPtr) || reinterpret_cast<uintptr_t>(itemPtr) < 0x10000) {
+        return false;
+    }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(itemPtr) + 0x20))) {
+        return false;
     }
     return true;
+}
+
+static void safeApplyUnlimitedClipAmmo(void *shooter, int ammoCount = 999) {
+    if (shooter == nullptr) return;
+    if (set_ClipAmmo != nullptr && isSafeToSetClipAmmo(shooter)) {
+        set_ClipAmmo(shooter, ammoCount);
+    }
 }
 
 static void applyPlayerWeaponMemoryEdits() {
@@ -531,6 +549,27 @@ static void applyPlayerWeaponMemoryEdits() {
             }
             *shootActionPtr = 0; // AUTO
         }
+    }
+
+    // 2. Zero out internal cooldown ObscuredFloat fields at offset 0x18C & 0x1B0
+    static ObscuredFloat s_cachedZeroVal = {0};
+    static bool s_hasCachedZero = false;
+    if (!s_hasCachedZero && actk_op_Implicit_Float != nullptr) {
+        s_cachedZeroVal = actk_op_Implicit_Float(0.0f);
+        s_hasCachedZero = true;
+    }
+    if (s_hasCachedZero) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x18C))) {
+            memcpy(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x18C), &s_cachedZeroVal, sizeof(ObscuredFloat));
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x1B0))) {
+            memcpy(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x1B0), &s_cachedZeroVal, sizeof(ObscuredFloat));
+        }
+    }
+
+    // 3. Keep clip ammo filled during high-speed firing if unlimited ammo is active
+    if (g_unlimitedAmmo.load()) {
+        safeApplyUnlimitedClipAmmo(shooter, 999);
     }
 }
 
@@ -590,35 +629,11 @@ void hook_FirstPersonController_Update(void *instance) {
         }
     }
 
-    // Unlimited Ammo: Top off ammo ONLY once on weapon change or toggle-on on the Unity thread
-    static void *s_lastRefilledShooter = nullptr;
-    static bool s_lastRefilledState = false;
-    bool curAmmoState = g_unlimitedAmmo.load();
-    void *curShooter = g_localPlayerShooter.load();
-    if (curAmmoState) {
-        if (!s_lastRefilledState || curShooter != s_lastRefilledShooter) {
-            s_lastRefilledState = true;
-            s_lastRefilledShooter = curShooter;
-            if (curShooter != nullptr && g_localWeaponProfile.load() != nullptr && g_localWeaponParams.load() != nullptr) {
-                if (isSafeToSetClipAmmo(curShooter)) {
-                    int maxCap = 30;
-                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curShooter) + 0x13C))) {
-                        int cap = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(curShooter) + 0x13C);
-                        if (cap > 0 && cap <= 500) {
-                            maxCap = cap;
-                        }
-                    }
-                    if (old_WeaponShooterBehaviour_SetClipAmmo != nullptr) {
-                        old_WeaponShooterBehaviour_SetClipAmmo(curShooter, maxCap);
-                    } else if (set_ClipAmmo != nullptr) {
-                        set_ClipAmmo(curShooter, maxCap);
-                    }
-                }
-            }
+    if (g_unlimitedAmmo.load()) {
+        void *shooter = g_localPlayerShooter.load();
+        if (shooter != nullptr) {
+            safeApplyUnlimitedClipAmmo(shooter, 999);
         }
-    } else {
-        s_lastRefilledState = false;
-        s_lastRefilledShooter = nullptr;
     }
 
     if (g_noRecoil.load()) {
@@ -666,6 +681,9 @@ bool (*old_WeaponShooterBehaviour_CanShoot)(void *instance) = nullptr;
 bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
     if (instance != nullptr && isClientWeapon(instance)) {
         g_lastPlayerShootMs.store(getCurrentTimeMs());
+        if (g_unlimitedAmmo.load()) {
+            safeApplyUnlimitedClipAmmo(instance, 999);
+        }
         if (g_fastFireRate.load()) {
             return true; // Local weapon can always shoot instantly
         }
@@ -679,16 +697,7 @@ bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
 // 2b. WeaponShooterBehaviour.SetClipAmmo: RVA 0x405A39C
 void hook_WeaponShooterBehaviour_SetClipAmmo(void *instance, int ammo) {
     if (g_unlimitedAmmo.load() && instance != nullptr && isClientWeapon(instance)) {
-        int maxCap = 30;
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x13C))) {
-            int cap = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(instance) + 0x13C);
-            if (cap > 0 && cap <= 500) {
-                maxCap = cap;
-            }
-        }
-        if (ammo < maxCap) {
-            ammo = maxCap;
-        }
+        ammo = 999;
     }
     if (old_WeaponShooterBehaviour_SetClipAmmo != nullptr) {
         old_WeaponShooterBehaviour_SetClipAmmo(instance, ammo);
@@ -699,14 +708,7 @@ void hook_WeaponShooterBehaviour_SetClipAmmo(void *instance, int ammo) {
 int (*old_WeaponShooterBehaviour_GetClipAmmo)(void *instance) = nullptr;
 int hook_WeaponShooterBehaviour_GetClipAmmo(void *instance) {
     if (g_unlimitedAmmo.load() && instance != nullptr && isClientWeapon(instance)) {
-        int maxCap = 30;
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x13C))) {
-            int cap = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(instance) + 0x13C);
-            if (cap > 0 && cap <= 500) {
-                maxCap = cap;
-            }
-        }
-        return maxCap;
+        return 999;
     }
     if (old_WeaponShooterBehaviour_GetClipAmmo != nullptr) {
         return old_WeaponShooterBehaviour_GetClipAmmo(instance);
@@ -769,6 +771,12 @@ bool hook_ShootCoroutine_MoveNext(void *instance) {
             void *fpc = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x20);
             if (fpc == g_localPlayerFPC.load() && fpc != nullptr) {
                 g_lastPlayerShootMs.store(getCurrentTimeMs());
+                if (g_unlimitedAmmo.load()) {
+                    void *shooter = g_localPlayerShooter.load();
+                    if (shooter != nullptr) {
+                        safeApplyUnlimitedClipAmmo(shooter, 999);
+                    }
+                }
                 if (g_fastFireRate.load()) {
                     // Do NOT force IsImmediate (at +0x28) to true!
                     // Forcing IsImmediate = true breaks hip fire and causes auto-scoping on sniper/rifle weapons.
