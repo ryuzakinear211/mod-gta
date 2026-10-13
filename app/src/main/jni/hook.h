@@ -80,6 +80,13 @@ namespace Offsets {
     constexpr uintptr_t UNITY_OBJECT_GET_NAME              = 0x85A392C;
     constexpr uintptr_t UI_TEXT_GET_TEXT                   = 0x86FFFC8;
     constexpr uintptr_t ITEM_BEHAVIOUR_AWAKE               = 0x5294D74;
+    constexpr uintptr_t ITEM_BEHAVIOUR_START               = 0x5293EB4;
+    constexpr uintptr_t ITEM_WEAPON_INIT1                  = 0x5160388;
+    constexpr uintptr_t ITEM_WEAPON_INIT2                  = 0x51604DC;
+    constexpr uintptr_t ITEM_WEAPON_INIT3                  = 0x5160684;
+    constexpr uintptr_t FPC_SET_CURRENT_WEAPON             = 0x408FCD4;
+    constexpr uintptr_t FPC_SET_CURRENT_WEAPON2            = 0x40A5788;
+    constexpr uintptr_t FPC_EQUIP_COROUTINE                = 0x4097C90;
     constexpr uintptr_t MAIN_MENU_SCROLL_ITEM_SET_DATA     = 0x4FA985C;
 
     // ---------------------------------------------------------------------

@@ -384,6 +384,7 @@ struct DiscoveredWeapon {
     void *profile;       // WeaponProfile (+0x80)
     void *params;        // WeaponParameters (+0x88)
     void *settings;      // WeaponSettings (+0x98)
+    void *weaponKey;     // WeaponKey (+0x108)
     int equipmentSlot;   // EquipmentSlot (+0x90, 0 = Primary)
 };
 
@@ -398,6 +399,7 @@ static void *g_origPrimaryWeapon = nullptr;
 static void *g_origWeaponProfile = nullptr;
 static void *g_origWeaponParams = nullptr;
 static void *g_origWeaponSettings = nullptr;
+static void *g_origWeaponKey = nullptr;
 static bool g_hasSavedOrigWeapon = false;
 
 // Global JNI Cache for dynamic Java UI calls
@@ -484,6 +486,9 @@ static void restoreOriginalPrimaryWeapon() {
         if (g_origWeaponSettings != nullptr) {
             *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98) = g_origWeaponSettings;
         }
+        if (g_origWeaponKey != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x108))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x108) = g_origWeaponKey;
+        }
     }
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x48))) {
         void *slotsArray = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x48);
@@ -529,12 +534,20 @@ static void applySelectedWeaponSwap() {
         target = g_discoveredWeapons[idx];
     }
 
-    // 1. Save original weapon pointers before swapping if not yet saved
+    // 1. Resolve current active weapon
     void *curWeapon = nullptr;
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
+    if (get_CurrentWeapon != nullptr) {
+        curWeapon = get_CurrentWeapon(fpc);
+    }
+    if (curWeapon == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
         curWeapon = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50);
     }
-    if (!g_hasSavedOrigWeapon && curWeapon != nullptr && isPointerReadable(curWeapon)) {
+    if (curWeapon == nullptr || !isPointerReadable(curWeapon)) {
+        return;
+    }
+
+    // 2. Save original weapon pointers before swapping if not yet saved
+    if (!g_hasSavedOrigWeapon) {
         g_origPrimaryWeapon = curWeapon;
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x80))) {
             g_origWeaponProfile = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x80);
@@ -545,30 +558,31 @@ static void applySelectedWeaponSwap() {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98))) {
             g_origWeaponSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98);
         }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x108))) {
+            g_origWeaponKey = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x108);
+        }
         g_hasSavedOrigWeapon = true;
     }
 
-    // 2. If target has a valid live ItemBehaviour, swap the current equipped weapon pointer directly
-    if (target.itemBehaviour != nullptr && isPointerReadable(target.itemBehaviour) && isUnityObjectAlive(target.itemBehaviour)) {
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50) = target.itemBehaviour;
+    // 3. Swap WeaponProfile (+0x80), WeaponParameters (+0x88), WeaponSettings (+0x98), WeaponKey (+0x108)
+    if (target.profile != nullptr && isPointerReadable(target.profile)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x80))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x80) = target.profile;
         }
     }
-
-    // 3. Swap WeaponProfile (+0x80), WeaponParameters (+0x88), and WeaponSettings (+0x98)
-    void *activeW = nullptr;
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
-        activeW = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50);
+    if (target.params != nullptr && isPointerReadable(target.params)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x88))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x88) = target.params;
+        }
     }
-    if (activeW != nullptr && isPointerReadable(activeW)) {
-        if (target.profile != nullptr && isPointerReadable(target.profile)) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(activeW) + 0x80) = target.profile;
+    if (target.settings != nullptr && isPointerReadable(target.settings)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98) = target.settings;
         }
-        if (target.params != nullptr && isPointerReadable(target.params)) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(activeW) + 0x88) = target.params;
-        }
-        if (target.settings != nullptr && isPointerReadable(target.settings)) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(activeW) + 0x98) = target.settings;
+    }
+    if (target.weaponKey != nullptr && isPointerReadable(target.weaponKey)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x108))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x108) = target.weaponKey;
         }
     }
 
@@ -583,9 +597,6 @@ static void applySelectedWeaponSwap() {
                     uintptr_t slotAddr = elemBase + i * 0x20;
                     int slotType = *reinterpret_cast<int *>(slotAddr + 0x18);
                     if (slotType == 0) { // Primary weapon slot
-                        if (target.itemBehaviour != nullptr && isPointerReadable(target.itemBehaviour) && isUnityObjectAlive(target.itemBehaviour)) {
-                            *reinterpret_cast<void **>(slotAddr + 0x0) = target.itemBehaviour;
-                        }
                         if (target.settings != nullptr && isPointerReadable(target.settings)) {
                             *reinterpret_cast<void **>(slotAddr + 0x8) = target.settings;
                         }
@@ -596,20 +607,24 @@ static void applySelectedWeaponSwap() {
         }
     }
 
+    // 5. If target has a valid live ItemBehaviour in the current scene, swap the equipped instance directly
+    if (target.itemBehaviour != nullptr && isPointerReadable(target.itemBehaviour) && isUnityObjectAlive(target.itemBehaviour)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50) = target.itemBehaviour;
+        }
+    }
+
     g_primaryWeaponSwapApplied = true;
     updateLocalPlayerWeapon(fpc);
-    ModLog("[WEAPON_SWAP] Applied primary weapon swap -> Target: '%s' (Item: %p, Prof: %p, Settings: %p)",
-           target.name.c_str(), target.itemBehaviour, target.profile, target.settings);
+    ModLog("[WEAPON_SWAP] Applied primary weapon swap -> Target: '%s' (Item: %p, Prof: %p, Params: %p, Key: %p, Settings: %p)",
+           target.name.c_str(), target.itemBehaviour, target.profile, target.params, target.weaponKey, target.settings);
 }
 
 // ---------------------------------------------------------------------
-// Lobby & Match Weapon Hooks: ItemBehaviour.Awake & Scroll Item SetData
+// Lobby & Match Weapon Hooks: Discovery, Pickup Transmutation, and Equipping
 // ---------------------------------------------------------------------
-void (*old_ItemBehaviour_Awake)(void *instance) = nullptr;
-void hook_ItemBehaviour_Awake(void *instance) {
-    if (old_ItemBehaviour_Awake != nullptr) {
-        old_ItemBehaviour_Awake(instance);
-    }
+
+static void registerWeaponData(void *instance, void *key, void *profile, int slot, const char *source) {
     if (instance == nullptr || !isPointerReadable(instance) || !isUnityObjectAlive(instance)) {
         return;
     }
@@ -626,21 +641,29 @@ void hook_ItemBehaviour_Awake(void *instance) {
         name = buf;
     }
 
-    void *prof = nullptr;
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x80))) {
+    void *prof = profile;
+    if (prof == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x80))) {
         prof = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x80);
     }
+
     void *params = nullptr;
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x88))) {
         params = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x88);
     }
-    int slot = -1;
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x90))) {
-        slot = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(instance) + 0x90);
+
+    int eqSlot = slot;
+    if (eqSlot < 0 && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x90))) {
+        eqSlot = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(instance) + 0x90);
     }
+
     void *settings = nullptr;
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x98))) {
         settings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x98);
+    }
+
+    void *wKey = key;
+    if (wKey == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x108))) {
+        wKey = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x108);
     }
 
     {
@@ -652,60 +675,211 @@ void hook_ItemBehaviour_Awake(void *instance) {
                 if (prof) w.profile = prof;
                 if (params) w.params = params;
                 if (settings) w.settings = settings;
-                if (slot >= 0) w.equipmentSlot = slot;
+                if (wKey) w.weaponKey = wKey;
+                if (eqSlot >= 0) w.equipmentSlot = eqSlot;
                 found = true;
+                ModLog("[INVENTORY] Updated '%s' via %s (Item: %p, Prof: %p, Params: %p, Key: %p, Slot: %d)",
+                       w.name.c_str(), source, instance, w.profile, w.params, w.weaponKey, w.equipmentSlot);
                 break;
             }
         }
         if (!found) {
-            g_discoveredWeapons.push_back({name, instance, prof, params, settings, slot});
-            ModLog("[INVENTORY] Discovered new weapon: '%s' (Item: %p, Prof: %p, Slot: %d)",
-                   name.c_str(), instance, prof, slot);
+            g_discoveredWeapons.push_back({name, instance, prof, params, settings, wKey, eqSlot});
+            ModLog("[INVENTORY] Discovered new weapon via %s: '%s' (Item: %p, Prof: %p, Params: %p, Key: %p, Slot: %d)",
+                   source, name.c_str(), instance, prof, params, wKey, eqSlot);
         }
     }
 }
 
+// 1. ItemBehaviour.Awake (0x5294D74)
+void (*old_ItemBehaviour_Awake)(void *instance) = nullptr;
+void hook_ItemBehaviour_Awake(void *instance) {
+    if (old_ItemBehaviour_Awake != nullptr) {
+        old_ItemBehaviour_Awake(instance);
+    }
+    registerWeaponData(instance, nullptr, nullptr, -1, "Awake");
+}
+
+// 2. ItemBehaviour.Start (0x5293EB4)
+void (*old_ItemBehaviour_Start)(void *instance) = nullptr;
+void hook_ItemBehaviour_Start(void *instance) {
+    if (old_ItemBehaviour_Start != nullptr) {
+        old_ItemBehaviour_Start(instance);
+    }
+    registerWeaponData(instance, nullptr, nullptr, -1, "Start");
+}
+
+// 3. ItemWeaponBehaviour.Init1 (0x5160388)
+void (*old_ItemWeapon_Init1)(void *instance, void *key, void *profile, int slot) = nullptr;
+void hook_ItemWeapon_Init1(void *instance, void *key, void *profile, int slot) {
+    if (old_ItemWeapon_Init1 != nullptr) {
+        old_ItemWeapon_Init1(instance, key, profile, slot);
+    }
+    registerWeaponData(instance, key, profile, slot, "Init1");
+}
+
+// 4. ItemWeaponBehaviour.Init2 (0x51604DC)
+void (*old_ItemWeapon_Init2)(void *instance, void *key, void *profile, int slot) = nullptr;
+void hook_ItemWeapon_Init2(void *instance, void *key, void *profile, int slot) {
+    if (old_ItemWeapon_Init2 != nullptr) {
+        old_ItemWeapon_Init2(instance, key, profile, slot);
+    }
+    registerWeaponData(instance, key, profile, slot, "Init2");
+}
+
+// 5. ItemWeaponBehaviour.Init3 (0x5160684)
+void (*old_ItemWeapon_Init3)(void *instance, void *key, void *profile, int slot) = nullptr;
+void hook_ItemWeapon_Init3(void *instance, void *key, void *profile, int slot) {
+    if (old_ItemWeapon_Init3 != nullptr) {
+        old_ItemWeapon_Init3(instance, key, profile, slot);
+    }
+    registerWeaponData(instance, key, profile, slot, "Init3");
+}
+
+// 6. FirstPersonController.SetCurrentWeapon (0x408FCD4) - Intercepts In-Game Weapon Pickup & Switch
+void (*old_FPC_SetCurrentWeapon)(void *instance, void *weapon) = nullptr;
+void hook_FPC_SetCurrentWeapon(void *instance, void *weapon) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        g_localPlayerFPC.store(instance);
+    }
+    int selIdx = g_selectedWeaponIdx.load();
+    if (selIdx > 0 && weapon != nullptr && isPointerReadable(weapon)) {
+        DiscoveredWeapon target;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(g_weaponListMutex);
+            size_t idx = static_cast<size_t>(selIdx - 1);
+            if (idx < g_discoveredWeapons.size()) {
+                target = g_discoveredWeapons[idx];
+                found = true;
+            }
+        }
+        if (found) {
+            if (target.profile != nullptr && isPointerReadable(target.profile)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x80))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x80) = target.profile;
+                }
+            }
+            if (target.params != nullptr && isPointerReadable(target.params)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x88))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x88) = target.params;
+                }
+            }
+            if (target.settings != nullptr && isPointerReadable(target.settings)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x98))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x98) = target.settings;
+                }
+            }
+            if (target.weaponKey != nullptr && isPointerReadable(target.weaponKey)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x108))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x108) = target.weaponKey;
+                }
+            }
+            ModLog("[WEAPON_PICKUP] SetCurrentWeapon -> Transmuted pickup weapon %p to '%s' (Prof: %p, Params: %p, Key: %p)",
+                   weapon, target.name.c_str(), target.profile, target.params, target.weaponKey);
+        }
+    }
+
+    if (old_FPC_SetCurrentWeapon != nullptr) {
+        old_FPC_SetCurrentWeapon(instance, weapon);
+    }
+
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        updateLocalPlayerWeapon(instance);
+    }
+}
+
+// 7. FirstPersonController.SetCurrentWeapon2 (0x40A5788) - Secondary Weapon Switch/Pickup Handler
+void (*old_FPC_SetCurrentWeapon2)(void *instance, void *weapon) = nullptr;
+void hook_FPC_SetCurrentWeapon2(void *instance, void *weapon) {
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        g_localPlayerFPC.store(instance);
+    }
+    int selIdx = g_selectedWeaponIdx.load();
+    if (selIdx > 0 && weapon != nullptr && isPointerReadable(weapon)) {
+        DiscoveredWeapon target;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(g_weaponListMutex);
+            size_t idx = static_cast<size_t>(selIdx - 1);
+            if (idx < g_discoveredWeapons.size()) {
+                target = g_discoveredWeapons[idx];
+                found = true;
+            }
+        }
+        if (found) {
+            if (target.profile != nullptr && isPointerReadable(target.profile)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x80))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x80) = target.profile;
+                }
+            }
+            if (target.params != nullptr && isPointerReadable(target.params)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x88))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x88) = target.params;
+                }
+            }
+            if (target.settings != nullptr && isPointerReadable(target.settings)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x98))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x98) = target.settings;
+                }
+            }
+            if (target.weaponKey != nullptr && isPointerReadable(target.weaponKey)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(weapon) + 0x108))) {
+                    *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(weapon) + 0x108) = target.weaponKey;
+                }
+            }
+            ModLog("[WEAPON_PICKUP] SetCurrentWeapon2 -> Transmuted weapon %p to '%s' (Prof: %p, Params: %p, Key: %p)",
+                   weapon, target.name.c_str(), target.profile, target.params, target.weaponKey);
+        }
+    }
+
+    if (old_FPC_SetCurrentWeapon2 != nullptr) {
+        old_FPC_SetCurrentWeapon2(instance, weapon);
+    }
+
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        updateLocalPlayerWeapon(instance);
+    }
+}
+
+// 8. FirstPersonController.EquipWeaponCoroutine (0x4097C90) - Equip Coroutine Interception
+void* (*old_FPC_EquipCoroutine)(void *instance, int slot, void *key, void *profile, int reason) = nullptr;
+void* hook_FPC_EquipCoroutine(void *instance, int slot, void *key, void *profile, int reason) {
+    int selIdx = g_selectedWeaponIdx.load();
+    if (selIdx > 0 && slot == 0) { // Primary weapon slot
+        DiscoveredWeapon target;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(g_weaponListMutex);
+            size_t idx = static_cast<size_t>(selIdx - 1);
+            if (idx < g_discoveredWeapons.size()) {
+                target = g_discoveredWeapons[idx];
+                found = true;
+            }
+        }
+        if (found) {
+            if (target.weaponKey != nullptr && isPointerReadable(target.weaponKey)) {
+                key = target.weaponKey;
+            }
+            if (target.profile != nullptr && isPointerReadable(target.profile)) {
+                profile = target.profile;
+            }
+            ModLog("[WEAPON_EQUIP] EquipCoroutine intercepted -> slot %d transmuted to '%s' (Key: %p, Prof: %p)",
+                   slot, target.name.c_str(), key, profile);
+        }
+    }
+
+    if (old_FPC_EquipCoroutine != nullptr) {
+        return old_FPC_EquipCoroutine(instance, slot, key, profile, reason);
+    }
+    return nullptr;
+}
+
+// 9. MainMenuUiWeaponInventoryScrollItem.SetData (0x4FA985C)
 void (*old_MainMenuUiWeaponInventoryScrollItem_SetData)(void *instance, void *data) = nullptr;
 void hook_MainMenuUiWeaponInventoryScrollItem_SetData(void *instance, void *data) {
     if (old_MainMenuUiWeaponInventoryScrollItem_SetData != nullptr) {
         old_MainMenuUiWeaponInventoryScrollItem_SetData(instance, data);
-    }
-    if (instance == nullptr || !isPointerReadable(instance)) return;
-
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x80))) {
-        void *textObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x80);
-        if (textObj != nullptr && isPointerReadable(textObj) && Text_get_text != nullptr) {
-            void *strObj = Text_get_text(textObj);
-            std::string rawName = readIl2CppString(strObj);
-            std::string name = cleanWeaponName(rawName);
-            if (!name.empty()) {
-                std::lock_guard<std::mutex> lock(g_weaponListMutex);
-                bool found = false;
-                for (auto &w : g_discoveredWeapons) {
-                    if (w.name == name) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    g_discoveredWeapons.push_back({name, nullptr, nullptr, nullptr, nullptr, 0});
-                    ModLog("[INVENTORY] Discovered scroll weapon: '%s'", name.c_str());
-                }
-            }
-        }
-    }
-}
-
-static void initDefaultWeaponCatalog() {
-    std::lock_guard<std::mutex> lock(g_weaponListMutex);
-    if (!g_discoveredWeapons.empty()) return;
-    const char *defaults[] = {
-        "M1 Garand", "Kar98k", "PPSh-41", "Thompson M1928", "Mosin-Nagant",
-        "StG 44", "MP 40", "BAR M1918", "Springfield 1903", "Lee-Enfield",
-        "G43", "Type 99", "PPS-43", "Browning M1919", "DP-27", "MG 42"
-    };
-    for (const char *wName : defaults) {
-        g_discoveredWeapons.push_back({wName, nullptr, nullptr, nullptr, nullptr, 0});
     }
 }
 
@@ -1025,6 +1199,7 @@ void hook_FirstPersonController_OnDestroy(void *instance) {
         g_origWeaponProfile = nullptr;
         g_origWeaponParams = nullptr;
         g_origWeaponSettings = nullptr;
+        g_origWeaponKey = nullptr;
         resetEntityCounters();
         onESPClear();
         resetAimAssistState();
@@ -3068,6 +3243,13 @@ static void registerAllHooks() {
 
     // 6. Lobby & Match Inventory Weapon Hooks
     mgr.registerHook(Offsets::ITEM_BEHAVIOUR_AWAKE,                reinterpret_cast<void*>(hook_ItemBehaviour_Awake),                          reinterpret_cast<void**>(&old_ItemBehaviour_Awake),                          "ItemBehaviour.Awake");
+    mgr.registerHook(Offsets::ITEM_BEHAVIOUR_START,                reinterpret_cast<void*>(hook_ItemBehaviour_Start),                          reinterpret_cast<void**>(&old_ItemBehaviour_Start),                          "ItemBehaviour.Start");
+    mgr.registerHook(Offsets::ITEM_WEAPON_INIT1,                   reinterpret_cast<void*>(hook_ItemWeapon_Init1),                             reinterpret_cast<void**>(&old_ItemWeapon_Init1),                             "ItemWeaponBehaviour.Init1");
+    mgr.registerHook(Offsets::ITEM_WEAPON_INIT2,                   reinterpret_cast<void*>(hook_ItemWeapon_Init2),                             reinterpret_cast<void**>(&old_ItemWeapon_Init2),                             "ItemWeaponBehaviour.Init2");
+    mgr.registerHook(Offsets::ITEM_WEAPON_INIT3,                   reinterpret_cast<void*>(hook_ItemWeapon_Init3),                             reinterpret_cast<void**>(&old_ItemWeapon_Init3),                             "ItemWeaponBehaviour.Init3");
+    mgr.registerHook(Offsets::FPC_SET_CURRENT_WEAPON,             reinterpret_cast<void*>(hook_FPC_SetCurrentWeapon),                         reinterpret_cast<void**>(&old_FPC_SetCurrentWeapon),                         "FirstPersonController.SetCurrentWeapon");
+    mgr.registerHook(Offsets::FPC_SET_CURRENT_WEAPON2,            reinterpret_cast<void*>(hook_FPC_SetCurrentWeapon2),                        reinterpret_cast<void**>(&old_FPC_SetCurrentWeapon2),                        "FirstPersonController.SetCurrentWeapon2");
+    mgr.registerHook(Offsets::FPC_EQUIP_COROUTINE,                reinterpret_cast<void*>(hook_FPC_EquipCoroutine),                           reinterpret_cast<void**>(&old_FPC_EquipCoroutine),                           "FirstPersonController.EquipCoroutine");
     mgr.registerHook(Offsets::MAIN_MENU_SCROLL_ITEM_SET_DATA,     reinterpret_cast<void*>(hook_MainMenuUiWeaponInventoryScrollItem_SetData), reinterpret_cast<void**>(&old_MainMenuUiWeaponInventoryScrollItem_SetData), "MainMenuUiWeaponInventoryScrollItem.SetData");
 }
 
@@ -3087,7 +3269,6 @@ void *hack_thread(void *) {
 
     initSafetyPipe();
     initAllFunctionPointers(base);
-    initDefaultWeaponCatalog();
 
 #if defined(__aarch64__)
     ModLog("[HOOK] Installing hooks on libil2cpp.so via HookManager (arm64-v8a)...");
@@ -3357,8 +3538,36 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 16: { // 16_Button_🔄 Fetch Inventory Weapons (Lobby)
+        case 16: { // 16_Button_🔄 Fetch Inventory Weapons (Lobby & In-Game)
             setLastAction("Button Fetch Inventory Weapons clicked");
+
+            // 1. Refresh live pointers for all registered weapons
+            {
+                std::lock_guard<std::mutex> lock(g_weaponListMutex);
+                for (auto &w : g_discoveredWeapons) {
+                    if (w.itemBehaviour != nullptr && isPointerReadable(w.itemBehaviour) && isUnityObjectAlive(w.itemBehaviour)) {
+                        if (w.profile == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x80))) {
+                            w.profile = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x80);
+                        }
+                        if (w.params == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x88))) {
+                            w.params = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x88);
+                        }
+                        if (w.settings == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x98))) {
+                            w.settings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x98);
+                        }
+                        if (w.weaponKey == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x108))) {
+                            w.weaponKey = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(w.itemBehaviour) + 0x108);
+                        }
+                    }
+                }
+            }
+
+            // 2. If in match, also capture current player weapon
+            void *curWeapon = g_localPlayerWeapon.load();
+            if (curWeapon != nullptr && isPointerReadable(curWeapon) && isUnityObjectAlive(curWeapon)) {
+                registerWeaponData(curWeapon, nullptr, g_localWeaponProfile.load(), 0, "InGameFetch");
+            }
+
             std::string listStr = "Default Weapon (Current)";
             size_t count = 0;
             {
