@@ -56,6 +56,8 @@ import android.widget.Toast;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 
 import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
@@ -66,6 +68,8 @@ import org.xml.sax.ErrorHandler;
 
 public class Menu {
     //********** Here you can easly change the menu appearance **********//
+
+    public static final Map<Integer, Spinner> spinners = new HashMap<>();
 
     //region Variable
     public static final String TAG = "Mod_Menu"; //Tag for logcat
@@ -1041,8 +1045,38 @@ public class Menu {
             public void onNothingSelected(AdapterView<?> parent) {
             }
         });
+        spinners.put(featNum, spinner);
         linearLayout2.addView(spinner);
         linLayout.addView(linearLayout2);
+    }
+
+    public static void updateSpinnerList(final int featNum, final String list) {
+        if (instance != null && spinners.containsKey(featNum)) {
+            final Spinner sp = spinners.get(featNum);
+            if (sp != null) {
+                sp.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        List<String> lists = new LinkedList<>(Arrays.asList(list.split(",")));
+                        ArrayAdapter aa = new ArrayAdapter(instance.getContext, android.R.layout.simple_spinner_dropdown_item, lists);
+                        aa.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+                        sp.setAdapter(aa);
+                    }
+                });
+            }
+        }
+    }
+
+    public static void refreshMenu() {
+        if (instance != null && instance.mods != null) {
+            instance.mods.post(new Runnable() {
+                @Override
+                public void run() {
+                    instance.mods.removeAllViews();
+                    instance.featureList(instance.GetFeatureList(), instance.mods);
+                }
+            });
+        }
     }
 
     private void InputNum(LinearLayout linLayout, final int featNum, final String featName, final int maxValue) {

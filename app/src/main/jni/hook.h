@@ -77,6 +77,10 @@ namespace Offsets {
     constexpr uintptr_t AIMING_CONTROL_RECOIL1              = 0x4D27AB8;
     constexpr uintptr_t AIMING_CONTROL_RECOIL2              = 0x4D27E20;
     constexpr uintptr_t AIMING_CONTROL_RECOIL3              = 0x4D284B0;
+    constexpr uintptr_t UNITY_OBJECT_GET_NAME              = 0x85A392C;
+    constexpr uintptr_t UI_TEXT_GET_TEXT                   = 0x86FFFC8;
+    constexpr uintptr_t ITEM_BEHAVIOUR_AWAKE               = 0x5294D74;
+    constexpr uintptr_t MAIN_MENU_SCROLL_ITEM_SET_DATA     = 0x4FA985C;
 
     // ---------------------------------------------------------------------
     // Entity Lifecycle & Target Filtering RVAs
@@ -417,6 +421,10 @@ inline void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
 inline int (*BotPlayer_GetTeam)(void *) = nullptr;
 inline float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
 
+// Inventory & Weapon Inspection Pointers
+inline void* (*Object_get_name)(void *) = nullptr;
+inline void* (*Text_get_text)(void *) = nullptr;
+
 // Safe wrapper to set local scale on a Transform
 inline void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
     if (transformObj == nullptr || !isUnityObjectAlive(transformObj) || set_localScale_Injected == nullptr) return;
@@ -529,6 +537,8 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::AIMING_CONTROL_ADD_DELTA,            AimingControl_AddDelta,        "AimingControl_AddDelta");
     resolvePointer(base, Offsets::BOT_PLAYER_GET_TEAM,                 BotPlayer_GetTeam,             "BotPlayer_GetTeam");
     resolvePointer(base, Offsets::BOT_PLAYER_HEALTH_GET_HEALTH,        BotPlayerHealth_GetHealth,     "BotPlayerHealth_GetHealth");
+    resolvePointer(base, Offsets::UNITY_OBJECT_GET_NAME,               Object_get_name,               "Object_get_name");
+    resolvePointer(base, Offsets::UI_TEXT_GET_TEXT,                    Text_get_text,                 "Text_get_text");
 }
 
 // =========================================================================

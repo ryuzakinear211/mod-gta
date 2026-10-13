@@ -375,6 +375,340 @@ static uint64_t g_lastWeaponLogMs = 0;
 static int g_origShootAction = -1;
 static bool g_hasOrigShootAction = false;
 
+// =========================================================================
+// Lobby Inventory Weapon Discovery & Primary Weapon Swapping Structures
+// =========================================================================
+struct DiscoveredWeapon {
+    std::string name;
+    void *itemBehaviour; // ItemBehaviour instance
+    void *profile;       // WeaponProfile (+0x80)
+    void *params;        // WeaponParameters (+0x88)
+    void *settings;      // WeaponSettings (+0x98)
+    int equipmentSlot;   // EquipmentSlot (+0x90, 0 = Primary)
+};
+
+static std::mutex g_weaponListMutex;
+static std::vector<DiscoveredWeapon> g_discoveredWeapons;
+static std::atomic<int> g_selectedWeaponIdx{0};
+static std::atomic<bool> g_pendingPrimaryWeaponSwap{false};
+static bool g_primaryWeaponSwapApplied = false;
+
+// Backup of original player primary weapon
+static void *g_origPrimaryWeapon = nullptr;
+static void *g_origWeaponProfile = nullptr;
+static void *g_origWeaponParams = nullptr;
+static void *g_origWeaponSettings = nullptr;
+static bool g_hasSavedOrigWeapon = false;
+
+// Global JNI Cache for dynamic Java UI calls
+static JavaVM *g_jvm = nullptr;
+static jclass g_menuClassGlobal = nullptr;
+static jmethodID g_updateSpinnerMid = nullptr;
+
+static void updateLocalPlayerWeapon(void *fpc);
+
+static std::string cleanWeaponName(const std::string &raw) {
+    if (raw.empty()) return "";
+    std::string name = raw;
+    size_t clonePos = name.find("(Clone)");
+    if (clonePos != std::string::npos) {
+        name = name.substr(0, clonePos);
+    }
+    if (name.rfind("Weapon_", 0) == 0) {
+        name = name.substr(7);
+    }
+    if (name.rfind("Item_", 0) == 0) {
+        name = name.substr(5);
+    }
+    for (char &c : name) {
+        if (c == '_') c = ' ';
+    }
+    while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) name.erase(name.begin());
+    while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+    return name;
+}
+
+static void callUpdateSpinnerList(int featNum, const std::string &listStr) {
+    if (g_jvm == nullptr) return;
+    JNIEnv *env = nullptr;
+    jint res = g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    bool shouldDetach = false;
+    if (res == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != 0) {
+            return;
+        }
+        shouldDetach = true;
+    } else if (res != JNI_OK || env == nullptr) {
+        return;
+    }
+
+    if (g_menuClassGlobal != nullptr && g_updateSpinnerMid != nullptr) {
+        jstring jList = env->NewStringUTF(listStr.c_str());
+        env->CallStaticVoidMethod(g_menuClassGlobal, g_updateSpinnerMid, featNum, jList);
+        env->DeleteLocalRef(jList);
+    } else {
+        jclass clazz = env->FindClass("com/android/support/Menu");
+        if (clazz != nullptr) {
+            jmethodID mid = env->GetStaticMethodID(clazz, "updateSpinnerList", "(ILjava/lang/String;)V");
+            if (mid != nullptr) {
+                jstring jList = env->NewStringUTF(listStr.c_str());
+                env->CallStaticVoidMethod(clazz, mid, featNum, jList);
+                env->DeleteLocalRef(jList);
+            }
+            env->DeleteLocalRef(clazz);
+        }
+    }
+
+    if (shouldDetach) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
+static void restoreOriginalPrimaryWeapon() {
+    void *fpc = g_localPlayerFPC.load();
+    if (fpc == nullptr || !isUnityObjectAlive(fpc)) return;
+
+    if (g_origPrimaryWeapon != nullptr && isPointerReadable(g_origPrimaryWeapon)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50) = g_origPrimaryWeapon;
+        }
+    }
+    void *curWeapon = g_localPlayerWeapon.load();
+    if (curWeapon != nullptr && isPointerReadable(curWeapon)) {
+        if (g_origWeaponProfile != nullptr) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x80) = g_origWeaponProfile;
+        }
+        if (g_origWeaponParams != nullptr) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x88) = g_origWeaponParams;
+        }
+        if (g_origWeaponSettings != nullptr) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98) = g_origWeaponSettings;
+        }
+    }
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x48))) {
+        void *slotsArray = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x48);
+        if (slotsArray != nullptr && isPointerReadable(slotsArray)) {
+            int32_t count = *reinterpret_cast<int32_t *>(reinterpret_cast<uintptr_t>(slotsArray) + 0x18);
+            if (count > 0 && count < 16) {
+                uintptr_t elemBase = reinterpret_cast<uintptr_t>(slotsArray) + 0x20;
+                for (int i = 0; i < count; i++) {
+                    uintptr_t slotAddr = elemBase + i * 0x20;
+                    int slotType = *reinterpret_cast<int *>(slotAddr + 0x18);
+                    if (slotType == 0) { // Primary
+                        if (g_origPrimaryWeapon != nullptr) {
+                            *reinterpret_cast<void **>(slotAddr + 0x0) = g_origPrimaryWeapon;
+                        }
+                        if (g_origWeaponSettings != nullptr) {
+                            *reinterpret_cast<void **>(slotAddr + 0x8) = g_origWeaponSettings;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    g_primaryWeaponSwapApplied = false;
+    updateLocalPlayerWeapon(fpc);
+    ModLog("[WEAPON_SWAP] Restored default primary weapon");
+}
+
+static void applySelectedWeaponSwap() {
+    int selIdx = g_selectedWeaponIdx.load();
+    if (selIdx <= 0) return;
+
+    void *fpc = g_localPlayerFPC.load();
+    if (fpc == nullptr || !isPointerReadable(fpc) || !isUnityObjectAlive(fpc)) {
+        return;
+    }
+
+    DiscoveredWeapon target;
+    {
+        std::lock_guard<std::mutex> lock(g_weaponListMutex);
+        size_t idx = static_cast<size_t>(selIdx - 1);
+        if (idx >= g_discoveredWeapons.size()) return;
+        target = g_discoveredWeapons[idx];
+    }
+
+    // 1. Save original weapon pointers before swapping if not yet saved
+    void *curWeapon = nullptr;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
+        curWeapon = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50);
+    }
+    if (!g_hasSavedOrigWeapon && curWeapon != nullptr && isPointerReadable(curWeapon)) {
+        g_origPrimaryWeapon = curWeapon;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x80))) {
+            g_origWeaponProfile = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x80);
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x88))) {
+            g_origWeaponParams = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x88);
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98))) {
+            g_origWeaponSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(curWeapon) + 0x98);
+        }
+        g_hasSavedOrigWeapon = true;
+    }
+
+    // 2. If target has a valid live ItemBehaviour, swap the current equipped weapon pointer directly
+    if (target.itemBehaviour != nullptr && isPointerReadable(target.itemBehaviour) && isUnityObjectAlive(target.itemBehaviour)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50) = target.itemBehaviour;
+        }
+    }
+
+    // 3. Swap WeaponProfile (+0x80), WeaponParameters (+0x88), and WeaponSettings (+0x98)
+    void *activeW = nullptr;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x50))) {
+        activeW = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50);
+    }
+    if (activeW != nullptr && isPointerReadable(activeW)) {
+        if (target.profile != nullptr && isPointerReadable(target.profile)) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(activeW) + 0x80) = target.profile;
+        }
+        if (target.params != nullptr && isPointerReadable(target.params)) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(activeW) + 0x88) = target.params;
+        }
+        if (target.settings != nullptr && isPointerReadable(target.settings)) {
+            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(activeW) + 0x98) = target.settings;
+        }
+    }
+
+    // 4. Update Slot 0 (EquipmentSlot.Primary) in fpc + 0x48 slots array
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0x48))) {
+        void *slotsArray = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x48);
+        if (slotsArray != nullptr && isPointerReadable(slotsArray)) {
+            int32_t count = *reinterpret_cast<int32_t *>(reinterpret_cast<uintptr_t>(slotsArray) + 0x18);
+            if (count > 0 && count < 16) {
+                uintptr_t elemBase = reinterpret_cast<uintptr_t>(slotsArray) + 0x20;
+                for (int i = 0; i < count; i++) {
+                    uintptr_t slotAddr = elemBase + i * 0x20;
+                    int slotType = *reinterpret_cast<int *>(slotAddr + 0x18);
+                    if (slotType == 0) { // Primary weapon slot
+                        if (target.itemBehaviour != nullptr && isPointerReadable(target.itemBehaviour) && isUnityObjectAlive(target.itemBehaviour)) {
+                            *reinterpret_cast<void **>(slotAddr + 0x0) = target.itemBehaviour;
+                        }
+                        if (target.settings != nullptr && isPointerReadable(target.settings)) {
+                            *reinterpret_cast<void **>(slotAddr + 0x8) = target.settings;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    g_primaryWeaponSwapApplied = true;
+    updateLocalPlayerWeapon(fpc);
+    ModLog("[WEAPON_SWAP] Applied primary weapon swap -> Target: '%s' (Item: %p, Prof: %p, Settings: %p)",
+           target.name.c_str(), target.itemBehaviour, target.profile, target.settings);
+}
+
+// ---------------------------------------------------------------------
+// Lobby & Match Weapon Hooks: ItemBehaviour.Awake & Scroll Item SetData
+// ---------------------------------------------------------------------
+void (*old_ItemBehaviour_Awake)(void *instance) = nullptr;
+void hook_ItemBehaviour_Awake(void *instance) {
+    if (old_ItemBehaviour_Awake != nullptr) {
+        old_ItemBehaviour_Awake(instance);
+    }
+    if (instance == nullptr || !isPointerReadable(instance) || !isUnityObjectAlive(instance)) {
+        return;
+    }
+
+    std::string rawName;
+    if (Object_get_name != nullptr) {
+        void *strObj = Object_get_name(instance);
+        rawName = readIl2CppString(strObj);
+    }
+    std::string name = cleanWeaponName(rawName);
+    if (name.empty()) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "Weapon_%p", instance);
+        name = buf;
+    }
+
+    void *prof = nullptr;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x80))) {
+        prof = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x80);
+    }
+    void *params = nullptr;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x88))) {
+        params = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x88);
+    }
+    int slot = -1;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x90))) {
+        slot = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(instance) + 0x90);
+    }
+    void *settings = nullptr;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x98))) {
+        settings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x98);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_weaponListMutex);
+        bool found = false;
+        for (auto &w : g_discoveredWeapons) {
+            if (w.name == name || w.itemBehaviour == instance) {
+                w.itemBehaviour = instance;
+                if (prof) w.profile = prof;
+                if (params) w.params = params;
+                if (settings) w.settings = settings;
+                if (slot >= 0) w.equipmentSlot = slot;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_discoveredWeapons.push_back({name, instance, prof, params, settings, slot});
+            ModLog("[INVENTORY] Discovered new weapon: '%s' (Item: %p, Prof: %p, Slot: %d)",
+                   name.c_str(), instance, prof, slot);
+        }
+    }
+}
+
+void (*old_MainMenuUiWeaponInventoryScrollItem_SetData)(void *instance, void *data) = nullptr;
+void hook_MainMenuUiWeaponInventoryScrollItem_SetData(void *instance, void *data) {
+    if (old_MainMenuUiWeaponInventoryScrollItem_SetData != nullptr) {
+        old_MainMenuUiWeaponInventoryScrollItem_SetData(instance, data);
+    }
+    if (instance == nullptr || !isPointerReadable(instance)) return;
+
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x80))) {
+        void *textObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x80);
+        if (textObj != nullptr && isPointerReadable(textObj) && Text_get_text != nullptr) {
+            void *strObj = Text_get_text(textObj);
+            std::string rawName = readIl2CppString(strObj);
+            std::string name = cleanWeaponName(rawName);
+            if (!name.empty()) {
+                std::lock_guard<std::mutex> lock(g_weaponListMutex);
+                bool found = false;
+                for (auto &w : g_discoveredWeapons) {
+                    if (w.name == name) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    g_discoveredWeapons.push_back({name, nullptr, nullptr, nullptr, nullptr, 0});
+                    ModLog("[INVENTORY] Discovered scroll weapon: '%s'", name.c_str());
+                }
+            }
+        }
+    }
+}
+
+static void initDefaultWeaponCatalog() {
+    std::lock_guard<std::mutex> lock(g_weaponListMutex);
+    if (!g_discoveredWeapons.empty()) return;
+    const char *defaults[] = {
+        "M1 Garand", "Kar98k", "PPSh-41", "Thompson M1928", "Mosin-Nagant",
+        "StG 44", "MP 40", "BAR M1918", "Springfield 1903", "Lee-Enfield",
+        "G43", "Type 99", "PPS-43", "Browning M1919", "DP-27", "MG 42"
+    };
+    for (const char *wName : defaults) {
+        g_discoveredWeapons.push_back({wName, nullptr, nullptr, nullptr, nullptr, 0});
+    }
+}
+
 static bool isClientWeapon(void *instance) {
     if (instance == nullptr || !isPointerReadable(instance)) return false;
     void *curShooter = g_localPlayerShooter.load();
@@ -628,6 +962,12 @@ void hook_FirstPersonController_Update(void *instance) {
     }
     setLastAction("FirstPersonController_Update");
     updateLocalPlayerWeapon(instance);
+
+    if (g_pendingPrimaryWeaponSwap.load() || (g_selectedWeaponIdx.load() > 0 && !g_primaryWeaponSwapApplied)) {
+        applySelectedWeaponSwap();
+        g_pendingPrimaryWeaponSwap.store(false);
+    }
+
     if (g_fastFireRate.load()) {
         applyPlayerWeaponMemoryEdits();
     } else if (g_hasOrigShootAction) {
@@ -679,6 +1019,12 @@ void hook_FirstPersonController_OnDestroy(void *instance) {
         g_activeAimAssistManager.store(nullptr);
         g_activeNewAutoAim.store(nullptr);
         g_activeBaseAimAssist.store(nullptr);
+        g_primaryWeaponSwapApplied = false;
+        g_hasSavedOrigWeapon = false;
+        g_origPrimaryWeapon = nullptr;
+        g_origWeaponProfile = nullptr;
+        g_origWeaponParams = nullptr;
+        g_origWeaponSettings = nullptr;
         resetEntityCounters();
         onESPClear();
         resetAimAssistState();
@@ -2719,6 +3065,10 @@ static void registerAllHooks() {
     // 5. Target Filtering Hooks (Ignore Teammates & Allies)
     mgr.registerHook(Offsets::BASE_AIM_ASSIST_IS_VALID_TARGET,     reinterpret_cast<void*>(hook_BaseAimAssist_IsValidTarget),                  reinterpret_cast<void**>(&old_BaseAimAssist_IsValidTarget),                  "BaseAimAssist.IsValidTarget");
     mgr.registerHook(Offsets::NEW_AUTO_AIM_IS_VALID_TARGET,        reinterpret_cast<void*>(hook_NewAutoAim_IsValidTarget),                     reinterpret_cast<void**>(&old_NewAutoAim_IsValidTarget),                     "NewAutoAim.IsValidTarget");
+
+    // 6. Lobby & Match Inventory Weapon Hooks
+    mgr.registerHook(Offsets::ITEM_BEHAVIOUR_AWAKE,                reinterpret_cast<void*>(hook_ItemBehaviour_Awake),                          reinterpret_cast<void**>(&old_ItemBehaviour_Awake),                          "ItemBehaviour.Awake");
+    mgr.registerHook(Offsets::MAIN_MENU_SCROLL_ITEM_SET_DATA,     reinterpret_cast<void*>(hook_MainMenuUiWeaponInventoryScrollItem_SetData), reinterpret_cast<void**>(&old_MainMenuUiWeaponInventoryScrollItem_SetData), "MainMenuUiWeaponInventoryScrollItem.SetData");
 }
 
 // Background thread waiting for libil2cpp.so
@@ -2737,6 +3087,7 @@ void *hack_thread(void *) {
 
     initSafetyPipe();
     initAllFunctionPointers(base);
+    initDefaultWeaponCatalog();
 
 #if defined(__aarch64__)
     ModLog("[HOOK] Installing hooks on libil2cpp.so via HookManager (arm64-v8a)...");
@@ -2768,6 +3119,9 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_Aim Assist (Auto-Lock Radius)"), // featNum 4
         OBFUSCATE("SeekBar_Aim Smoothness (Sticky Lock)_0_100"), // featNum 5
         OBFUSCATE("14_Toggle_Unlimited Ammo (Clip Ammo)"), // featNum 14
+        OBFUSCATE("Category_🎒 INVENTORY & PRIMARY WEAPON SWAP"),
+        OBFUSCATE("16_Button_🔄 Fetch Inventory Weapons (Lobby)"),
+        OBFUSCATE("15_Spinner_Primary Weapon Selector_Default Weapon (Current)"),
         OBFUSCATE("Category_👁️ ESP OVERLAY SYSTEM"),
         OBFUSCATE("Toggle_ESP Master Switch"),           // featNum 6
         OBFUSCATE("Toggle_ESP 2D Box_True"),             // featNum 7
@@ -2967,6 +3321,68 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
+        case 15: { // 15_Spinner_Primary Weapon Selector
+            g_selectedWeaponIdx.store(value);
+            setLastAction("Spinner Primary Weapon changed");
+
+            if (value == 0) {
+                restoreOriginalPrimaryWeapon();
+                Toast(env, ctx, OBFUSCATE("Primary Weapon: Default Weapon (Current)"), ToastLength::LENGTH_SHORT);
+                ModLog("[WEAPON_SWAP] Selected Default Weapon (Current)");
+            } else {
+                std::string chosenName = "Unknown";
+                {
+                    std::lock_guard<std::mutex> lock(g_weaponListMutex);
+                    size_t idx = static_cast<size_t>(value - 1);
+                    if (idx < g_discoveredWeapons.size()) {
+                        chosenName = g_discoveredWeapons[idx].name;
+                    }
+                }
+
+                void *fpc = g_localPlayerFPC.load();
+                if (fpc != nullptr && isUnityObjectAlive(fpc)) {
+                    applySelectedWeaponSwap();
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "Primary Weapon Diset: %s", chosenName.c_str());
+                    Toast(env, ctx, msg, ToastLength::LENGTH_SHORT);
+                } else {
+                    g_pendingPrimaryWeaponSwap.store(true);
+                    char msg[128];
+                    snprintf(msg, sizeof(msg), "Senjata dipilih: %s (Akan aktif pas masuk match)", chosenName.c_str());
+                    Toast(env, ctx, msg, ToastLength::LENGTH_SHORT);
+                }
+                ModLog("[WEAPON_SWAP] Selected weapon #%d: '%s' (InMatch: %d)",
+                       value, chosenName.c_str(), fpc != nullptr ? 1 : 0);
+            }
+            break;
+        }
+
+        case 16: { // 16_Button_🔄 Fetch Inventory Weapons (Lobby)
+            setLastAction("Button Fetch Inventory Weapons clicked");
+            std::string listStr = "Default Weapon (Current)";
+            size_t count = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_weaponListMutex);
+                for (const auto &w : g_discoveredWeapons) {
+                    listStr += ",";
+                    listStr += w.name;
+                    count++;
+                }
+            }
+
+            callUpdateSpinnerList(15, listStr);
+
+            char toastBuf[128];
+            if (count > 0) {
+                snprintf(toastBuf, sizeof(toastBuf), "Inventory Di-fetch! %zu Senjata Siap Dipilih di Dropdown", count);
+            } else {
+                snprintf(toastBuf, sizeof(toastBuf), "Buka menu Persenjataan di Lobby lalu tekan Fetch lagi!");
+            }
+            Toast(env, ctx, toastBuf, ToastLength::LENGTH_LONG);
+            ModLog("[INVENTORY] Fetch button pressed. Sent %zu weapons to Spinner #15.", count);
+            break;
+        }
+
         default:
             ModLog("[TOGGLE] Unknown Feature #%d changed to: val=%d, bool=%d", featNum, value, static_cast<int>(boolean));
             break;
@@ -3045,6 +3461,12 @@ int RegisterMenu(JNIEnv *env) {
         return JNI_ERR;
     if (env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0])) != 0)
         return JNI_ERR;
+
+    if (g_menuClassGlobal == nullptr) {
+        g_menuClassGlobal = reinterpret_cast<jclass>(env->NewGlobalRef(clazz));
+        g_updateSpinnerMid = env->GetStaticMethodID(g_menuClassGlobal, "updateSpinnerList", "(ILjava/lang/String;)V");
+    }
+
     return JNI_OK;
 }
 
@@ -3076,6 +3498,7 @@ int RegisterMain(JNIEnv *env) {
 extern "C"
 JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM *vm, void *reserved) {
+    g_jvm = vm;
     JNIEnv *env;
     vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
     if (RegisterMenu(env) != 0)
