@@ -362,58 +362,6 @@ static std::atomic<void*> g_activeAimAssistManager{nullptr};
 static std::atomic<void*> g_activeNewAutoAim{nullptr};
 static std::atomic<void*> g_activeBaseAimAssist{nullptr};
 static std::atomic<int>   g_localPlayerTeam{-1}; // -1 = uncalibrated, 0 = TeamA, 1 = TeamB
-static std::atomic<void*> g_botServiceBehaviour{nullptr};
-
-static inline bool isTargetibleObjectInList(void *listPtr, void *targetObj) {
-    if (listPtr == nullptr || !isPointerReadable(listPtr) || targetObj == nullptr) return false;
-
-    // IL2CPP List<T>:
-    // 0x10: _items (T[])
-    // 0x18: _size (int32)
-    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(listPtr) + 0x18))) return false;
-    int size = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(listPtr) + 0x18);
-    if (size <= 0 || size > 256) return false;
-
-    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(listPtr) + 0x10))) return false;
-    void *itemsArray = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(listPtr) + 0x10);
-    if (itemsArray == nullptr || !isPointerReadable(itemsArray)) return false;
-
-    // Vector elements start at offset 0x20 in SZArray
-    uintptr_t itemsBase = reinterpret_cast<uintptr_t>(itemsArray) + 0x20;
-    for (int i = 0; i < size; ++i) {
-        uintptr_t elemAddr = itemsBase + static_cast<uintptr_t>(i) * sizeof(void *);
-        if (!isPointerReadable(reinterpret_cast<void *>(elemAddr))) break;
-        void *item = *reinterpret_cast<void **>(elemAddr);
-        if (item == targetObj) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static inline int getTeamFromBotService(void *targetibleObj) {
-    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return -1;
-    void *bs = g_botServiceBehaviour.load();
-    if (bs == nullptr || !isPointerReadable(bs) || !isUnityObjectAlive(bs)) return -1;
-
-    // 0x28: teamATargetibleObjects (Team 0 / TeamA)
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bs) + 0x28))) {
-        void *teamAList = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bs) + 0x28);
-        if (isTargetibleObjectInList(teamAList, targetibleObj)) {
-            return 0; // TeamA
-        }
-    }
-
-    // 0x30: teamBTargetibleObjects (Team 1 / TeamB)
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bs) + 0x30))) {
-        void *teamBList = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bs) + 0x30);
-        if (isTargetibleObjectInList(teamBList, targetibleObj)) {
-            return 1; // TeamB
-        }
-    }
-
-    return -1;
-}
 
 static inline int getBotTeam(void *botPlayer);
 
@@ -477,13 +425,6 @@ static void updateLocalPlayerWeapon(void *fpc) {
         void *tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x120);
         if (tObj != nullptr && isUnityObjectAlive(tObj)) {
             g_localPlayerTargetibleObject.store(tObj);
-            if (g_localPlayerTeam.load() == -1) {
-                int myTeam = getTeamFromBotService(tObj);
-                if (myTeam == 0 || myTeam == 1) {
-                    g_localPlayerTeam.store(myTeam);
-                    ModLog("[TEAM] Calibrated Local Player Team -> %d (from FPC._targetibleObject)", myTeam);
-                }
-            }
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tObj) + 0xD8))) {
                 void *np = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tObj) + 0xD8);
                 if (np != nullptr && isUnityObjectAlive(np)) {
@@ -983,23 +924,7 @@ static inline bool isValidTargetType(int val) {
 static inline int extractTargetType(void *targetInfo) {
     if (targetInfo == nullptr || !isPointerReadable(targetInfo)) return 0;
 
-    // 1. Direct call to RemoteTargetInfo_GetTargetType (RVA 0x4368EF8)
-    if (RemoteTargetInfo_GetTargetType != nullptr) {
-        int val = RemoteTargetInfo_GetTargetType(targetInfo);
-        if (isValidTargetType(val)) {
-            return val;
-        }
-    }
-
-    // 2. Direct call to LocalTargetInfo_GetTargetType (RVA 0x40AAA58)
-    if (LocalTargetInfo_GetTargetType != nullptr) {
-        int val = LocalTargetInfo_GetTargetType(targetInfo);
-        if (isValidTargetType(val)) {
-            return val;
-        }
-    }
-
-    // 3. Direct memory read for Remote TargetInfo (TypeDefIndex 1590: TargetType is at offset 0x34)
+    // 1. Direct memory read for Remote TargetInfo (TypeDefIndex 1590: TargetType is at offset 0x34)
     if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
         int val34 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
         if (isValidTargetType(val34)) {
@@ -1007,7 +932,7 @@ static inline int extractTargetType(void *targetInfo) {
         }
     }
 
-    // 4. Direct memory read for Local TargetInfo (TypeDefIndex 6459 & 3806: TargetType is at offset 0x30)
+    // 2. Direct memory read for Local TargetInfo (TypeDefIndex 6459 & 3806: TargetType is at offset 0x30)
     if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
         int val30 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
         if (isValidTargetType(val30)) {
@@ -1028,7 +953,7 @@ static void onNetworkPlayerUpdate(void *instance) {
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_networkPlayers[instance] = getCurrentTimeMs();
 
-    // Dynamically detect local player and calibrate team via TargetInfo
+    // Dynamically detect local player via TargetInfo
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC0))) {
         void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC0);
         if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
@@ -1039,37 +964,6 @@ static void onNetworkPlayerUpdate(void *instance) {
                     void *tObj = NetworkPlayer_GetTargetibleObject(instance);
                     if (tObj != nullptr && isUnityObjectAlive(tObj)) {
                         g_localPlayerTargetibleObject.store(tObj);
-                        if (g_localPlayerTeam.load() == -1) {
-                            int t = getTeamFromBotService(tObj);
-                            if (t == 0 || t == 1) {
-                                g_localPlayerTeam.store(t);
-                                ModLog("[TEAM] Calibrated Local Player Team -> %d (from Local NetPlayer in BotService)", t);
-                            }
-                        }
-                    }
-                }
-            } else if ((tType & (2 | 8 | 32)) != 0 && g_localPlayerTeam.load() == -1) {
-                // Ally entity
-                if (NetworkPlayer_GetTargetibleObject != nullptr) {
-                    void *tObj = NetworkPlayer_GetTargetibleObject(instance);
-                    if (tObj != nullptr) {
-                        int t = getTeamFromBotService(tObj);
-                        if (t == 0 || t == 1) {
-                            g_localPlayerTeam.store(t);
-                            ModLog("[TEAM] Calibrated Local Player Team -> %d (from Ally NetPlayer in BotService)", t);
-                        }
-                    }
-                }
-            } else if ((tType & (4 | 16 | 64 | 128)) != 0 && g_localPlayerTeam.load() == -1) {
-                // Enemy entity
-                if (NetworkPlayer_GetTargetibleObject != nullptr) {
-                    void *tObj = NetworkPlayer_GetTargetibleObject(instance);
-                    if (tObj != nullptr) {
-                        int t = getTeamFromBotService(tObj);
-                        if (t == 0 || t == 1) {
-                            g_localPlayerTeam.store(1 - t);
-                            ModLog("[TEAM] Calibrated Local Player Team -> %d (from Enemy NetPlayer in BotService)", 1 - t);
-                        }
                     }
                 }
             }
@@ -1085,6 +979,7 @@ static void onNetworkPlayerDestroy(void *instance) {
     if (instance == g_localPlayerNetPlayer.load()) {
         g_localPlayerNetPlayer.store(nullptr);
         g_localPlayerTargetibleObject.store(nullptr);
+        g_localPlayerTeam.store(-1);
         g_activeAimingControl.store(nullptr);
         onESPClear();
     }
@@ -1368,51 +1263,30 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 static inline int getBotTeam(void *botPlayer) {
     if (botPlayer == nullptr || !isPointerReadable(botPlayer) || !isUnityObjectAlive(botPlayer)) return -1;
 
-    // 1. Check BotServiceBehaviour via _thisTargetibleObject (offset 0x60)
-    void *tObj = nullptr;
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
-        tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
-    }
-    if (tObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
-        tObj = BotPlayer_GetTargetibleObject(botPlayer);
-    }
-    if (tObj != nullptr) {
-        int bsTeam = getTeamFromBotService(tObj);
-        if (bsTeam == 0 || bsTeam == 1) return bsTeam;
-    }
-
-    // 2. Direct read <Team>k__BackingField at offset 0xE0
+    // 1. Direct read <Team>k__BackingField at offset 0xE0
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE0))) {
         int tE0 = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE0);
         if (tE0 == 0 || tE0 == 1) return tE0;
     }
 
-    // 3. Direct read <Team>k__BackingField at offset 0xE4
+    // 2. Direct read <Team>k__BackingField at offset 0xE4
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE4))) {
         int tE4 = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE4);
         if (tE4 == 0 || tE4 == 1) return tE4;
     }
 
-    // 4. PlayerSpawnPoint at offset 0xB0 or BotPlayer_GetSpawnPoint (0x444A3FC) -> TeamSpawnPoint_GetTeam (0x51B7718) or offset 0x38
-    void *sp = nullptr;
+    // 3. PlayerSpawnPoint at offset 0xB0 -> team at offset 0x38
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xB0))) {
-        sp = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0xB0);
-    }
-    if (sp == nullptr && BotPlayer_GetSpawnPoint != nullptr) {
-        sp = BotPlayer_GetSpawnPoint(botPlayer);
-    }
-    if (sp != nullptr && isPointerReadable(sp) && isUnityObjectAlive(sp)) {
-        if (TeamSpawnPoint_GetTeam != nullptr) {
-            int spTeam = TeamSpawnPoint_GetTeam(sp);
-            if (spTeam == 0 || spTeam == 1) return spTeam;
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(sp) + 0x38))) {
-            int spTeam = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(sp) + 0x38);
-            if (spTeam == 0 || spTeam == 1) return spTeam;
+        void *sp = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0xB0);
+        if (sp != nullptr && isPointerReadable(sp) && isUnityObjectAlive(sp)) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(sp) + 0x38))) {
+                int spTeam = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(sp) + 0x38);
+                if (spTeam == 0 || spTeam == 1) return spTeam;
+            }
         }
     }
 
-    // 5. BotPlayer_GetTeam getter (RVA 0x4449610)
+    // 4. BotPlayer_GetTeam getter (RVA 0x4449610)
     if (BotPlayer_GetTeam != nullptr) {
         int t = BotPlayer_GetTeam(botPlayer);
         if (t == 0 || t == 1) return t;
@@ -1482,14 +1356,8 @@ static inline int classifyEntityAffiliation(void *netPlayer, void *targetibleObj
     if (localNet != nullptr && netPlayer != nullptr && netPlayer == localNet) return -1;
     if (localTObj != nullptr && targetibleObj != nullptr && targetibleObj == localTObj) return -1;
 
-    // 3. BotServiceBehaviour & Bot Team Resolution
-    int targetTeam = -1;
-    if (targetibleObj != nullptr) {
-        targetTeam = getTeamFromBotService(targetibleObj);
-    }
-    if (targetTeam == -1 && botPlayer != nullptr) {
-        targetTeam = getBotTeam(botPlayer);
-    }
+    // 3. Bot Team Resolution
+    int targetTeam = (botPlayer != nullptr) ? getBotTeam(botPlayer) : -1;
     int myTeam = g_localPlayerTeam.load();
     if (myTeam >= 0 && targetTeam >= 0) {
         if (targetTeam == myTeam) {
@@ -1590,10 +1458,7 @@ static inline bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, voi
     if (cls == 1) return true;
     if (cls == -1) return false;
 
-    int targetTeam = -1;
-    if (targetibleObj != nullptr) targetTeam = getTeamFromBotService(targetibleObj);
-    if (targetTeam == -1 && botPlayer != nullptr) targetTeam = getBotTeam(botPlayer);
-
+    int targetTeam = (botPlayer != nullptr) ? getBotTeam(botPlayer) : -1;
     int myTeam = g_localPlayerTeam.load();
     if (targetTeam >= 0 && myTeam >= 0) {
         return (targetTeam != myTeam);
@@ -1631,11 +1496,6 @@ static inline bool isTargetibleObjectTeammate(void *targetibleObj) {
     int cls = classifyEntityAffiliation(nullptr, targetibleObj, nullptr);
     if (cls == -1) return true;
     if (cls == 1) return false;
-    int tTeam = getTeamFromBotService(targetibleObj);
-    int myTeam = g_localPlayerTeam.load();
-    if (tTeam >= 0 && myTeam >= 0) {
-        return (tTeam == myTeam);
-    }
     return false;
 }
 
@@ -1827,30 +1687,7 @@ static void updateEspData(void *aimingControl) {
     // Comprehensive Local Player Team Calibration before rendering
     // ---------------------------------------------------------------------
     if (g_localPlayerTeam.load() == -1) {
-        // Step 1: Check Local Player TargetibleObject in BotServiceBehaviour
-        void *localTObj = g_localPlayerTargetibleObject.load();
-        if (localTObj == nullptr) {
-            void *fpc = g_localPlayerFPC.load();
-            if (fpc != nullptr && isPointerReadable(fpc)) {
-                if (isPointerReadable(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(fpc) + 0x120))) {
-                    localTObj = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(fpc) + 0x120);
-                    if (localTObj != nullptr && isUnityObjectAlive(localTObj)) {
-                        g_localPlayerTargetibleObject.store(localTObj);
-                    }
-                }
-            }
-        }
-        if (localTObj != nullptr) {
-            int myTeam = getTeamFromBotService(localTObj);
-            if (myTeam == 0 || myTeam == 1) {
-                g_localPlayerTeam.store(myTeam);
-                ModLog("[TEAM] Proactive Calibrated Local Player Team -> %d (from Local TargetibleObject in BotService)", myTeam);
-            }
-        }
-    }
-
-    if (g_localPlayerTeam.load() == -1) {
-        // Step 2: Proactive calibration from entities (TargetType, Ally Toggle, AutoAim)
+        // Step 1: Proactive calibration from entities (TargetType, Ally Toggle, AutoAim)
         for (const auto &item : activeEntities) {
             void *botObj = item.isBot ? item.object : nullptr;
             void *netObj = !item.isBot ? item.object : nullptr;
@@ -1876,17 +1713,14 @@ static void updateEspData(void *aimingControl) {
         }
     }
 
-    if (g_localPlayerTeam.load() == -1 && activeEntities.size() >= 3) {
-        // Step 3: Bot Population Distribution Analysis (Fail-Safe Calibration)
+    if (g_localPlayerTeam.load() == -1 && !activeEntities.empty()) {
+        // Step 2: Bot Population Distribution Analysis (Fail-Safe Calibration)
         int team0Bots = 0;
         int team1Bots = 0;
         for (const auto &item : activeEntities) {
             int bTeam = -1;
             if (item.isBot && item.object != nullptr) {
                 bTeam = getBotTeam(item.object);
-            } else if (item.object != nullptr && NetworkPlayer_GetTargetibleObject != nullptr) {
-                void *tObj = NetworkPlayer_GetTargetibleObject(item.object);
-                if (tObj != nullptr) bTeam = getTeamFromBotService(tObj);
             }
             if (bTeam == 0) team0Bots++;
             else if (bTeam == 1) team1Bots++;
@@ -2963,28 +2797,6 @@ void hook_BotPlayer_OnDestroy(void *instance) {
     }
 }
 
-// BotServiceBehaviour.Update: RVA 0x4E158D0
-void (*old_BotServiceBehaviour_Update)(void *instance) = nullptr;
-void hook_BotServiceBehaviour_Update(void *instance) {
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        g_botServiceBehaviour.store(instance);
-
-        if (g_localPlayerTeam.load() == -1) {
-            void *localTObj = g_localPlayerTargetibleObject.load();
-            if (localTObj != nullptr) {
-                int myTeam = getTeamFromBotService(localTObj);
-                if (myTeam == 0 || myTeam == 1) {
-                    g_localPlayerTeam.store(myTeam);
-                    ModLog("[TEAM] Calibrated Local Player Team -> %d (from BotServiceBehaviour.Update)", myTeam);
-                }
-            }
-        }
-    }
-    if (old_BotServiceBehaviour_Update != nullptr) {
-        old_BotServiceBehaviour_Update(instance);
-    }
-}
-
 // Registers all hooks in a clean, extensible registry table using HookManager
 static void registerAllHooks() {
     auto &mgr = HookManager::getInstance();
@@ -3016,7 +2828,6 @@ static void registerAllHooks() {
     mgr.registerHook(Offsets::BOT_PLAYER_START,              reinterpret_cast<void*>(hook_BotPlayer_Start),                     reinterpret_cast<void**>(&old_BotPlayer_Start),                     "BotPlayer.Start");
     mgr.registerHook(Offsets::BOT_PLAYER_UPDATE,             reinterpret_cast<void*>(hook_BotPlayer_Update),                    reinterpret_cast<void**>(&old_BotPlayer_Update),                    "BotPlayer.Update");
     mgr.registerHook(Offsets::BOT_PLAYER_ON_DESTROY,         reinterpret_cast<void*>(hook_BotPlayer_OnDestroy),                reinterpret_cast<void**>(&old_BotPlayer_OnDestroy),                "BotPlayer.OnDestroy");
-    mgr.registerHook(Offsets::BOT_SERVICE_BEHAVIOUR_UPDATE,  reinterpret_cast<void*>(hook_BotServiceBehaviour_Update),        reinterpret_cast<void**>(&old_BotServiceBehaviour_Update),        "BotServiceBehaviour.Update");
 
     // 4. Native Aim Assist & Sensitivity Reinforcement Hooks
     mgr.registerHook(Offsets::STRAFE_ROT_GET_MAX_ROTATION_POWER,   reinterpret_cast<void*>(hook_StrafeRotationConfig_get_MaxRotationPower),   reinterpret_cast<void**>(&old_StrafeRotationConfig_get_MaxRotationPower),   "StrafeRotationConfig.get_MaxRotationPower");

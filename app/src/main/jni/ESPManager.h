@@ -17,7 +17,7 @@ static inline int extractTargetType(void *targetInfo);
 static inline bool isTargetInfoAlive(void *targetInfo);
 static inline int getBotTeam(void *botPlayer);
 static inline bool isTargetibleObjectTeammate(void *targetibleObj);
-static inline int getTeamFromBotService(void *targetibleObj);
+
 
 // Struct for passing active entities directly from Status Overlay synchronization
 struct ESPEntityItem {
@@ -267,9 +267,6 @@ public:
 
             int localTeam = g_localPlayerTeam.load();
             int targetTeam = isBot ? getBotTeam(entityObj) : -1;
-            if (targetTeam == -1 && targetibleObj != nullptr) {
-                targetTeam = getTeamFromBotService(targetibleObj);
-            }
             if (localTeam >= 0 && targetTeam >= 0) {
                 if (localTeam == targetTeam) {
                     isEnemy = false;

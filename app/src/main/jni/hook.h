@@ -119,14 +119,6 @@ namespace Offsets {
     constexpr uintptr_t BASE_AIM_ASSIST_IS_VALID_TARGET     = 0x4478A70;
     constexpr uintptr_t NEW_AUTO_AIM_IS_VALID_TARGET        = 0x421C254;
 
-    // ---------------------------------------------------------------------
-    // Team & Bot Service RVAs
-    // ---------------------------------------------------------------------
-    constexpr uintptr_t BOT_SERVICE_BEHAVIOUR_UPDATE        = 0x4E158D0;
-    constexpr uintptr_t BOT_PLAYER_GET_SPAWN_POINT          = 0x444A3FC;
-    constexpr uintptr_t TEAM_SPAWN_POINT_GET_TEAM           = 0x51B7718;
-    constexpr uintptr_t REMOTE_TARGET_INFO_GET_TARGET_TYPE   = 0x4368EF8;
-    constexpr uintptr_t LOCAL_TARGET_INFO_GET_TARGET_TYPE    = 0x40AAA58;
 }
 
 // =========================================================================
@@ -426,10 +418,7 @@ inline void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
 inline int (*BotPlayer_GetTeam)(void *) = nullptr;
 inline float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
 
-inline void *(*BotPlayer_GetSpawnPoint)(void *) = nullptr;
-inline int (*TeamSpawnPoint_GetTeam)(void *) = nullptr;
-inline int (*RemoteTargetInfo_GetTargetType)(void *) = nullptr;
-inline int (*LocalTargetInfo_GetTargetType)(void *) = nullptr;
+
 
 // Safe wrapper to set local scale on a Transform
 inline void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
@@ -543,10 +532,6 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::AIMING_CONTROL_ADD_DELTA,            AimingControl_AddDelta,        "AimingControl_AddDelta");
     resolvePointer(base, Offsets::BOT_PLAYER_GET_TEAM,                 BotPlayer_GetTeam,             "BotPlayer_GetTeam");
     resolvePointer(base, Offsets::BOT_PLAYER_HEALTH_GET_HEALTH,        BotPlayerHealth_GetHealth,     "BotPlayerHealth_GetHealth");
-    resolvePointer(base, Offsets::BOT_PLAYER_GET_SPAWN_POINT,          BotPlayer_GetSpawnPoint,       "BotPlayer_GetSpawnPoint");
-    resolvePointer(base, Offsets::TEAM_SPAWN_POINT_GET_TEAM,           TeamSpawnPoint_GetTeam,        "TeamSpawnPoint_GetTeam");
-    resolvePointer(base, Offsets::REMOTE_TARGET_INFO_GET_TARGET_TYPE,  RemoteTargetInfo_GetTargetType,"RemoteTargetInfo_GetTargetType");
-    resolvePointer(base, Offsets::LOCAL_TARGET_INFO_GET_TARGET_TYPE,   LocalTargetInfo_GetTargetType, "LocalTargetInfo_GetTargetType");
 }
 
 // =========================================================================
