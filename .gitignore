@@ -88,3 +88,6 @@ lint/tmp/
 
 # Android Profiling
 *.hprof
+
+# Reference templates
+esp-chams-template/

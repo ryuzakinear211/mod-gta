@@ -114,8 +114,16 @@ public class Menu {
     public WindowManager.LayoutParams hudParams;
     public boolean showStatusHud = false;
     public boolean autoCount = true;
-    private Handler statusHandler;
-    private Runnable statusRunnable;
+    // ESP Overlay System
+    public ESPOverlayView mEspOverlay;
+    public WindowManager.LayoutParams espParams;
+    public boolean mEspMaster = false;
+    public boolean mEspBox = true;
+    public boolean mEspLine = true;
+    public boolean mEspDistance = true;
+    public boolean mEspHealth = true;
+    public boolean mEspName = true;
+    public boolean mEspEnemyOnly = true;
 
     //initialize methods from the native library
     native void Init(Context context, TextView title, TextView subTitle);
@@ -141,6 +149,10 @@ public class Menu {
     native boolean IsInGame();
 
     native void ResetEntityCounters();
+
+    native float[] GetESPData(int screenWidth, int screenHeight);
+
+    native boolean GetESPSetting(int settingId);
 
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
@@ -305,6 +317,11 @@ public class Menu {
                         mWindowManager.removeView(mStatusHud);
                     } catch (Exception ignored) {}
                 }
+                if (mEspOverlay != null) {
+                    try {
+                        mWindowManager.removeView(mEspOverlay);
+                    } catch (Exception ignored) {}
+                }
                 return false;
             }
         });
@@ -349,6 +366,7 @@ public class Menu {
 
         Init(context, title, subTitle);
         createStatusHud(context);
+        createEspOverlay(context);
     }
 
     public void ShowMenu() {
@@ -394,6 +412,11 @@ public class Menu {
                 mWindowManager.addView(mStatusHud, hudParams);
             } catch (Exception ignored) {}
         }
+        if (mEspOverlay != null) {
+            try {
+                mWindowManager.addView(mEspOverlay, espParams);
+            } catch (Exception ignored) {}
+        }
 
         overlayRequired = true;
     }
@@ -421,6 +444,11 @@ public class Menu {
         if (mStatusHud != null) {
             try {
                 mWindowManager.addView(mStatusHud, hudParams);
+            } catch (Exception ignored) {}
+        }
+        if (mEspOverlay != null) {
+            try {
+                mWindowManager.addView(mEspOverlay, espParams);
             } catch (Exception ignored) {}
         }
     }
@@ -556,6 +584,54 @@ public class Menu {
         } catch (Throwable e) {
             Log.e(TAG, "Update status error", e);
         }
+    }
+
+    public float[] getNativeEspData(int width, int height) {
+        try {
+            return GetESPData(width, height);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public boolean isEspMasterActive() { return mEspMaster; }
+    public boolean isEspBoxActive() { return mEspBox; }
+    public boolean isEspLineActive() { return mEspLine; }
+    public boolean isEspDistanceActive() { return mEspDistance; }
+    public boolean isEspHealthActive() { return mEspHealth; }
+    public boolean isEspNameActive() { return mEspName; }
+    public boolean isEspEnemyOnlyActive() { return mEspEnemyOnly; }
+
+    public void setEspOverlayVisible(final boolean visible) {
+        mEspMaster = visible;
+        if (mEspOverlay != null) {
+            mEspOverlay.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (visible) {
+                        mEspOverlay.startLoop();
+                    } else {
+                        mEspOverlay.stopLoop();
+                    }
+                }
+            });
+        }
+    }
+
+    private void createEspOverlay(final Context context) {
+        int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
+        espParams = new WindowManager.LayoutParams(
+                MATCH_PARENT,
+                MATCH_PARENT,
+                context instanceof Activity ? WindowManager.LayoutParams.TYPE_APPLICATION : iparams,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+        );
+        mEspOverlay = new ESPOverlayView(context);
+        mEspOverlay.setVisibility(View.GONE);
     }
 
     private View.OnTouchListener onTouchListener() {
@@ -735,6 +811,23 @@ public class Menu {
                     case -3:
                         Preferences.isExpanded = bool;
                         scrollView.setLayoutParams(bool ? scrlLLExpanded : scrlLL);
+                        break;
+                    case 5: // ESP Master Switch
+                        setEspOverlayVisible(bool);
+                        break;
+                    case 6: // ESP Enemy Only Filter
+                        mEspEnemyOnly = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                        break;
+                    case 7: // ESP Line Tracer
+                        mEspLine = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                        break;
+                    case 8: // ESP Health Bar & Info
+                        mEspHealth = bool;
+                        mEspDistance = bool;
+                        mEspName = bool;
+                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
                         break;
                 }
             }
@@ -1226,6 +1319,11 @@ public class Menu {
     public void onDestroy() {
         if (rootFrame != null) {
             mWindowManager.removeView(rootFrame);
+        }
+        if (mEspOverlay != null) {
+            try {
+                mWindowManager.removeView(mEspOverlay);
+            } catch (Exception ignored) {}
         }
     }
 }

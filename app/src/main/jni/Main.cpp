@@ -7,6 +7,7 @@
 #include "Core/MemoryHelper.h"
 #include "Features/FeatureManager.h"
 #include "Features/StatusPanel.h"
+#include "Features/ESP.h"
 #include "Includes/obfuscate.h"
 #include "Includes/Utils.h"
 #include "Menu/Setup.h"
@@ -83,6 +84,14 @@ static void Native_ResetEntityCounters(JNIEnv *env, jobject thiz) {
     StatusPanel::ResetCounters();
 }
 
+static jfloatArray Native_GetESPData(JNIEnv *env, jobject thiz, jint screenWidth, jint screenHeight) {
+    return ESP::GetESPData(env, screenWidth, screenHeight);
+}
+
+static jboolean Native_GetESPSetting(JNIEnv *env, jobject thiz, jint settingId) {
+    return ESP::GetESPSetting(settingId);
+}
+
 // =========================================================================
 // JNI Native Registrations
 // =========================================================================
@@ -101,6 +110,8 @@ static int RegisterMenu(JNIEnv *env) {
         {OBFUSCATE("GetTotalCount"),       OBFUSCATE("()I"),                                                                                 reinterpret_cast<void *>(Native_GetTotalCount)},
         {OBFUSCATE("IsInGame"),            OBFUSCATE("()Z"),                                                                                 reinterpret_cast<void *>(Native_IsInGame)},
         {OBFUSCATE("ResetEntityCounters"), OBFUSCATE("()V"),                                                                                 reinterpret_cast<void *>(Native_ResetEntityCounters)},
+        {OBFUSCATE("GetESPData"),          OBFUSCATE("(II)[F"),                                                                              reinterpret_cast<void *>(Native_GetESPData)},
+        {OBFUSCATE("GetESPSetting"),       OBFUSCATE("(I)Z"),                                                                                reinterpret_cast<void *>(Native_GetESPSetting)},
     };
 
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Menu"));

@@ -40,6 +40,9 @@ public class Preferences {
         if (featureNum == 0 && Menu.instance != null) {
             Menu.instance.setStatusHudVisible(bool);
         }
+        if (featureNum == 5 && Menu.instance != null) {
+            Menu.instance.setEspOverlayVisible(bool);
+        }
     }
 
     public static int loadPrefInt(String featureName, int featureNum) {

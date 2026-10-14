@@ -23,9 +23,19 @@ namespace StatusPanel {
     void OnBotPlayerUpdate(void *instance);
     void OnBotPlayerDestroy(void *instance);
 
-    // Stats queries for Java JNI
+    // Entity snapshot for ESP and Aim features
+    struct EntitySnapshot {
+        void *object;
+        bool isBot;
+        void *netPlayer;
+        EntitySnapshot(void *obj = nullptr, bool bot = false, void *net = nullptr)
+            : object(obj), isBot(bot), netPlayer(net) {}
+    };
+
+    // Stats and active entity queries
     Stats GetStats();
     std::string GetFormattedStatus();
+    std::vector<EntitySnapshot> GetActiveEntities();
     void ResetCounters();
 
 } // namespace StatusPanel

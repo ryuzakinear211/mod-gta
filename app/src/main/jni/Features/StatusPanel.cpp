@@ -148,6 +148,49 @@ namespace StatusPanel {
         return std::string(buf);
     }
 
+    std::vector<EntitySnapshot> GetActiveEntities() {
+        std::vector<EntitySnapshot> result;
+        std::lock_guard<std::mutex> lock(s_entityMutex);
+        uint64_t now = GetCurrentTimeMs();
+
+        std::set<void*> activeBotNets;
+        for (auto it = s_botPlayers.begin(); it != s_botPlayers.end(); ) {
+            if (now - it->second > TIMEOUT_MS) {
+                s_botNetPlayers.erase(it->first);
+                it = s_botPlayers.erase(it);
+            } else {
+                void *botObj = it->first;
+                void *netPlayer = nullptr;
+                auto netIt = s_botNetPlayers.find(botObj);
+                if (netIt != s_botNetPlayers.end()) {
+                    netPlayer = netIt->second;
+                } else {
+                    netPlayer = Memory::ReadField<void*>(botObj, Offsets::BotPlayer::NetPlayer);
+                    if (netPlayer) s_botNetPlayers[botObj] = netPlayer;
+                }
+                if (netPlayer) {
+                    activeBotNets.insert(netPlayer);
+                }
+                result.push_back(EntitySnapshot(botObj, true, netPlayer));
+                ++it;
+            }
+        }
+
+        for (auto it = s_networkPlayers.begin(); it != s_networkPlayers.end(); ) {
+            if (now - it->second > TIMEOUT_MS) {
+                it = s_networkPlayers.erase(it);
+            } else {
+                void *netObj = it->first;
+                if (activeBotNets.find(netObj) == activeBotNets.end()) {
+                    result.push_back(EntitySnapshot(netObj, false, netObj));
+                }
+                ++it;
+            }
+        }
+
+        return result;
+    }
+
     void ResetCounters() {
         std::lock_guard<std::mutex> lock(s_entityMutex);
         s_networkPlayers.clear();
