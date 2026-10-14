@@ -1559,12 +1559,6 @@ static void* getBestActiveCamera(void *passedAimingControl = nullptr) {
             return cameraObj;
         }
     }
-    if (Camera_get_current != nullptr) {
-        cameraObj = Camera_get_current();
-        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
-            return cameraObj;
-        }
-    }
     return nullptr;
 }
 
@@ -1630,13 +1624,22 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
         return 0;
     }
 
-    Vector3 camPos = getTransformPosition(cameraObj);
+    Vector3 camPos(0.0f, 0.0f, 0.0f);
     void *aimingControl = passedAimingControl ? passedAimingControl : g_activeAimingControl.load();
     if (aimingControl != nullptr && isUnityObjectAlive(aimingControl)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x30))) {
             void *elevationNode = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x30);
             if (elevationNode != nullptr && isUnityObjectAlive(elevationNode)) {
                 camPos = getTransformPosition(elevationNode);
+            }
+        }
+    }
+
+    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
+        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj) && get_transform != nullptr) {
+            void *camTrans = get_transform(cameraObj);
+            if (camTrans != nullptr && isUnityObjectAlive(camTrans)) {
+                camPos = getTransformPosition(camTrans);
             }
         }
     }
@@ -1748,15 +1751,15 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
         }
 
         float dist = headScreen.z;
-        if (dist <= 0.1f) {
+        if (dist <= 0.1f || std::isnan(dist) || std::isinf(dist)) {
             Vector3 diff = headWorld - camPos;
             dist = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
         }
+        if (std::isnan(dist) || std::isinf(dist) || dist <= 0.0f) {
+            dist = 1.0f;
+        }
 
         int isBlocked = 0;
-        if (isTargetObstructedByWall(camPos, headWorld)) {
-            isBlocked = 1;
-        }
 
         int entityType = 0;
         if (isEnemy) {
@@ -1772,7 +1775,7 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
         data.screenRootX = rootScreen.x;
         data.screenRootY = rootScreen.y;
         data.distance = dist;
-        data.health = (knownHealth > 0.0f) ? knownHealth : 100.0f;
+        data.health = (knownHealth > 0.0f && !std::isnan(knownHealth)) ? knownHealth : 100.0f;
         data.isObstructed = static_cast<float>(isBlocked);
     };
 
@@ -2035,13 +2038,19 @@ static void processAimAssistLock(void *aimingControl) {
 
     Vector3 camPos = getTransformPosition(elevationNode);
     if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
-        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
-            camPos = getTransformPosition(cameraObj);
+        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj) && get_transform != nullptr) {
+            void *camTrans = get_transform(cameraObj);
+            if (camTrans != nullptr && isUnityObjectAlive(camTrans)) {
+                camPos = getTransformPosition(camTrans);
+            }
         }
     }
     void *localFpc = g_localPlayerFPC.load();
-    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f && localFpc != nullptr && isUnityObjectAlive(localFpc)) {
-        camPos = getTransformPosition(localFpc) + Vector3(0.0f, 1.6f, 0.0f);
+    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f && localFpc != nullptr && isUnityObjectAlive(localFpc) && get_transform != nullptr) {
+        void *fpcTrans = get_transform(localFpc);
+        if (fpcTrans != nullptr && isUnityObjectAlive(fpcTrans)) {
+            camPos = getTransformPosition(fpcTrans) + Vector3(0.0f, 1.6f, 0.0f);
+        }
     }
 
     int sliderVal = g_aimSmoothness.load();

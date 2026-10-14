@@ -468,7 +468,8 @@ inline bool worldToScreenOrViewport(void *cameraObj, const Vector3 &worldPos, Ve
     if (WorldToViewportPoint_Injected != nullptr) {
         Vector3 vp(0.0f, 0.0f, 0.0f);
         WorldToViewportPoint_Injected(nativeCam, &worldPos, 2, &vp);
-        if (vp.z > 0.05f) {
+        if (!std::isnan(vp.x) && !std::isnan(vp.y) && !std::isnan(vp.z) &&
+            !std::isinf(vp.x) && !std::isinf(vp.y) && !std::isinf(vp.z) && vp.z > 0.05f) {
             outScreen.x = vp.x * static_cast<float>(screenW);
             outScreen.y = (1.0f - vp.y) * static_cast<float>(screenH);
             outScreen.z = vp.z;
@@ -480,7 +481,8 @@ inline bool worldToScreenOrViewport(void *cameraObj, const Vector3 &worldPos, Ve
     if (WorldToScreenPoint_Injected != nullptr) {
         Vector3 sp(0.0f, 0.0f, 0.0f);
         WorldToScreenPoint_Injected(nativeCam, &worldPos, 2, &sp);
-        if (sp.z > 0.05f) {
+        if (!std::isnan(sp.x) && !std::isnan(sp.y) && !std::isnan(sp.z) &&
+            !std::isinf(sp.x) && !std::isinf(sp.y) && !std::isinf(sp.z) && sp.z > 0.05f) {
             outScreen.x = sp.x;
             outScreen.y = static_cast<float>(screenH) - sp.y;
             outScreen.z = sp.z;
@@ -489,6 +491,20 @@ inline bool worldToScreenOrViewport(void *cameraObj, const Vector3 &worldPos, Ve
     }
 
     return false;
+}
+
+// Universal safe position resolver: works on both Transform and any Component (Camera, FPC, etc.)
+inline Vector3 safeGetAnyPosition(void *unityObj) {
+    Vector3 pos(0.0f, 0.0f, 0.0f);
+    if (unityObj == nullptr || !isUnityObjectAlive(unityObj)) return pos;
+    void *trans = unityObj;
+    if (get_transform != nullptr) {
+        void *t = get_transform(unityObj);
+        if (t != nullptr && isUnityObjectAlive(t)) {
+            trans = t;
+        }
+    }
+    return getTransformPosition(trans);
 }
 
 // =========================================================================
