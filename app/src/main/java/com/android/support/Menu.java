@@ -118,6 +118,7 @@ public class Menu {
     private Runnable statusRunnable;
     public ESPView mEspView;
     private WindowManager.LayoutParams espParams;
+    public boolean mIsEspActive = false;
 
     //initialize methods from the native library
     native void Init(Context context, TextView title, TextView subTitle);
@@ -549,6 +550,7 @@ public class Menu {
     }
 
     public void setESPVisible(final boolean visible) {
+        mIsEspActive = visible;
         if (mEspView != null) {
             mEspView.post(new Runnable() {
                 @Override
@@ -1275,10 +1277,12 @@ public class Menu {
         if (rootFrame != null) {
             rootFrame.setVisibility(view);
         }
-        if (mEspView != null && view != View.VISIBLE) {
-            mEspView.setVisibility(View.GONE);
-        } else if (mEspView != null && view == View.VISIBLE && Preferences.loadPrefBool("ESP Master Switch", 6, false)) {
-            mEspView.setVisibility(View.VISIBLE);
+        if (mEspView != null) {
+            if (view != View.VISIBLE) {
+                mEspView.setVisibility(View.GONE);
+            } else if (mIsEspActive) {
+                mEspView.setVisibility(View.VISIBLE);
+            }
         }
     }
 

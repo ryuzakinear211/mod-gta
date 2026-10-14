@@ -30,6 +30,14 @@
 #include "Menu/Setup.h"
 #include "ESPManager.h"
 
+// Thread-safe ESP state shared between Unity Engine thread (Producer) and Java UI thread (Consumer)
+static ESPEntityData s_espSharedBuffer[64];
+static int s_espSharedCount = 0;
+static std::mutex s_espSharedMutex;
+static std::atomic<int> s_espClientWidth{0};
+static std::atomic<int> s_espClientHeight{0};
+static std::atomic<uint64_t> s_espLastProduceMs{0};
+
 // =========================================================================
 // Advanced Debug Logger & Crash Handler
 // Target Log Paths: /storage/0/emulated/Document/mod_gta_debug.log, etc.
@@ -546,6 +554,9 @@ void hook_FirstPersonController_Update(void *instance) {
                 g_activeAimingControl.store(aimingControl);
             }
         }
+        if (g_espManager != nullptr && g_espManager->isEspEnabled.load()) {
+            g_espManager->updateOnEngineThread(nullptr);
+        }
     }
     if (old_FirstPersonController_Update != nullptr) {
         old_FirstPersonController_Update(instance);
@@ -849,6 +860,11 @@ static void resetEntityCounters() {
     g_botNetPlayers.clear();
     g_localPlayerTargetibleObject.store(nullptr);
     g_localPlayerNetPlayer.store(nullptr);
+    g_activeAimingControl.store(nullptr);
+    {
+        std::lock_guard<std::mutex> espLock(s_espSharedMutex);
+        s_espSharedCount = 0;
+    }
     ModLog("[STATS] Entity counters reset manually.");
 }
 
@@ -1225,7 +1241,7 @@ static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botP
 }
 
 static bool isTargetObstructedByWall(const Vector3 &camPos, const Vector3 &bonePos) {
-    if (Internal_RaycastTest_Injected == nullptr) return false;
+    if (Internal_RaycastTest_Injected == nullptr || Physics_get_defaultPhysicsScene == nullptr) return false;
 
     Vector3 diff = bonePos - camPos;
     float dist3D = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
@@ -1241,12 +1257,8 @@ static bool isTargetObstructedByWall(const Vector3 &camPos, const Vector3 &boneP
     float checkDist = dist3D - 0.80f;
     if (checkDist <= 0.1f) checkDist = 0.1f;
 
-    PhysicsScene scene(0, 0);
-    if (Physics_get_defaultPhysicsScene != nullptr) {
-        scene = Physics_get_defaultPhysicsScene();
-    }
-
-    bool isBlocked = Internal_RaycastTest_Injected(&scene, &ray, checkDist, -5, 1);
+    PhysicsScene scene = Physics_get_defaultPhysicsScene();
+    bool isBlocked = Internal_RaycastTest_Injected(&scene, &ray, checkDist, 1, 1);
     return isBlocked;
 }
 
@@ -1582,7 +1594,39 @@ ESPManager::ESPManager() {
 
 ESPManager::~ESPManager() = default;
 
-int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int screenW, int screenH) {
+void ESPManager::updateOnEngineThread(void *passedAimingControl) {
+    if (!isEspEnabled.load()) {
+        std::lock_guard<std::mutex> lock(s_espSharedMutex);
+        s_espSharedCount = 0;
+        return;
+    }
+
+    uint64_t now = getCurrentTimeMs();
+    if (now - s_espLastProduceMs.load() < 8) {
+        return; // Throttle to max ~120 fps
+    }
+
+    int screenW = s_espClientWidth.load();
+    int screenH = s_espClientHeight.load();
+    if (screenW <= 0 || screenH <= 0) {
+        screenW = 1920;
+        screenH = 1080;
+    }
+
+    static ESPEntityData tempBuffer[64];
+    int count = getVisibleEntities(tempBuffer, 64, screenW, screenH, passedAimingControl);
+
+    {
+        std::lock_guard<std::mutex> lock(s_espSharedMutex);
+        if (count > 0) {
+            memcpy(s_espSharedBuffer, tempBuffer, count * sizeof(ESPEntityData));
+        }
+        s_espSharedCount = count;
+        s_espLastProduceMs.store(now);
+    }
+}
+
+int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int screenW, int screenH, void *passedAimingControl) {
     if (!isEspEnabled.load()) {
         return 0;
     }
@@ -1591,7 +1635,7 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
     }
 
     void *cameraObj = nullptr;
-    void *aimingControl = g_activeAimingControl.load();
+    void *aimingControl = passedAimingControl ? passedAimingControl : g_activeAimingControl.load();
     if (aimingControl != nullptr && isUnityObjectAlive(aimingControl)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20))) {
             cameraObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20);
@@ -1755,14 +1799,14 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
         }
 
         ESPEntityData &data = outArray[count++];
-        data.type = entityType;
+        data.type = static_cast<float>(entityType);
         data.screenHeadX = headScreenX;
         data.screenHeadY = headScreenY;
         data.screenRootX = rootScreenX;
         data.screenRootY = rootScreenY;
         data.distance = dist;
         data.health = (knownHealth > 0.0f) ? knownHealth : 100.0f;
-        data.isObstructed = isBlocked;
+        data.isObstructed = static_cast<float>(isBlocked);
     };
 
     // 1. Process candidate Real Players
@@ -2136,6 +2180,10 @@ void hook_AimingControl_Update(void *instance) {
         }
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
             *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+        }
+
+        if (g_espManager != nullptr && g_espManager->isEspEnabled.load()) {
+            g_espManager->updateOnEngineThread(instance);
         }
     }
 
@@ -2698,7 +2746,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             if (g_espManager != nullptr) g_espManager->isEspEnabled.store(boolean);
             ModLog("[TOGGLE] Feature #6 [ESP Master Switch] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle ESP Master: ON" : "Toggle ESP Master: OFF");
-            Toast(env, ctx, boolean ? OBFUSCATE("ESP Master: ON") : OBFUSCATE("ESP Master: OFF"), ToastLength::LENGTH_SHORT);
             break;
         }
 
@@ -2734,7 +2781,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             if (g_espManager != nullptr) g_espManager->espTeamFilter.store(boolean);
             ModLog("[TOGGLE] Feature #11 [ESP Filter Tim] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle ESP Filter Tim: ON" : "Toggle ESP Filter Tim: OFF");
-            Toast(env, ctx, boolean ? OBFUSCATE("ESP Filter Tim: ON (Hanya Musuh)") : OBFUSCATE("ESP Filter Tim: OFF (Semua Entitas)"), ToastLength::LENGTH_SHORT);
             break;
         }
 
@@ -2816,15 +2862,28 @@ Java_com_android_support_ESPView_getESPData(JNIEnv *env, jclass clazz, jfloatArr
     }
     if (outArray == nullptr) return 0;
 
+    if (screenW > 0 && screenH > 0) {
+        s_espClientWidth.store(screenW);
+        s_espClientHeight.store(screenH);
+    }
+
+    uint64_t now = getCurrentTimeMs();
+    if (now - s_espLastProduceMs.load() > 500) {
+        return 0;
+    }
+
     jsize len = env->GetArrayLength(outArray);
     int maxEntities = len / 8;
     if (maxEntities <= 0) return 0;
     if (maxEntities > 64) maxEntities = 64;
 
-    static ESPEntityData s_entityBuffer[64];
-    int count = g_espManager->getVisibleEntities(s_entityBuffer, maxEntities, screenW, screenH);
-    if (count > 0) {
-        env->SetFloatArrayRegion(outArray, 0, count * 8, reinterpret_cast<const jfloat *>(s_entityBuffer));
+    int count = 0;
+    {
+        std::lock_guard<std::mutex> lock(s_espSharedMutex);
+        count = std::min(s_espSharedCount, maxEntities);
+        if (count > 0) {
+            env->SetFloatArrayRegion(outArray, 0, count * 8, reinterpret_cast<const jfloat *>(s_espSharedBuffer));
+        }
     }
     return count;
 }
