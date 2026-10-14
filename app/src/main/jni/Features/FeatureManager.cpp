@@ -87,45 +87,45 @@ namespace FeatureManager {
             case 0: { // Status Panel Overlay
                 StatusPanel::SetEnabled(boolean);
                 ModLogger::SetLastAction(boolean ? "StatusPanel: ON" : "StatusPanel: OFF");
-                Toast(env, ctx, boolean ? OBFUSCATE("Status Panel & Counter: ON")
-                                        : OBFUSCATE("Status Panel & Counter: OFF"),
-                      ToastLength::LENGTH_SHORT);
+                if (boolean && ctx != nullptr) {
+                    Toast(env, ctx, OBFUSCATE("Status Panel & Counter: ON"), ToastLength::LENGTH_SHORT);
+                }
                 break;
             }
 
             case 1: { // Big Head
                 BigHead::SetEnabled(boolean);
                 ModLogger::SetLastAction(boolean ? "BigHead: ON" : "BigHead: OFF");
-                Toast(env, ctx, boolean ? OBFUSCATE("Big Head: ON (Kepala Membesar)")
-                                        : OBFUSCATE("Big Head: OFF (Normal)"),
-                      ToastLength::LENGTH_SHORT);
+                if (boolean && ctx != nullptr) {
+                    Toast(env, ctx, OBFUSCATE("Big Head: ON (Kepala Membesar)"), ToastLength::LENGTH_SHORT);
+                }
                 break;
             }
 
             case 2: { // Fast FireRate
                 FastFireRate::SetEnabled(boolean);
                 ModLogger::SetLastAction(boolean ? "FastFireRate: ON" : "FastFireRate: OFF");
-                Toast(env, ctx, boolean ? OBFUSCATE("Fast FireRate: ON (Client-Side)")
-                                        : OBFUSCATE("Fast FireRate: OFF (Normal)"),
-                      ToastLength::LENGTH_SHORT);
+                if (boolean && ctx != nullptr) {
+                    Toast(env, ctx, OBFUSCATE("Fast FireRate: ON (Client-Side)"), ToastLength::LENGTH_SHORT);
+                }
                 break;
             }
 
             case 3: { // No Recoil
                 NoRecoil::SetEnabled(boolean);
                 ModLogger::SetLastAction(boolean ? "NoRecoil: ON" : "NoRecoil: OFF");
-                Toast(env, ctx, boolean ? OBFUSCATE("No Recoil: ON (Client-Side)")
-                                        : OBFUSCATE("No Recoil: OFF (Normal)"),
-                      ToastLength::LENGTH_SHORT);
+                if (boolean && ctx != nullptr) {
+                    Toast(env, ctx, OBFUSCATE("No Recoil: ON (Client-Side)"), ToastLength::LENGTH_SHORT);
+                }
                 break;
             }
 
             case 4: { // Unlock 60 FPS
                 FPSUnlock::SetEnabled(boolean);
                 ModLogger::SetLastAction(boolean ? "FPSUnlock: ON (60 FPS)" : "FPSUnlock: OFF (30 FPS)");
-                Toast(env, ctx, boolean ? OBFUSCATE("Unlock 60 FPS: ON (Ultra Halus)")
-                                        : OBFUSCATE("Unlock 60 FPS: OFF (30 FPS Default)"),
-                      ToastLength::LENGTH_SHORT);
+                if (boolean && ctx != nullptr) {
+                    Toast(env, ctx, OBFUSCATE("Unlock 60 FPS: ON (Ultra Halus)"), ToastLength::LENGTH_SHORT);
+                }
                 break;
             }
 

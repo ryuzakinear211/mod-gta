@@ -187,7 +187,16 @@ namespace CrashHandler {
         }
     }
 
+    static char s_altStack[SIGSTKSZ * 4];
+
     void Install() {
+        stack_t ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.ss_sp = s_altStack;
+        ss.ss_size = sizeof(s_altStack);
+        ss.ss_flags = 0;
+        sigaltstack(&ss, nullptr);
+
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = crashSignalHandler;
@@ -200,7 +209,7 @@ namespace CrashHandler {
         sigaction(SIGILL,  &sa, &old_sa_ill);
         sigaction(SIGTRAP, &sa, &old_sa_trap);
 
-        LOG_INFO("[CRASH_HANDLER] Native ARM64 Crash Handler installed.");
+        LOG_INFO("[CRASH_HANDLER] Native ARM64 Crash Handler installed with dedicated altstack.");
     }
 
 } // namespace CrashHandler
