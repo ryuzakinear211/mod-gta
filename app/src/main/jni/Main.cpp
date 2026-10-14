@@ -28,15 +28,6 @@
 #include "hook.h"
 #include "KittyMemory/MemoryPatch.h"
 #include "Menu/Setup.h"
-#include "ESPManager.h"
-
-// Thread-safe ESP state shared between Unity Engine thread (Producer) and Java UI thread (Consumer)
-static ESPEntityData s_espSharedBuffer[64];
-static int s_espSharedCount = 0;
-static std::mutex s_espSharedMutex;
-static std::atomic<int> s_espClientWidth{0};
-static std::atomic<int> s_espClientHeight{0};
-static std::atomic<uint64_t> s_espLastProduceMs{0};
 
 // =========================================================================
 // Advanced Debug Logger & Crash Handler
@@ -174,6 +165,8 @@ static std::atomic<bool> g_noRecoil{false};
 static std::atomic<bool> g_aimAssistBoost{false};
 static std::atomic<int>  g_aimSmoothness{80}; // 0 - 100 slider (default: 80, 100 = sticky lock)
 #define g_aimSensitivity g_aimSmoothness
+static std::atomic<bool> g_unlimitedAmmo{false};
+static std::atomic<uint64_t> g_lastPlayerShootMs{0};
 
 static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
     char crashBuf[8192];
@@ -210,7 +203,7 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         "Fault Address : %p\n"
         "Thread TID    : %d\n"
         "Last Action   : %s\n"
-        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d, AimSmooth=%d\n"
+        "Toggle States : StatusPanel=%d, AutoCount=%d, BigHead=%d, FastFireRate=%d, NoRecoil=%d, AimAssistBoost=%d, AimSmooth=%d, UnlimitedAmmo=%d\n"
         "-----------------------------------------------------------------\n",
         timeStr, sig, sigName, info->si_code, info->si_addr, gettid(),
         g_lastAction,
@@ -220,7 +213,8 @@ static void crashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
         static_cast<int>(g_fastFireRate.load()),
         static_cast<int>(g_noRecoil.load()),
         static_cast<int>(g_aimAssistBoost.load()),
-        g_aimSmoothness.load()
+        g_aimSmoothness.load(),
+        static_cast<int>(g_unlimitedAmmo.load())
     );
 
 #if defined(__aarch64__)
@@ -367,13 +361,22 @@ static std::atomic<void*> g_activeAimingControl{nullptr};
 static std::atomic<void*> g_activeAimAssistManager{nullptr};
 static std::atomic<void*> g_activeNewAutoAim{nullptr};
 static std::atomic<void*> g_activeBaseAimAssist{nullptr};
+static std::atomic<int>   g_localPlayerTeam{-1}; // -1 = uncalibrated, 0 = TeamA, 1 = TeamB
+static inline int getBotTeam(void *botPlayer);
+
+// Forward declarations for target validation & lifecycle handlers
+extern bool (*old_BaseAimAssist_IsValidTarget)(void *, void *);
+extern bool (*old_NewAutoAim_IsValidTarget)(void *, void *);
+static void resetAimAssistState(void *aimingControlInstance = nullptr);
+static void resetEntityCounters();
+void onESPClear();
 
 static uint64_t g_lastWeaponLogMs = 0;
 static int g_origShootAction = -1;
 static bool g_hasOrigShootAction = false;
 
 static bool isClientWeapon(void *instance) {
-    if (instance == nullptr) return false;
+    if (instance == nullptr || !isPointerReadable(instance)) return false;
     void *curShooter = g_localPlayerShooter.load();
     void *curWeapon = g_localPlayerWeapon.load();
     if (instance == curShooter || instance == curWeapon) return true;
@@ -385,6 +388,19 @@ static bool isClientWeapon(void *instance) {
             if (equipped == instance) return true;
         }
     }
+
+    void *curProf = g_localWeaponProfile.load();
+    if (curProf != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x80))) {
+        void *pProf = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x80);
+        if (pProf != nullptr && pProf == curProf) return true;
+    }
+
+    void *curParam = g_localWeaponParams.load();
+    if (curParam != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x88))) {
+        void *pParam = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x88);
+        if (pParam != nullptr && pParam == curParam) return true;
+    }
+
     return false;
 }
 
@@ -397,6 +413,8 @@ static bool isClientWeaponParams(void *instance) {
     if (instance == nullptr) return false;
     return (instance == g_localWeaponParams.load());
 }
+
+static bool isSafeToSetClipAmmo(void *shooter);
 
 static void updateLocalPlayerWeapon(void *fpc) {
     if (fpc == nullptr || !isPointerReadable(fpc)) return;
@@ -415,6 +433,13 @@ static void updateLocalPlayerWeapon(void *fpc) {
         }
     }
 
+    if (g_localPlayerNetPlayer.load() == nullptr && FPC_GetNetworkPlayer != nullptr) {
+        void *np = FPC_GetNetworkPlayer(fpc);
+        if (np != nullptr && isUnityObjectAlive(np)) {
+            g_localPlayerNetPlayer.store(np);
+        }
+    }
+
     void *currentWeapon = nullptr;
     if (get_CurrentWeapon != nullptr) {
         currentWeapon = get_CurrentWeapon(fpc);
@@ -423,50 +448,117 @@ static void updateLocalPlayerWeapon(void *fpc) {
         currentWeapon = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0x50);
     }
 
-    if (currentWeapon != nullptr && isPointerReadable(currentWeapon)) {
+    if (currentWeapon != nullptr && isPointerReadable(currentWeapon) && reinterpret_cast<uintptr_t>(currentWeapon) >= 0x10000) {
         g_localPlayerWeapon.store(currentWeapon);
+
+        // WeaponProfile at offset 0x80 of ItemBehaviour
+        void *prof = nullptr;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80))) {
+            void *p = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80);
+            if (p != nullptr && isPointerReadable(p) && reinterpret_cast<uintptr_t>(p) >= 0x10000) {
+                prof = p;
+            }
+        }
+        g_localWeaponProfile.store(prof);
+
+        // WeaponParameters at offset 0x88 of ItemBehaviour
+        void *param = nullptr;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88))) {
+            void *p = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88);
+            if (p != nullptr && isPointerReadable(p) && reinterpret_cast<uintptr_t>(p) >= 0x10000) {
+                param = p;
+            }
+        }
+        g_localWeaponParams.store(param);
 
         void *shooter = nullptr;
         if (get_ShooterBehaviour != nullptr) {
             shooter = get_ShooterBehaviour(fpc, currentWeapon);
         }
-        if (shooter != nullptr && isPointerReadable(shooter)) {
+        if (shooter != nullptr && isPointerReadable(shooter) && reinterpret_cast<uintptr_t>(shooter) >= 0x10000) {
             g_localPlayerShooter.store(shooter);
         } else {
-            g_localPlayerShooter.store(currentWeapon); // WeaponShooterBehaviour inherits from ItemWeaponBehaviour
+            g_localPlayerShooter.store(currentWeapon);
         }
-
-        // WeaponProfile at offset 0x80 of ItemBehaviour
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80))) {
-            g_localWeaponProfile.store(*reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x80));
-        }
-        // WeaponParameters at offset 0x88 of ItemBehaviour
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88))) {
-            g_localWeaponParams.store(*reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(currentWeapon) + 0x88));
-        }
+    } else {
+        g_localPlayerWeapon.store(nullptr);
+        g_localPlayerShooter.store(nullptr);
+        g_localWeaponProfile.store(nullptr);
+        g_localWeaponParams.store(nullptr);
     }
 
     uint64_t now = getCurrentTimeMs();
     void *s = g_localPlayerShooter.load();
-    if (now - g_lastWeaponLogMs > 8000 && s != nullptr) {
+    if (now - g_lastWeaponLogMs > 5000) {
         g_lastWeaponLogMs = now;
-        ModLog("[WEAPON] Client Weapon Memory Found -> FPC: %p | Weapon: %p | Shooter: %p | Profile: %p | Params: %p",
-               g_localPlayerFPC.load(), g_localPlayerWeapon.load(), s, g_localWeaponProfile.load(), g_localWeaponParams.load());
+        bool safeAmmo = (s != nullptr && isSafeToSetClipAmmo(s));
+        ModLog("[WEAPON] State -> FPC: %p | Weapon: %p | Shooter: %p | Profile: %p | Params: %p | SafeAmmo: %d | Unlimited: %d | FastFire: %d",
+               g_localPlayerFPC.load(), g_localPlayerWeapon.load(), s, g_localWeaponProfile.load(), g_localWeaponParams.load(),
+               safeAmmo ? 1 : 0,
+               g_unlimitedAmmo.load() ? 1 : 0,
+               g_fastFireRate.load() ? 1 : 0);
+    }
+}
+
+// Check that the weapon's ammo hierarchy is fully initialized and readable before calling set_ClipAmmo.
+// In libil2cpp:
+// - shooter + 0x178 is the ammo controller (TypeDefIndex: 2094).
+// - ammoCtrl + 0x28 is the primary clip ammo sub-controller (TypeDefIndex: 7341).
+// - subObj + 0x18 is the inventory ammo item link (if null, dereferencing +0x20 in 0x425dd68 causes SIGSEGV Fault Address 0x20).
+static bool isSafeToSetClipAmmo(void *shooter) {
+    if (shooter == nullptr || !isPointerReadable(shooter) || reinterpret_cast<uintptr_t>(shooter) < 0x10000) {
+        return false;
+    }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x178))) {
+        return false;
+    }
+    void *ammoCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(shooter) + 0x178);
+    if (ammoCtrl == nullptr || !isPointerReadable(ammoCtrl) || reinterpret_cast<uintptr_t>(ammoCtrl) < 0x10000) {
+        return false;
+    }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ammoCtrl) + 0x28))) {
+        return false;
+    }
+    void *subObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ammoCtrl) + 0x28);
+    if (subObj == nullptr || !isPointerReadable(subObj) || reinterpret_cast<uintptr_t>(subObj) < 0x10000) {
+        return false;
+    }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(subObj) + 0x18))) {
+        return false;
+    }
+    void *itemPtr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(subObj) + 0x18);
+    if (itemPtr == nullptr || !isPointerReadable(itemPtr) || reinterpret_cast<uintptr_t>(itemPtr) < 0x10000) {
+        return false;
+    }
+    if (!isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(itemPtr) + 0x20))) {
+        return false;
+    }
+    return true;
+}
+
+static void safeApplyUnlimitedClipAmmo(void *shooter, int ammoCount = 999) {
+    if (shooter == nullptr) return;
+    if (set_ClipAmmo != nullptr && isSafeToSetClipAmmo(shooter)) {
+        set_ClipAmmo(shooter, ammoCount);
     }
 }
 
 static void applyPlayerWeaponMemoryEdits() {
     void *shooter = g_localPlayerShooter.load();
-    if (shooter == nullptr || !isPointerReadable(shooter)) return;
+    if (shooter == nullptr || !isPointerReadable(shooter) || reinterpret_cast<uintptr_t>(shooter) < 0x10000) return;
 
-    // 1. Force Full Auto (_shootAction at offset 0x150: AUTO = 0, BOLT_ACTION = 1)
+    // 1. Never force AUTO (0) onto BOLT_ACTION (1) weapons (such as sniper rifles).
+    // Forcing AUTO onto sniper rifles causes auto-scoping on kill and disables hip fire!
+    // Fast fire rate is already handled by CanShoot, SetCooldown, and shot interval hooks.
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x150))) {
         int *shootActionPtr = reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(shooter) + 0x150);
-        if (!g_hasOrigShootAction) {
-            g_origShootAction = *shootActionPtr;
-            g_hasOrigShootAction = true;
+        if (*shootActionPtr != 1) { // Only adjust semi-auto / burst, keep BOLT_ACTION intact
+            if (!g_hasOrigShootAction) {
+                g_origShootAction = *shootActionPtr;
+                g_hasOrigShootAction = true;
+            }
+            *shootActionPtr = 0; // AUTO
         }
-        *shootActionPtr = 0; // AUTO
     }
 
     // 2. Zero out internal cooldown ObscuredFloat fields at offset 0x18C & 0x1B0
@@ -485,34 +577,31 @@ static void applyPlayerWeaponMemoryEdits() {
         }
     }
 
-    // 3. Keep clip ammo filled during high-speed firing
-    if (set_ClipAmmo != nullptr) {
-        set_ClipAmmo(shooter, 999);
+    // 3. Keep clip ammo filled during high-speed firing if unlimited ammo or fast fire rate is active
+    bool unlimited = g_unlimitedAmmo.load() || g_fastFireRate.load();
+    if (unlimited) {
+        safeApplyUnlimitedClipAmmo(shooter, 999);
     }
 }
 
 static void applyNoRecoilMemoryEdits(void *fpc) {
-    if (fpc == nullptr || !isPointerReadable(fpc)) return;
+    if (fpc == nullptr || !isPointerReadable(fpc) || !isUnityObjectAlive(fpc)) return;
 
     // 1. AnimController at offset 0xB8
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(fpc) + 0xB8))) {
         void *animCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(fpc) + 0xB8);
-        if (animCtrl != nullptr && isPointerReadable(animCtrl)) {
+        if (animCtrl != nullptr && isPointerReadable(animCtrl) && isUnityObjectAlive(animCtrl)) {
             // AnimEffectList at offset 0x30
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(animCtrl) + 0x30))) {
                 void *animList = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(animCtrl) + 0x30);
-                if (animList != nullptr && isPointerReadable(animList)) {
+                if (animList != nullptr && isPointerReadable(animList) && isUnityObjectAlive(animList)) {
                     // AttackAnimEffect at offset 0x38
                     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(animList) + 0x38))) {
                         void *attackAnim = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(animList) + 0x38);
-                        if (attackAnim != nullptr && isPointerReadable(attackAnim)) {
-                            // Zero current weapon/camera recoil vectors
-                            // 0x1F0: _currentWeaponRecoilPosition (Vector3)
-                            // 0x1FC: _currentWeaponRecoilRotation (Vector3)
-                            // 0x208: _currentCameraRecoilRotation (Vector3)
-                            // 0x214: _weaponRotationOutput (Vector3)
-                            // 0x220: _cameraRotationOutput (Vector3)
-                            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x1F0))) {
+                        if (attackAnim != nullptr && isPointerReadable(attackAnim) && isUnityObjectAlive(attackAnim)) {
+                            // Zero current weapon/camera recoil vectors safely with bounds checking
+                            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x1F0)) &&
+                                isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x228))) {
                                 memset(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(attackAnim) + 0x1F0), 0, 0x22C - 0x1F0);
                             }
                             // 0x244: _sumShift (Vector2)
@@ -528,34 +617,44 @@ static void applyNoRecoilMemoryEdits(void *fpc) {
     }
 }
 
+// Forward declarations of weapon hooks
+void (*old_WeaponShooterBehaviour_SetClipAmmo)(void *instance, int ammo) = nullptr;
+
 // 1. FirstPersonController.Update: RVA 0x40A1BF4
 void (*old_FirstPersonController_Update)(void *instance) = nullptr;
 void hook_FirstPersonController_Update(void *instance) {
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        setLastAction("FirstPersonController_Update");
-        updateLocalPlayerWeapon(instance);
-        if (g_fastFireRate.load()) {
-            applyPlayerWeaponMemoryEdits();
-        } else if (g_hasOrigShootAction) {
-            void *shooter = g_localPlayerShooter.load();
-            if (shooter != nullptr && isPointerReadable(shooter)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x150))) {
-                    *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(shooter) + 0x150) = g_origShootAction;
-                    g_hasOrigShootAction = false;
-                }
+    if (instance == nullptr || !isUnityObjectAlive(instance)) {
+        return;
+    }
+    setLastAction("FirstPersonController_Update");
+    updateLocalPlayerWeapon(instance);
+    if (g_fastFireRate.load()) {
+        applyPlayerWeaponMemoryEdits();
+    } else if (g_hasOrigShootAction) {
+        void *shooter = g_localPlayerShooter.load();
+        if (shooter != nullptr && isPointerReadable(shooter)) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shooter) + 0x150))) {
+                *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(shooter) + 0x150) = g_origShootAction;
+                g_hasOrigShootAction = false;
             }
         }
-        if (g_noRecoil.load()) {
-            applyNoRecoilMemoryEdits(instance);
+    }
+
+    bool unlimited = g_unlimitedAmmo.load() || g_fastFireRate.load();
+    if (unlimited) {
+        void *shooter = g_localPlayerShooter.load();
+        if (shooter != nullptr) {
+            safeApplyUnlimitedClipAmmo(shooter, 999);
         }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xF0))) {
-            void *aimingControl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xF0);
-            if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
-                g_activeAimingControl.store(aimingControl);
-            }
-        }
-        if (g_espManager != nullptr && g_espManager->isEspEnabled.load()) {
-            g_espManager->updateOnEngineThread(g_activeAimingControl.load());
+    }
+
+    if (g_noRecoil.load()) {
+        applyNoRecoilMemoryEdits(instance);
+    }
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xF0))) {
+        void *aimingControl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xF0);
+        if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
+            g_activeAimingControl.store(aimingControl);
         }
     }
     if (old_FirstPersonController_Update != nullptr) {
@@ -563,16 +662,73 @@ void hook_FirstPersonController_Update(void *instance) {
     }
 }
 
+// FirstPersonController.OnDestroy: RVA 0x40A3A84
+void (*old_FirstPersonController_OnDestroy)(void *instance) = nullptr;
+void hook_FirstPersonController_OnDestroy(void *instance) {
+    setLastAction("FirstPersonController_OnDestroy");
+    if (instance != nullptr && instance == g_localPlayerFPC.load()) {
+        g_localPlayerFPC.store(nullptr);
+        g_localPlayerWeapon.store(nullptr);
+        g_localPlayerShooter.store(nullptr);
+        g_localWeaponProfile.store(nullptr);
+        g_localWeaponParams.store(nullptr);
+        g_localPlayerTargetibleObject.store(nullptr);
+        g_localPlayerNetPlayer.store(nullptr);
+        g_localPlayerTeam.store(-1);
+        g_activeAimingControl.store(nullptr);
+        g_activeAimAssistManager.store(nullptr);
+        g_activeNewAutoAim.store(nullptr);
+        g_activeBaseAimAssist.store(nullptr);
+        resetEntityCounters();
+        onESPClear();
+        resetAimAssistState();
+    }
+    if (old_FirstPersonController_OnDestroy != nullptr) {
+        old_FirstPersonController_OnDestroy(instance);
+    }
+}
+
 // 2. WeaponShooterBehaviour.CanShoot: RVA 0x405BBF0
 bool (*old_WeaponShooterBehaviour_CanShoot)(void *instance) = nullptr;
 bool hook_WeaponShooterBehaviour_CanShoot(void *instance) {
-    if (g_fastFireRate.load() && isClientWeapon(instance)) {
-        return true; // Local weapon can always shoot instantly
+    if (instance != nullptr && isClientWeapon(instance)) {
+        g_lastPlayerShootMs.store(getCurrentTimeMs());
+        bool unlimited = g_unlimitedAmmo.load() || g_fastFireRate.load();
+        if (unlimited) {
+            safeApplyUnlimitedClipAmmo(instance, 999);
+        }
+        if (g_fastFireRate.load()) {
+            return true; // Local weapon can always shoot instantly
+        }
     }
     if (old_WeaponShooterBehaviour_CanShoot != nullptr) {
         return old_WeaponShooterBehaviour_CanShoot(instance);
     }
     return true;
+}
+
+// 2b. WeaponShooterBehaviour.SetClipAmmo: RVA 0x405A39C
+void hook_WeaponShooterBehaviour_SetClipAmmo(void *instance, int ammo) {
+    bool unlimited = g_unlimitedAmmo.load() || g_fastFireRate.load();
+    if (unlimited && instance != nullptr && isClientWeapon(instance)) {
+        ammo = 999;
+    }
+    if (old_WeaponShooterBehaviour_SetClipAmmo != nullptr) {
+        old_WeaponShooterBehaviour_SetClipAmmo(instance, ammo);
+    }
+}
+
+// 2c. WeaponShooterBehaviour.GetClipAmmo: RVA 0x405A650
+int (*old_WeaponShooterBehaviour_GetClipAmmo)(void *instance) = nullptr;
+int hook_WeaponShooterBehaviour_GetClipAmmo(void *instance) {
+    bool unlimited = g_unlimitedAmmo.load() || g_fastFireRate.load();
+    if (unlimited && instance != nullptr && isClientWeapon(instance)) {
+        return 999;
+    }
+    if (old_WeaponShooterBehaviour_GetClipAmmo != nullptr) {
+        return old_WeaponShooterBehaviour_GetClipAmmo(instance);
+    }
+    return 30;
 }
 
 // 3. WeaponShooterBehaviour.SetCooldown: RVA 0x405D084
@@ -625,16 +781,24 @@ ObscuredFloat hook_FPC_GetShotInterval2(void *fpc, void *weapon) {
 // 7. ShootCoroutine.MoveNext: RVA 0x40B93A0
 bool (*old_ShootCoroutine_MoveNext)(void *instance) = nullptr;
 bool hook_ShootCoroutine_MoveNext(void *instance) {
-    if (g_fastFireRate.load() && instance != nullptr && isPointerReadable(instance)) {
+    if (instance != nullptr && isPointerReadable(instance)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x20))) {
             void *fpc = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x20);
             if (fpc == g_localPlayerFPC.load() && fpc != nullptr) {
-                // Immediate fire without WaitForSeconds delay
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x28))) {
-                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0x28) = true;
+                g_lastPlayerShootMs.store(getCurrentTimeMs());
+                bool unlimited = g_unlimitedAmmo.load() || g_fastFireRate.load();
+                if (unlimited) {
+                    void *shooter = g_localPlayerShooter.load();
+                    if (shooter != nullptr) {
+                        safeApplyUnlimitedClipAmmo(shooter, 999);
+                    }
                 }
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x2C))) {
-                    *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(instance) + 0x2C) = 100.0f;
+                if (g_fastFireRate.load()) {
+                    // Do NOT force IsImmediate (at +0x28) to true!
+                    // Forcing IsImmediate = true breaks hip fire and causes auto-scoping on sniper/rifle weapons.
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x2C))) {
+                        *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(instance) + 0x2C) = 10.0f;
+                    }
                 }
             }
         }
@@ -741,13 +905,47 @@ static std::mutex g_entityMutex;
 static std::unordered_map<void*, uint64_t> g_networkPlayers; // NetworkPlayer* -> last seen ms
 static std::unordered_map<void*, uint64_t> g_botPlayers;     // BotPlayer* -> last seen ms
 static std::unordered_map<void*, void*> g_botNetPlayers;     // BotPlayer* -> NetworkPlayer*
-ESPManager *g_espManager = nullptr;
 
 static std::atomic<bool> g_needsBigHeadReset{false};
 static std::atomic<int> g_bigHeadResetFrames{0};
 
 static const Vector3 BIG_HEAD_SCALE(3.0f, 3.0f, 3.0f);
 static const Vector3 NORMAL_HEAD_SCALE(1.0f, 1.0f, 1.0f);
+
+void onESPPlayerUpdate(void *instance, bool isBot);
+void onESPPlayerDestroy(void *instance);
+void onESPClear();
+
+static inline bool isValidTargetType(int val) {
+    return (val > 0 && (val & 0xFF) != 0 && (val & ~0xFF) == 0);
+}
+
+static inline int extractTargetType(void *targetInfo) {
+    if (targetInfo == nullptr || !isPointerReadable(targetInfo)) return 0;
+
+    // 1. Direct memory read for Remote TargetInfo (TypeDefIndex 1590: TargetType is at offset 0x34)
+    if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
+        int val34 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
+        if (isValidTargetType(val34)) {
+            return val34;
+        }
+    }
+
+    // 2. Direct memory read for Local TargetInfo (TypeDefIndex 6459 & 3806: TargetType is at offset 0x30)
+    if (isPointerReadable(reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
+        int val30 = *reinterpret_cast<const int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
+        if (isValidTargetType(val30)) {
+            return val30;
+        }
+    }
+
+    return 0;
+}
+
+static inline bool isTargetInfoAlive(void *targetInfo) {
+    if (targetInfo == nullptr || !isPointerReadable(targetInfo)) return true;
+    return true;
+}
 
 static void onNetworkPlayerUpdate(void *instance) {
     if (instance == nullptr || !isUnityObjectAlive(instance)) return;
@@ -758,13 +956,7 @@ static void onNetworkPlayerUpdate(void *instance) {
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC0))) {
         void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC0);
         if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-            int tType = 0;
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
-                tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
-            }
-            if (tType == 0 && get_TargetType != nullptr) {
-                tType = get_TargetType(targetInfo);
-            }
+            int tType = extractTargetType(targetInfo);
             if (tType == 1) { // LocalPlayer
                 g_localPlayerNetPlayer.store(instance);
             }
@@ -776,8 +968,12 @@ static void onNetworkPlayerDestroy(void *instance) {
     if (instance == nullptr) return;
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_networkPlayers.erase(instance);
+    onESPPlayerDestroy(instance);
     if (instance == g_localPlayerNetPlayer.load()) {
         g_localPlayerNetPlayer.store(nullptr);
+        g_localPlayerTargetibleObject.store(nullptr);
+        g_activeAimingControl.store(nullptr);
+        onESPClear();
     }
 }
 
@@ -786,10 +982,29 @@ static void onBotPlayerUpdate(void *instance) {
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_botPlayers[instance] = getCurrentTimeMs();
 
+    void *netPlayer = nullptr;
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x50))) {
-        void *netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x50);
+        netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x50);
         if (netPlayer != nullptr && isUnityObjectAlive(netPlayer)) {
             g_botNetPlayers[instance] = netPlayer;
+        }
+    }
+
+    // Dynamic Player Team Calibration from Bot TargetInfo / Teammate check
+    int bTeam = getBotTeam(instance);
+    if (bTeam == 0 || bTeam == 1) {
+        if (netPlayer != nullptr && isPointerReadable(netPlayer)) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
+                void *tInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
+                if (tInfo != nullptr && isPointerReadable(tInfo)) {
+                    int tType = extractTargetType(tInfo);
+                    if ((tType & (2 | 8 | 32)) != 0) { // BotAlly / Ally
+                        g_localPlayerTeam.store(bTeam);
+                    } else if ((tType & (4 | 16 | 64 | 128)) != 0) { // BotEnemy / Enemy
+                        g_localPlayerTeam.store(1 - bTeam);
+                    }
+                }
+            }
         }
     }
 }
@@ -799,6 +1014,7 @@ static void onBotPlayerDestroy(void *instance) {
     std::lock_guard<std::mutex> lock(g_entityMutex);
     g_botPlayers.erase(instance);
     g_botNetPlayers.erase(instance);
+    onESPPlayerDestroy(instance);
 }
 
 static EntityStats getEntityStats() {
@@ -808,7 +1024,7 @@ static EntityStats getEntityStats() {
 
     std::set<void*> activeBotNets;
     for (auto it = g_botPlayers.begin(); it != g_botPlayers.end(); ) {
-        if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
+        if (now - it->second > TIMEOUT_MS) {
             g_botNetPlayers.erase(it->first);
             it = g_botPlayers.erase(it);
         } else {
@@ -823,7 +1039,7 @@ static EntityStats getEntityStats() {
     int totalNetPlayers = 0;
     int realCount = 0;
     for (auto it = g_networkPlayers.begin(); it != g_networkPlayers.end(); ) {
-        if (now - it->second > TIMEOUT_MS || !isUnityObjectAlive(it->first)) {
+        if (now - it->second > TIMEOUT_MS) {
             it = g_networkPlayers.erase(it);
         } else {
             totalNetPlayers++;
@@ -861,10 +1077,7 @@ static void resetEntityCounters() {
     g_localPlayerTargetibleObject.store(nullptr);
     g_localPlayerNetPlayer.store(nullptr);
     g_activeAimingControl.store(nullptr);
-    {
-        std::lock_guard<std::mutex> espLock(s_espSharedMutex);
-        s_espSharedCount = 0;
-    }
+    onESPClear();
     ModLog("[STATS] Entity counters reset manually.");
 }
 
@@ -1004,106 +1217,192 @@ static void applyBigHeadToBotPlayer(void *botPlayer, const Vector3 &scale) {
 }
 
 // =========================================================================
-// Advanced Bone-Lock Aim Assist System
+// Advanced Entity Target & Team Discrimination Engine
 // =========================================================================
 
-static bool isNetworkPlayerTeammate(void *netPlayer) {
-    if (netPlayer == nullptr || !isPointerReadable(netPlayer)) return true;
-    if (!isUnityObjectAlive(netPlayer)) return true; // Destroyed -> ignore
-
-    // Ignore self
-    void *localNet = g_localPlayerNetPlayer.load();
-    if (localNet != nullptr && netPlayer == localNet) {
-        return true;
+static inline int getBotTeam(void *botPlayer) {
+    if (botPlayer == nullptr || !isPointerReadable(botPlayer) || !isUnityObjectAlive(botPlayer)) return -1;
+    // 1. Direct read <Team>k__BackingField at offset 0xE0
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE0))) {
+        int tE0 = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE0);
+        if (tE0 == 0 || tE0 == 1) return tE0;
     }
-
-    // 1. Check targetInfo at offset 0xC0
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
-        void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
-        if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-            int tType = 0;
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30))) {
-                tType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x30);
-            }
-            if (tType == 0 && get_TargetType != nullptr) {
-                tType = get_TargetType(targetInfo);
-            }
-
-            if (tType != 0) {
-                if (tType == 1) { // LocalPlayer
-                    g_localPlayerNetPlayer.store(netPlayer);
-                    return true;
-                }
-                // Bitmask: LocalPlayer (1) | OtherPlayerAlly (2) | VehicleAlly (8) | BotAlly (32) = 43
-                if ((tType & (1 | 2 | 8 | 32)) != 0) {
-                    return true; // Marked as ally by game engine!
-                }
-                // Bitmask: OtherPlayerEnemy (4) | VehicleEnemy (16) | BotEnemy (64) | BotDeathmatch (128) = 212
-                if ((tType & (4 | 16 | 64 | 128)) != 0) {
-                    return false; // Confirmed enemy!
-                }
+    // 2. Direct read <Team>k__BackingField at offset 0xE4
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE4))) {
+        int tE4 = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xE4);
+        if (tE4 == 0 || tE4 == 1) return tE4;
+    }
+    // 3. PlayerSpawnPoint at offset 0xB0 -> _team at offset 0x38
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0xB0))) {
+        void *sp = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0xB0);
+        if (sp != nullptr && isPointerReadable(sp) && isUnityObjectAlive(sp)) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(sp) + 0x38))) {
+                int spTeam = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(sp) + 0x38);
+                if (spTeam == 0 || spTeam == 1) return spTeam;
             }
         }
     }
-
-    // 2. Check NetworkPlayer.IsTeammate if local player is known
-    if (localNet != nullptr && NetworkPlayer_IsTeammate != nullptr && isUnityObjectAlive(localNet)) {
-        if (NetworkPlayer_IsTeammate(netPlayer, localNet)) {
-            return true;
-        }
+    // 4. BotPlayer_GetTeam getter (RVA 0x4449610)
+    if (BotPlayer_GetTeam != nullptr) {
+        int t = BotPlayer_GetTeam(botPlayer);
+        if (t == 0 || t == 1) return t;
     }
-
-    return false;
+    return -1;
 }
 
-static bool isTargetibleObjectTeammate(void *targetibleObj) {
-    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return false;
-    if (!isUnityObjectAlive(targetibleObj)) return false;
+static inline int classifyEntityAffiliation(void *netPlayer, void *targetibleObj, void *botPlayer = nullptr) {
+    // Returns:
+    //  1: Confirmed Enemy (TARGET THIS)
+    // -1: Confirmed Ally / Teammate / Self (DO NOT TARGET)
+    //  0: Inconclusive
 
-    // Ignore self if targetibleObject belongs to local player
-    void *localTObj = g_localPlayerTargetibleObject.load();
-    if (localTObj != nullptr && targetibleObj == localTObj) {
-        return true;
-    }
-
-    // 1. Check associated NetworkPlayer at offset 0xD8
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8))) {
-        void *targetNetPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8);
-        if (targetNetPlayer != nullptr && isPointerReadable(targetNetPlayer) && isUnityObjectAlive(targetNetPlayer)) {
-            if (isNetworkPlayerTeammate(targetNetPlayer)) {
-                return true;
+    // 1. Cross-resolve pointers so none is missing if available
+    if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
+        if (netPlayer == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50))) {
+            netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50);
+        }
+        if (targetibleObj == nullptr) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
+                targetibleObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
+            }
+            if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
+                targetibleObj = BotPlayer_GetTargetibleObject(botPlayer);
             }
         }
     }
 
-    // 2. Check TargetibleObjectCustomSettings at offset 0x90
-    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
-        void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
-        if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
-            // A. Call get_AllyObjectToogle (RVA 0x4DED164)
-            if (get_AllyObjectToogle != nullptr && get_AllyObjectToogle(customSettings)) {
-                return true;
-            }
-            // B. Direct check of <AllyObjectToogle>k__BackingField at offset 0x20
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
-                if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20)) {
-                    return true;
-                }
-            }
-            // C. Direct check on _allyData at offset 0x30
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x30))) {
-                void *allyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x30);
-                if (allyData != nullptr && isPointerReadable(allyData) &&
-                    isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(allyData) + 0x10))) {
-                    if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(allyData) + 0x10)) {
-                        return true;
+    if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
+        if (netPlayer == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8))) {
+            netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0xD8);
+        }
+    }
+
+    if (netPlayer != nullptr && isPointerReadable(netPlayer) && isUnityObjectAlive(netPlayer)) {
+        if (targetibleObj == nullptr && NetworkPlayer_GetTargetibleObject != nullptr) {
+            targetibleObj = NetworkPlayer_GetTargetibleObject(netPlayer);
+        }
+    }
+
+    // 2. Strict Self / Local Player Exclusion
+    void *localNet = g_localPlayerNetPlayer.load();
+    if (localNet != nullptr && netPlayer != nullptr && netPlayer == localNet) return -1;
+    void *localTObj = g_localPlayerTargetibleObject.load();
+    if (localTObj != nullptr && targetibleObj != nullptr && targetibleObj == localTObj) return -1;
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc != nullptr && botPlayer != nullptr && botPlayer == localFpc) return -1;
+
+    // Resolve localNet if not currently cached
+    if (localNet == nullptr && localFpc != nullptr && isUnityObjectAlive(localFpc) && FPC_GetNetworkPlayer != nullptr) {
+        localNet = FPC_GetNetworkPlayer(localFpc);
+        if (localNet != nullptr && isUnityObjectAlive(localNet)) {
+            g_localPlayerNetPlayer.store(localNet);
+        }
+    }
+
+    // 3. TARGETINFO CLASSIFICATION (Engine's explicit bitmask classification)
+    if (netPlayer != nullptr && isPointerReadable(netPlayer) && isUnityObjectAlive(netPlayer)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
+            void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
+            if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
+                int tType = extractTargetType(targetInfo);
+                if (tType != 0) {
+                    if (tType == 1) { // LocalPlayer
+                        g_localPlayerNetPlayer.store(netPlayer);
+                        return -1; // Self
+                    }
+                    // Bitmask: OtherPlayerAlly (2) | VehicleAlly (8) | BotAlly (32) = 42
+                    if ((tType & (2 | 8 | 32)) != 0) {
+                        if (botPlayer != nullptr) {
+                            int bTeam = getBotTeam(botPlayer);
+                            if (bTeam == 0 || bTeam == 1) g_localPlayerTeam.store(bTeam);
+                        }
+                        return -1; // Confirmed Ally/Teammate!
+                    }
+                    // Bitmask: OtherPlayerEnemy (4) | VehicleEnemy (16) | BotEnemy (64) | BotDeathmatch (128) = 212
+                    if ((tType & (4 | 16 | 64 | 128)) != 0) {
+                        if (botPlayer != nullptr) {
+                            int bTeam = getBotTeam(botPlayer);
+                            if (bTeam == 0 || bTeam == 1) g_localPlayerTeam.store(1 - bTeam);
+                        }
+                        return 1; // Confirmed Enemy!
                     }
                 }
             }
         }
     }
 
+    // 4. TargetibleObjectCustomSettings Ally Toggle Check
+    if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
+            void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
+            if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
+                    if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20)) {
+                        return -1; // Ally Toggle is active!
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. BotPlayer Team Comparison Check
+    if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
+        int bTeam = getBotTeam(botPlayer);
+        int myTeam = g_localPlayerTeam.load();
+        if (bTeam >= 0 && myTeam >= 0) {
+            if (bTeam == myTeam) {
+                return -1; // Teammate bot!
+            } else {
+                return 1; // Enemy bot!
+            }
+        }
+    }
+
+    // 6. Fallback for distinct non-local network player
+    if (localNet != nullptr && netPlayer != nullptr && netPlayer != localNet) {
+        return 1;
+    }
+
+    return 0; // Inconclusive
+}
+
+static inline bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botPlayer = nullptr) {
+    int cls = classifyEntityAffiliation(entityNetPlayer, targetibleObj, botPlayer);
+    if (cls == 1) return true;
+    if (cls == -1) return false;
+    if (botPlayer != nullptr) {
+        int bTeam = getBotTeam(botPlayer);
+        int myTeam = g_localPlayerTeam.load();
+        if (bTeam >= 0 && myTeam >= 0) {
+            return (bTeam != myTeam);
+        }
+        // If myTeam is uncalibrated, default bot to enemy unless proven teammate (cls == -1)
+        return true;
+    }
+    void *localNet = g_localPlayerNetPlayer.load();
+    if (entityNetPlayer != nullptr) {
+        if (localNet != nullptr && entityNetPlayer == localNet) {
+            return false;
+        }
+        return true;
+    }
     return false;
+}
+
+static inline bool isNetworkPlayerTeammate(void *netPlayer) {
+    if (netPlayer == nullptr) return false;
+    void *localNet = g_localPlayerNetPlayer.load();
+    if (localNet != nullptr && netPlayer == localNet) return true;
+    int cls = classifyEntityAffiliation(netPlayer, nullptr, nullptr);
+    return (cls == -1);
+}
+
+static inline bool isTargetibleObjectTeammate(void *targetibleObj) {
+    if (targetibleObj == nullptr) return false;
+    void *localTObj = g_localPlayerTargetibleObject.load();
+    if (localTObj != nullptr && targetibleObj == localTObj) return true;
+    int cls = classifyEntityAffiliation(nullptr, targetibleObj, nullptr);
+    return (cls == -1);
 }
 
 static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj) {
@@ -1111,24 +1410,6 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
     if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
         if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(targetibleObj)) {
             return true;
-        }
-
-        if (Collider_get_enabled != nullptr) {
-            void *headCol = nullptr;
-            void *bodyCol = nullptr;
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40))) {
-                headCol = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40);
-            }
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48))) {
-                bodyCol = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48);
-            }
-            bool headValid = (headCol != nullptr && isUnityObjectAlive(headCol));
-            bool bodyValid = (bodyCol != nullptr && isUnityObjectAlive(bodyCol));
-            if (headValid && bodyValid) {
-                if (!Collider_get_enabled(headCol) && !Collider_get_enabled(bodyCol)) {
-                    return true;
-                }
-            }
         }
     }
 
@@ -1140,15 +1421,16 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30))) {
             void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30);
             if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
-                    float hp = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
-                    if (hp <= 0.0f) {
-                        return true;
-                    }
+                // Max HP is at offset 0x30 in BotPlayerHealth
+                float maxHp = 0.0f;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x30))) {
+                    maxHp = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x30);
                 }
                 if (BotPlayerHealth_GetHealth != nullptr) {
                     float hp = BotPlayerHealth_GetHealth(botHealth);
-                    if (hp <= 0.0f) {
+                    // Only consider dead if max HP was properly loaded (> 0) and current HP <= 0.
+                    // If hp == 0.0f and maxHp == 0.0f (pre-combat lazy uninitialized), the bot is alive!
+                    if (maxHp > 0.0f && hp <= 0.0f) {
                         return true;
                     }
                 }
@@ -1164,11 +1446,8 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
             void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
             if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34))) {
-                    bool isAlive = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(targetInfo) + 0x34);
-                    if (!isAlive) {
-                        return true;
-                    }
+                if (!isTargetInfoAlive(targetInfo)) {
+                    return true;
                 }
             }
         }
@@ -1177,50 +1456,220 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
     return false;
 }
 
-static bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, void *botPlayer = nullptr) {
-    if (entityNetPlayer != nullptr && isPointerReadable(entityNetPlayer)) {
-        if (isNetworkPlayerTeammate(entityNetPlayer)) return false;
-    }
-    if (targetibleObj != nullptr && isPointerReadable(targetibleObj)) {
-        if (isTargetibleObjectTeammate(targetibleObj)) return false;
-    }
-    if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50))) {
-            void *botNet = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50);
-            if (botNet != nullptr && isPointerReadable(botNet) && isUnityObjectAlive(botNet)) {
-                if (isNetworkPlayerTeammate(botNet)) return false;
-            }
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
-            void *botTObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
-            if (botTObj != nullptr && isPointerReadable(botTObj) && isUnityObjectAlive(botTObj)) {
-                if (isTargetibleObjectTeammate(botTObj)) return false;
-            }
-        }
-    }
-    return true;
-}
-
 static bool isTargetObstructedByWall(const Vector3 &camPos, const Vector3 &bonePos) {
-    if (Internal_RaycastTest_Injected == nullptr || Physics_get_defaultPhysicsScene == nullptr) return false;
+    if (Internal_RaycastTest_Injected == nullptr) return false;
 
     Vector3 diff = bonePos - camPos;
     float dist3D = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
-    if (dist3D <= 0.8f) {
+    if (dist3D <= 1.0f) {
         return false;
     }
 
     Vector3 dirNorm = diff / dist3D;
     Ray ray;
-    ray.origin = camPos + dirNorm * 0.45f;
+    ray.origin = camPos + dirNorm * 0.75f;
     ray.direction = dirNorm;
 
-    float checkDist = dist3D - 0.80f;
-    if (checkDist <= 0.1f) checkDist = 0.1f;
+    float checkDist = dist3D - 1.10f;
+    if (checkDist <= 0.1f) return false;
 
-    PhysicsScene scene = Physics_get_defaultPhysicsScene();
+    PhysicsScene scene(0, 0);
+    if (Physics_get_defaultPhysicsScene != nullptr) {
+        scene = Physics_get_defaultPhysicsScene();
+    }
+
+    // Layer mask 1: Test only static world geometry (Default layer 0), avoiding player/ragdoll/weapon colliders
     bool isBlocked = Internal_RaycastTest_Injected(&scene, &ray, checkDist, 1, 1);
     return isBlocked;
+}
+
+#include "ESPManager.h"
+
+// Global ESPManager instance (matching tutorial architecture)
+static ESPManager *espManager = nullptr;
+
+static std::atomic<bool> g_espMaster{false};
+static std::atomic<bool> g_espBox{true};
+static std::atomic<bool> g_espLine{true};
+static std::atomic<bool> g_espDistance{true};
+static std::atomic<bool> g_espHealth{true};
+static std::atomic<bool> g_espName{true};
+static std::atomic<bool> g_espEnemyOnly{true};
+static std::atomic<int> g_espMaxDistance{200};
+
+// ESP Shared State between Unity thread and Java UI thread
+static std::atomic<int> g_espScreenWidth{0};
+static std::atomic<int> g_espScreenHeight{0};
+static std::vector<float> g_espDrawData;
+static std::mutex g_espDataMutex;
+static std::atomic<uint64_t> g_lastEspUpdateMs{0};
+
+void onESPPlayerUpdate(void *instance, bool isBot) {
+    if (espManager != nullptr) {
+        espManager->tryAddEnemy(instance, isBot);
+    }
+}
+
+void onESPPlayerDestroy(void *instance) {
+    if (espManager != nullptr) {
+        espManager->removeEnemyGivenObject(instance);
+    }
+}
+
+void onESPClear() {
+    if (espManager != nullptr) {
+        espManager->clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        g_espDrawData.clear();
+    }
+    g_lastEspUpdateMs.store(0);
+}
+
+// Executes synchronously on the Unity Main Engine Thread inside hook_AimingControl_Update
+static void updateEspData(void *aimingControl) {
+    if (aimingControl == nullptr || !isUnityObjectAlive(aimingControl) || espManager == nullptr) {
+        return;
+    }
+
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc == nullptr || !isUnityObjectAlive(localFpc)) {
+        onESPClear();
+        return;
+    }
+
+    void *cam = nullptr;
+    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20))) {
+        cam = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20);
+    }
+    if (cam == nullptr || !isUnityObjectAlive(cam)) {
+        if (Camera_get_main != nullptr) {
+            cam = Camera_get_main();
+        }
+    }
+    if (cam == nullptr || !isUnityObjectAlive(cam)) {
+        return;
+    }
+
+    int screenWidth = g_espScreenWidth.load();
+    int screenHeight = g_espScreenHeight.load();
+    if (screenWidth <= 0 || screenHeight <= 0) {
+        return;
+    }
+
+    float maxDist = static_cast<float>(g_espMaxDistance.load());
+    bool enemyOnly = g_espEnemyOnly.load();
+
+    std::vector<ESPEntityItem> activeEntities;
+    {
+        std::lock_guard<std::mutex> lock(g_entityMutex);
+
+        // 1. Gather all active bot NetworkPlayer pointers (Hardened: do not purge idle/pre-damage bots)
+        std::set<void*> activeBotNets;
+        for (auto it = g_botPlayers.begin(); it != g_botPlayers.end(); ) {
+            if (!isUnityObjectAlive(it->first)) {
+                g_botNetPlayers.erase(it->first);
+                it = g_botPlayers.erase(it);
+            } else {
+                void *botObj = it->first;
+                void *botNet = nullptr;
+                auto netIt = g_botNetPlayers.find(botObj);
+                if (netIt != g_botNetPlayers.end()) {
+                    botNet = netIt->second;
+                } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botObj) + 0x50))) {
+                    botNet = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botObj) + 0x50);
+                    if (botNet != nullptr && isUnityObjectAlive(botNet)) {
+                        g_botNetPlayers[botObj] = botNet;
+                    }
+                }
+                if (botNet != nullptr && isUnityObjectAlive(botNet)) {
+                    activeBotNets.insert(botNet);
+                }
+                activeEntities.push_back({botObj, true, botNet});
+                ++it;
+            }
+        }
+
+        // 2. Gather NetworkPlayers that are NOT bots and NOT local player
+        void *localPlayer = g_localPlayerNetPlayer.load();
+        for (auto it = g_networkPlayers.begin(); it != g_networkPlayers.end(); ) {
+            if (!isUnityObjectAlive(it->first)) {
+                it = g_networkPlayers.erase(it);
+            } else {
+                void *netObj = it->first;
+                if (netObj != localPlayer && activeBotNets.find(netObj) == activeBotNets.end()) {
+                    // Real other player in match
+                    activeEntities.push_back({netObj, false, netObj});
+                }
+                ++it;
+            }
+        }
+    }
+
+    if (activeEntities.empty()) {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        g_espDrawData.clear();
+        g_lastEspUpdateMs.store(getCurrentTimeMs());
+        return;
+    }
+
+    std::vector<float> buffer;
+    buffer.reserve(activeEntities.size() * 9);
+
+    espManager->collectESPDataFromList(cam, screenWidth, screenHeight, maxDist, enemyOnly, activeEntities, buffer);
+
+    {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        g_espDrawData = std::move(buffer);
+    }
+    g_lastEspUpdateMs.store(getCurrentTimeMs());
+}
+
+// Thread-safe JNI consumer called on Android UI thread (Zero Unity engine calls)
+jfloatArray GetESPData(JNIEnv *env, jobject thiz, jint screenWidth, jint screenHeight) {
+    if (screenWidth > 0 && screenHeight > 0) {
+        g_espScreenWidth.store(screenWidth);
+        g_espScreenHeight.store(screenHeight);
+    }
+
+    if (!g_espMaster.load()) {
+        return env->NewFloatArray(0);
+    }
+
+    uint64_t now = getCurrentTimeMs();
+    uint64_t lastUpdate = g_lastEspUpdateMs.load();
+    if (now - lastUpdate > 400) {
+        return env->NewFloatArray(0);
+    }
+
+    std::vector<float> copy;
+    {
+        std::lock_guard<std::mutex> lock(g_espDataMutex);
+        if (g_espDrawData.empty()) {
+            return env->NewFloatArray(0);
+        }
+        copy = g_espDrawData;
+    }
+
+    jfloatArray result = env->NewFloatArray(static_cast<jsize>(copy.size()));
+    if (result != nullptr && !copy.empty()) {
+        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(copy.size()), copy.data());
+    }
+    return result;
+}
+
+jboolean GetESPSetting(JNIEnv *env, jobject thiz, jint settingId) {
+    switch (settingId) {
+        case 0: return static_cast<jboolean>(g_espMaster.load());
+        case 1: return static_cast<jboolean>(g_espBox.load());
+        case 2: return static_cast<jboolean>(g_espLine.load());
+        case 3: return static_cast<jboolean>(g_espDistance.load());
+        case 4: return static_cast<jboolean>(g_espHealth.load());
+        case 5: return static_cast<jboolean>(g_espName.load());
+        case 6: return static_cast<jboolean>(g_espEnemyOnly.load());
+        default: return JNI_FALSE;
+    }
 }
 
 struct TargetBoneInfo {
@@ -1250,15 +1699,13 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
     std::vector<void*> candidateBotPlayers;
     {
         std::lock_guard<std::mutex> lock(g_entityMutex);
-        uint64_t now = getCurrentTimeMs();
-        const uint64_t TIMEOUT_MS = 2500;
         for (const auto &pair : g_networkPlayers) {
-            if (pair.first != nullptr && now - pair.second <= TIMEOUT_MS) {
+            if (pair.first != nullptr && isUnityObjectAlive(pair.first)) {
                 candidateNetPlayers.push_back(pair.first);
             }
         }
         for (const auto &pair : g_botPlayers) {
-            if (pair.first != nullptr && now - pair.second <= TIMEOUT_MS) {
+            if (pair.first != nullptr && isUnityObjectAlive(pair.first)) {
                 candidateBotPlayers.push_back(pair.first);
             }
         }
@@ -1282,16 +1729,20 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
                 return;
             }
 
-            Quaternion boneLook = Quaternion::LookRotation(aimDir, Vector3(0.0f, 1.0f, 0.0f));
-            Vector3 boneAngle = ToEulerRad(boneLook);
-            if (boneAngle.x >= 275.0f) boneAngle.x -= 360.0f;
-            if (boneAngle.x <= -275.0f) boneAngle.x += 360.0f;
+            float hyp = sqrtf(aimDir.x * aimDir.x + aimDir.z * aimDir.z);
+            if (hyp < 1e-4f) return;
 
-            float dyaw = boneAngle.y - currentYaw;
+            // Direct closed-form spherical angle calculation matching Unity camera orientation
+            float boneYaw = atan2f(aimDir.x, aimDir.z) * (180.0f / static_cast<float>(M_PI));
+            if (boneYaw < 0.0f) boneYaw += 360.0f;
+
+            float bonePitch = -atan2f(aimDir.y, hyp) * (180.0f / static_cast<float>(M_PI));
+
+            float dyaw = boneYaw - currentYaw;
             while (dyaw > 180.0f) dyaw -= 360.0f;
             while (dyaw < -180.0f) dyaw += 360.0f;
 
-            float dpitch = boneAngle.x - currentPitch;
+            float dpitch = bonePitch - currentPitch;
             while (dpitch > 180.0f) dpitch -= 360.0f;
             while (dpitch < -180.0f) dpitch += 360.0f;
 
@@ -1303,7 +1754,7 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             }
 
             if (angleOffset <= allowedAngle) {
-                float score = angleOffset;
+                float score = angleOffset * (1.0f + 0.003f * dist3D);
                 if (isHead) score *= 0.70f;
 
                 if (score < bestTarget.score) {
@@ -1313,8 +1764,8 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
                     bestTarget.dist3D = dist3D;
                     bestTarget.bonePos = bonePos;
                     bestTarget.isHead = isHead;
-                    bestTarget.targetYaw = boneAngle.y;
-                    bestTarget.targetPitch = boneAngle.x;
+                    bestTarget.targetYaw = boneYaw;
+                    bestTarget.targetPitch = bonePitch;
                     bestTarget.targetibleObj = targetibleObj;
                 }
             }
@@ -1327,6 +1778,12 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
             checkBone(bodyTransform, false, Vector3(0.0f, 0.0f, 0.0f));
         }
 
+        // If head was not found but body was found, synthesize head target above body
+        if (headTransform == nullptr && bodyTransform != nullptr && isUnityObjectAlive(bodyTransform)) {
+            checkBone(bodyTransform, true, Vector3(0.0f, 0.40f, 0.0f));
+        }
+
+        // Fallback using entity root transform if neither bone was available
         if (headTransform == nullptr && bodyTransform == nullptr && fallbackEntity != nullptr && isUnityObjectAlive(fallbackEntity) && get_transform != nullptr) {
             void *rootTransform = get_transform(fallbackEntity);
             if (rootTransform != nullptr && isUnityObjectAlive(rootTransform)) {
@@ -1538,460 +1995,54 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
     return bestTarget;
 }
 
-// =========================================================================
-// Real-time ESP Entity Query, Team Filtering & Screen Projection
-// =========================================================================
-
-static void* getBestActiveCamera(void *passedAimingControl = nullptr) {
-    void *cameraObj = nullptr;
-    void *ac = passedAimingControl ? passedAimingControl : g_activeAimingControl.load();
-    if (ac != nullptr && isUnityObjectAlive(ac)) {
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0x20))) {
-            cameraObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0x20);
-            if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
-                return cameraObj;
-            }
-        }
-    }
-    if (Camera_get_main != nullptr) {
-        cameraObj = Camera_get_main();
-        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
-            return cameraObj;
-        }
-    }
-    return nullptr;
-}
-
-ESPManager::ESPManager() {
-    isEspEnabled.store(false);
-    espLine.store(false);
-    espBox.store(false);
-    espHealth.store(true);
-    espDistance.store(true);
-    espTeamFilter.store(true);
-}
-
-ESPManager::~ESPManager() = default;
-
-void ESPManager::updateOnEngineThread(void *passedAimingControl) {
-    if (!isEspEnabled.load()) {
-        std::lock_guard<std::mutex> lock(s_espSharedMutex);
-        s_espSharedCount = 0;
-        return;
-    }
-
-    uint64_t now = getCurrentTimeMs();
-    if (now - s_espLastProduceMs.load() < 8) {
-        return; // Throttle to max ~120 fps
-    }
-
-    int screenW = s_espClientWidth.load();
-    int screenH = s_espClientHeight.load();
-    if (screenW <= 0 || screenH <= 0) {
-        screenW = 1920;
-        screenH = 1080;
-    }
-
-    static ESPEntityData tempBuffer[64];
-    int count = getVisibleEntities(tempBuffer, 64, screenW, screenH, passedAimingControl);
-
-    {
-        std::lock_guard<std::mutex> lock(s_espSharedMutex);
-        if (count > 0) {
-            memcpy(s_espSharedBuffer, tempBuffer, count * sizeof(ESPEntityData));
-        }
-        s_espSharedCount = count;
-        s_espLastProduceMs.store(now);
-    }
-
-    static uint64_t s_lastEspLogMs = 0;
-    if (now - s_lastEspLogMs > 5000) {
-        s_lastEspLogMs = now;
-        ModLog("[ESP] Producer Active -> Visible: %d targets | Screen: %dx%d", count, screenW, screenH);
-    }
-}
-
-int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int screenW, int screenH, void *passedAimingControl) {
-    if (!isEspEnabled.load()) {
-        return 0;
-    }
-    if (outArray == nullptr || maxCount <= 0 || screenW <= 0 || screenH <= 0) {
-        return 0;
-    }
-
-    void *cameraObj = getBestActiveCamera(passedAimingControl);
-    if (cameraObj == nullptr || !isUnityObjectAlive(cameraObj)) {
-        return 0;
-    }
-
-    Vector3 camPos(0.0f, 0.0f, 0.0f);
-    void *aimingControl = passedAimingControl ? passedAimingControl : g_activeAimingControl.load();
-    if (aimingControl != nullptr && isUnityObjectAlive(aimingControl)) {
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x30))) {
-            void *elevationNode = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x30);
-            if (elevationNode != nullptr && isUnityObjectAlive(elevationNode)) {
-                camPos = getTransformPosition(elevationNode);
-            }
-        }
-    }
-
-    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
-        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj) && get_transform != nullptr) {
-            void *camTrans = get_transform(cameraObj);
-            if (camTrans != nullptr && isUnityObjectAlive(camTrans)) {
-                camPos = getTransformPosition(camTrans);
-            }
-        }
-    }
-
-    std::vector<void*> candidateNetPlayers;
-    std::vector<void*> candidateBotPlayers;
-    std::set<void*> activeBotNets;
-    {
-        std::lock_guard<std::mutex> lock(g_entityMutex);
-        uint64_t now = getCurrentTimeMs();
-        const uint64_t TIMEOUT_MS = 2500;
-
-        for (const auto &pair : g_botPlayers) {
-            if (pair.first != nullptr && now - pair.second <= TIMEOUT_MS) {
-                candidateBotPlayers.push_back(pair.first);
-                auto netIt = g_botNetPlayers.find(pair.first);
-                if (netIt != g_botNetPlayers.end()) {
-                    activeBotNets.insert(netIt->second);
-                }
-            }
-        }
-        for (const auto &pair : g_networkPlayers) {
-            if (pair.first != nullptr && now - pair.second <= TIMEOUT_MS) {
-                if (activeBotNets.find(pair.first) == activeBotNets.end()) {
-                    candidateNetPlayers.push_back(pair.first);
-                }
-            }
-        }
-    }
-
-    int count = 0;
-    bool filterTeam = espTeamFilter.load();
-
-    auto processEntity = [&](void *headTransform, void *bodyTransform, void *targetibleObj,
-                             void *netPlayer, void *fallbackEntity, void *botPlayer,
-                             bool isBotEntity, float knownHealth) {
-        if (count >= maxCount) return;
-
-        void *localNet = g_localPlayerNetPlayer.load();
-        if (netPlayer != nullptr && localNet != nullptr && netPlayer == localNet) {
-            return;
-        }
-
-        if (isEntityDeadOrCorpse(netPlayer, botPlayer, targetibleObj)) {
-            return;
-        }
-
-        bool isEnemy = isEntityEnemy(netPlayer, targetibleObj, botPlayer);
-
-        // Filter Tim: if filterTeam is active, ignore teammates!
-        if (filterTeam && !isEnemy) {
-            return;
-        }
-
-        Vector3 headWorld(0.0f, 0.0f, 0.0f);
-        Vector3 rootWorld(0.0f, 0.0f, 0.0f);
-
-        if (headTransform != nullptr && isUnityObjectAlive(headTransform)) {
-            headWorld = getTransformPosition(headTransform);
-        }
-        if (bodyTransform != nullptr && isUnityObjectAlive(bodyTransform)) {
-            rootWorld = getTransformPosition(bodyTransform);
-        }
-
-        if (headWorld.x == 0.0f && headWorld.y == 0.0f && headWorld.z == 0.0f) {
-            if (rootWorld.x != 0.0f || rootWorld.y != 0.0f || rootWorld.z != 0.0f) {
-                headWorld = rootWorld + Vector3(0.0f, 1.65f, 0.0f);
-            } else if (fallbackEntity != nullptr && isUnityObjectAlive(fallbackEntity) && get_transform != nullptr) {
-                void *rootTrans = get_transform(fallbackEntity);
-                if (rootTrans != nullptr && isUnityObjectAlive(rootTrans)) {
-                    rootWorld = getTransformPosition(rootTrans);
-                    headWorld = rootWorld + Vector3(0.0f, 1.65f, 0.0f);
-                }
-            }
-        }
-        if (rootWorld.x == 0.0f && rootWorld.y == 0.0f && rootWorld.z == 0.0f) {
-            if (headWorld.x != 0.0f || headWorld.y != 0.0f || headWorld.z != 0.0f) {
-                rootWorld = headWorld - Vector3(0.0f, 1.65f, 0.0f);
-            }
-        }
-
-        if (headWorld.x == 0.0f && headWorld.y == 0.0f && headWorld.z == 0.0f) {
-            return;
-        }
-
-        Vector3 headScreen(0.0f, 0.0f, 0.0f);
-        Vector3 rootScreen(0.0f, 0.0f, 0.0f);
-        bool headOk = worldToScreenOrViewport(cameraObj, headWorld, headScreen, screenW, screenH);
-        bool rootOk = worldToScreenOrViewport(cameraObj, rootWorld, rootScreen, screenW, screenH);
-
-        if (!headOk && !rootOk) {
-            return;
-        }
-
-        if (!headOk) {
-            headScreen = rootScreen;
-            float estH = std::max(20.0f, (static_cast<float>(screenH) * 0.12f) / (std::max(0.1f, rootScreen.z * 0.08f)));
-            headScreen.y -= estH;
-        }
-        if (!rootOk) {
-            rootScreen = headScreen;
-            float estH = std::max(20.0f, (static_cast<float>(screenH) * 0.12f) / (std::max(0.1f, headScreen.z * 0.08f)));
-            rootScreen.y += estH;
-        }
-
-        if (headScreen.x < -400.0f || headScreen.x > screenW + 400.0f ||
-            headScreen.y < -400.0f || headScreen.y > screenH + 400.0f) {
-            return;
-        }
-
-        float dist = headScreen.z;
-        if (dist <= 0.1f || std::isnan(dist) || std::isinf(dist)) {
-            Vector3 diff = headWorld - camPos;
-            dist = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
-        }
-        if (std::isnan(dist) || std::isinf(dist) || dist <= 0.0f) {
-            dist = 1.0f;
-        }
-
-        int isBlocked = 0;
-
-        int entityType = 0;
-        if (isEnemy) {
-            entityType = isBotEntity ? ESP_TYPE_ENEMY_BOT : ESP_TYPE_ENEMY_PLAYER;
-        } else {
-            entityType = isBotEntity ? ESP_TYPE_ALLY_BOT : ESP_TYPE_ALLY_PLAYER;
-        }
-
-        ESPEntityData &data = outArray[count++];
-        data.type = static_cast<float>(entityType);
-        data.screenHeadX = headScreen.x;
-        data.screenHeadY = headScreen.y;
-        data.screenRootX = rootScreen.x;
-        data.screenRootY = rootScreen.y;
-        data.distance = dist;
-        data.health = (knownHealth > 0.0f && !std::isnan(knownHealth)) ? knownHealth : 100.0f;
-        data.isObstructed = static_cast<float>(isBlocked);
-    };
-
-    // 1. Process candidate Real Players
-    for (void *netPlayer : candidateNetPlayers) {
-        if (count >= maxCount) break;
-        if (netPlayer == nullptr || !isPointerReadable(netPlayer) || !isUnityObjectAlive(netPlayer)) continue;
-
-        void *headBone = nullptr;
-        void *bodyBone = nullptr;
-        void *targetibleObj = nullptr;
-
-        if (NetworkPlayer_GetTargetibleObject != nullptr) {
-            targetibleObj = NetworkPlayer_GetTargetibleObject(netPlayer);
-            if (targetibleObj != nullptr && !isUnityObjectAlive(targetibleObj)) {
-                targetibleObj = nullptr;
-            }
-        }
-
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0x88))) {
-            void *dollsMgr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0x88);
-            if (dollsMgr != nullptr && isUnityObjectAlive(dollsMgr)) {
-                void *tpCtrl = nullptr;
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50))) {
-                    tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x50);
-                }
-                if (tpCtrl == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60))) {
-                    tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(dollsMgr) + 0x60);
-                }
-                if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
-                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78))) {
-                        void *animator = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78);
-                        if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
-                            void *hb = GetBoneTransform(animator, 10);
-                            if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
-                            void *bb = GetBoneTransform(animator, 9);
-                            if (bb == nullptr || !isUnityObjectAlive(bb)) {
-                                bb = GetBoneTransform(animator, 8);
-                            }
-                            if (bb != nullptr && isUnityObjectAlive(bb)) bodyBone = bb;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC8))) {
-            void *bpm = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC8);
-            if (bpm != nullptr && isPointerReadable(bpm)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bpm) + 0x20))) {
-                    void *bodyPointsArr = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bpm) + 0x20);
-                    if (bodyPointsArr != nullptr && isPointerReadable(bodyPointsArr)) {
-                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bodyPointsArr) + 0x18))) {
-                            uintptr_t length = *reinterpret_cast<uintptr_t *>(reinterpret_cast<uintptr_t>(bodyPointsArr) + 0x18);
-                            if (length > 0 && length < 32) {
-                                void **items = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bodyPointsArr) + 0x20);
-                                for (uintptr_t i = 0; i < length; i++) {
-                                    if (isPointerReadable(&items[i])) {
-                                        void *bp = items[i];
-                                        if (bp != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bp) + 0x10))) {
-                                            void *bpView = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(bp) + 0x10);
-                                            if (bpView != nullptr && isUnityObjectAlive(bpView) && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(bpView) + 0x20))) {
-                                                int pType = *reinterpret_cast<int *>(reinterpret_cast<uintptr_t>(bpView) + 0x20);
-                                                if (pType == 0 && headBone == nullptr && get_transform != nullptr) {
-                                                    void *t = get_transform(bpView);
-                                                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
-                                                } else if (pType != 0 && bodyBone == nullptr && get_transform != nullptr) {
-                                                    void *t = get_transform(bpView);
-                                                    if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (targetibleObj != nullptr && isUnityObjectAlive(targetibleObj)) {
-            if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40))) {
-                void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40);
-                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
-                    void *t = get_transform(col);
-                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
-                }
-            }
-            if (bodyBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48))) {
-                void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48);
-                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
-                    void *t = get_transform(col);
-                    if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
-                }
-            }
-        }
-
-        if (headBone == nullptr && bodyBone == nullptr && get_transform != nullptr) {
-            void *t = get_transform(netPlayer);
-            if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
-        }
-
-        float health = 100.0f;
-        processEntity(headBone, bodyBone, targetibleObj, netPlayer, netPlayer, nullptr, false, health);
-    }
-
-    // 2. Process candidate AI Bots
-    for (void *botPlayer : candidateBotPlayers) {
-        if (count >= maxCount) break;
-        if (botPlayer == nullptr || !isPointerReadable(botPlayer) || !isUnityObjectAlive(botPlayer)) continue;
-
-        void *headBone = nullptr;
-        void *bodyBone = nullptr;
-        void *targetibleObj = nullptr;
-        void *netPlayer = nullptr;
-
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50))) {
-            netPlayer = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x50);
-            if (netPlayer != nullptr && !isUnityObjectAlive(netPlayer)) {
-                netPlayer = nullptr;
-            }
-        }
-
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60))) {
-            targetibleObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x60);
-        }
-        if (targetibleObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
-            targetibleObj = BotPlayer_GetTargetibleObject(botPlayer);
-        }
-        if (targetibleObj != nullptr && !isUnityObjectAlive(targetibleObj)) {
-            targetibleObj = nullptr;
-        }
-
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x58))) {
-            void *tpCtrl = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x58);
-            if (tpCtrl != nullptr && isUnityObjectAlive(tpCtrl)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78))) {
-                    void *animator = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tpCtrl) + 0x78);
-                    if (animator != nullptr && isUnityObjectAlive(animator) && GetBoneTransform != nullptr) {
-                        void *hb = GetBoneTransform(animator, 10);
-                        if (hb != nullptr && isUnityObjectAlive(hb)) headBone = hb;
-                        void *bb = GetBoneTransform(animator, 9);
-                        if (bb == nullptr || !isUnityObjectAlive(bb)) {
-                            bb = GetBoneTransform(animator, 8);
-                        }
-                        if (bb != nullptr && isUnityObjectAlive(bb)) bodyBone = bb;
-                    }
-                }
-            }
-        }
-
-        if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x28))) {
-            void *botLook = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x28);
-            if (botLook != nullptr && isUnityObjectAlive(botLook)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botLook) + 0x28))) {
-                    void *t = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botLook) + 0x28);
-                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
-                }
-            }
-        }
-
-        if (targetibleObj != nullptr && isUnityObjectAlive(targetibleObj)) {
-            if (headBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40))) {
-                void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x40);
-                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
-                    void *t = get_transform(col);
-                    if (t != nullptr && isUnityObjectAlive(t)) headBone = t;
-                }
-            }
-            if (bodyBone == nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48))) {
-                void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48);
-                if (col != nullptr && isUnityObjectAlive(col) && get_transform != nullptr) {
-                    void *t = get_transform(col);
-                    if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
-                }
-            }
-        }
-
-        if (headBone == nullptr && bodyBone == nullptr && get_transform != nullptr) {
-            void *t = get_transform(botPlayer);
-            if (t != nullptr && isUnityObjectAlive(t)) bodyBone = t;
-        }
-
-        float health = 100.0f;
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30))) {
-            void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30);
-            if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
-                if (BotPlayerHealth_GetHealth != nullptr) {
-                    health = BotPlayerHealth_GetHealth(botHealth);
-                } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C))) {
-                    health = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x2C);
-                }
-            }
-        }
-
-        processEntity(headBone, bodyBone, targetibleObj, netPlayer, botPlayer, botPlayer, true, health);
-    }
-
-    return count;
-}
-
 static uint64_t g_lastAimAssistProcessMs = 0;
 static uint64_t g_lastAimAssistLogMs = 0;
-static float g_lastFrameYaw = 0.0f;
-static float g_lastFramePitch = 0.0f;
-static bool g_hasLastFrameAngles = false;
+static float g_lastEngineYaw = 0.0f;
+static float g_lastEnginePitch = 0.0f;
+static bool g_hasLastEngineAngles = false;
+
+static inline bool isLocalPlayerAiming(void *aimingControl, void *cameraObj) {
+    if (aimingControl != nullptr && isPointerReadable(aimingControl)) {
+        // Offset 0x58: AimingControl bool backing field
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x58))) {
+            if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x58)) {
+                return true;
+            }
+        }
+        // Offset 0x68: AimingControl bool backing field
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x68))) {
+            if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x68)) {
+                return true;
+            }
+        }
+    }
+    // Camera FOV reduction check (when aiming/ADS, FOV drops below standard ~60.0 degrees)
+    if (cameraObj != nullptr && Camera_get_fieldOfView != nullptr && isUnityObjectAlive(cameraObj)) {
+        float fov = Camera_get_fieldOfView(cameraObj);
+        if (fov > 5.0f && fov < 56.0f) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void processAimAssistLock(void *aimingControl) {
     if (aimingControl == nullptr || !isPointerReadable(aimingControl) || !isUnityObjectAlive(aimingControl)) return;
+
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc == nullptr || !isUnityObjectAlive(localFpc)) {
+        resetAimAssistState(aimingControl);
+        return;
+    }
 
     uint64_t nowMs = getCurrentTimeMs();
     if (nowMs - g_lastAimAssistProcessMs < 4) {
         return; // Debounce duplicate calls within the same frame (~16ms)
     }
+    float dt = (g_lastAimAssistProcessMs > 0) ? static_cast<float>(nowMs - g_lastAimAssistProcessMs) / 1000.0f : 0.016f;
     g_lastAimAssistProcessMs = nowMs;
+    if (dt < 0.005f) dt = 0.005f;
+    if (dt > 0.050f) dt = 0.050f;
 
     void *azimuthNode = nullptr;
     void *elevationNode = nullptr;
@@ -2021,35 +2072,33 @@ static void processAimAssistLock(void *aimingControl) {
     float currentYaw = azEuler.y;
     float currentPitch = (elEuler.x > 180.0f) ? (elEuler.x - 360.0f) : elEuler.x;
 
+    // Isolate user touch / swipe delta cleanly from the engine's unassisted angles.
+    // We DO NOT feed our applied assist step into g_lastEngineYaw!
+    // This permanently breaks the -step feedback loop that caused the 30Hz micro-shake vibration.
     float userDeltaYaw = 0.0f;
     float userDeltaPitch = 0.0f;
-    if (g_hasLastFrameAngles) {
-        userDeltaYaw = currentYaw - g_lastFrameYaw;
+    if (g_hasLastEngineAngles) {
+        userDeltaYaw = currentYaw - g_lastEngineYaw;
         while (userDeltaYaw > 180.0f) userDeltaYaw -= 360.0f;
         while (userDeltaYaw < -180.0f) userDeltaYaw += 360.0f;
 
-        userDeltaPitch = currentPitch - g_lastFramePitch;
+        userDeltaPitch = currentPitch - g_lastEnginePitch;
         while (userDeltaPitch > 180.0f) userDeltaPitch -= 360.0f;
         while (userDeltaPitch < -180.0f) userDeltaPitch += 360.0f;
     }
-    g_lastFrameYaw = currentYaw;
-    g_lastFramePitch = currentPitch;
-    g_hasLastFrameAngles = true;
+    g_lastEngineYaw = currentYaw;
+    g_lastEnginePitch = currentPitch;
+    g_hasLastEngineAngles = true;
 
-    Vector3 camPos = getTransformPosition(elevationNode);
+    float userSpeed = sqrtf(userDeltaYaw * userDeltaYaw + userDeltaPitch * userDeltaPitch);
+
+    // Resolve true camera position
+    void *camTrans = (cameraObj != nullptr && get_transform != nullptr) ? get_transform(cameraObj) : nullptr;
+    Vector3 camPos = (camTrans != nullptr && isUnityObjectAlive(camTrans)) ? getTransformPosition(camTrans) : getTransformPosition(elevationNode);
     if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
-        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj) && get_transform != nullptr) {
-            void *camTrans = get_transform(cameraObj);
-            if (camTrans != nullptr && isUnityObjectAlive(camTrans)) {
-                camPos = getTransformPosition(camTrans);
-            }
-        }
-    }
-    void *localFpc = g_localPlayerFPC.load();
-    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f && localFpc != nullptr && isUnityObjectAlive(localFpc) && get_transform != nullptr) {
-        void *fpcTrans = get_transform(localFpc);
-        if (fpcTrans != nullptr && isUnityObjectAlive(fpcTrans)) {
-            camPos = getTransformPosition(fpcTrans) + Vector3(0.0f, 1.6f, 0.0f);
+        localFpc = g_localPlayerFPC.load();
+        if (localFpc != nullptr && isUnityObjectAlive(localFpc)) {
+            camPos = getTransformPosition(localFpc) + Vector3(0.0f, 1.6f, 0.0f);
         }
     }
 
@@ -2058,15 +2107,37 @@ static void processAimAssistLock(void *aimingControl) {
     if (sliderVal > 100) sliderVal = 100;
     float s = static_cast<float>(sliderVal) / 100.0f;
 
-    float maxFovAngle = g_bigHead.load() ? (24.0f + 6.0f * s) : (18.0f + 6.0f * s);
+    bool isAiming = isLocalPlayerAiming(aimingControl, cameraObj);
+    bool isFiring = (nowMs - g_lastPlayerShootMs.load() < 500);
+    bool isSwiping = (userSpeed > 0.025f);
+    bool isPlayerActive = isAiming || isFiring || isSwiping;
+
+    // Adaptive FOV cone based on player activity:
+    // When aiming (ADS) or firing: full combat lock cone (13-25 deg)
+    // When actively swiping: medium assist cone (9-16 deg)
+    // When completely idle in hipfire: focused close proximity cone (5-8 deg) so it NEVER snatches random peripheral peds!
+    float baseFov = 5.0f + 3.0f * s;
+    if (isAiming || isFiring) {
+        baseFov = g_bigHead.load() ? (18.0f + 5.0f * s) : (13.0f + 5.0f * s);
+    } else if (isSwiping) {
+        baseFov = g_bigHead.load() ? (12.0f + 4.0f * s) : (9.0f + 4.0f * s);
+    }
+    float maxFovAngle = baseFov;
 
     TargetBoneInfo targetInfo = findBestTargetBone(camPos, currentYaw, currentPitch, maxFovAngle, cameraObj);
     if (!targetInfo.found) {
+        // Zero-write exit: ONLY clear if targetible pointer was non-null
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8) = nullptr;
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
-            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = false;
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0))) {
+                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xD0) = false;
+                }
+                if (AimingControl_ClearTargetibleObject != nullptr) {
+                    AimingControl_ClearTargetibleObject(aimingControl);
+                }
+            }
         }
         return;
     }
@@ -2079,27 +2150,76 @@ static void processAimAssistLock(void *aimingControl) {
     while (diffPitch > 180.0f) diffPitch -= 360.0f;
     while (diffPitch < -180.0f) diffPitch += 360.0f;
 
-    float proximity = 1.0f - (targetInfo.angleOffset / (maxFovAngle + 0.001f));
+    float targetAngularDist = sqrtf(diffYaw * diffYaw + diffPitch * diffPitch);
+
+    // 1. Absolute zero-write inner deadband: directly on target center
+    if (targetAngularDist < 0.06f) {
+        return;
+    }
+
+    // 2. Idle Gating: when completely idle in hipfire (not aiming, not firing, not swiping),
+    // and target is outside close crosshair proximity (> 1.2 deg), DO NOT rotate camera!
+    if (!isPlayerActive && targetAngularDist > 1.20f) {
+        return;
+    }
+
+    // 3. Human Manual Swipe Authority & Directional Escape:
+    if (userSpeed > 0.03f) {
+        // Flick escape: immediate drop
+        if (userSpeed > 0.35f) {
+            return;
+        }
+        // Direction check: if player is steering away from target, zero assist
+        float dot = (userDeltaYaw * diffYaw + userDeltaPitch * diffPitch) / (userSpeed * targetAngularDist);
+        if (dot < -0.05f) {
+            return;
+        }
+    }
+
+    // 4. Dynamic manual swipe blend
+    float manualFactor = 1.0f;
+    if (userSpeed > 0.04f) {
+        manualFactor = 1.0f - (userSpeed / 0.35f);
+        if (manualFactor < 0.0f) manualFactor = 0.0f;
+    }
+
+    // Lambda curve scales with slider (s)
+    float lambda = 1.0f + 4.0f * (s * s);
+    float pullFactor = (1.0f - expf(-lambda * dt)) * manualFactor;
+
+    // Easing near edge of FOV cone for natural entry
+    float proximity = 1.0f - (targetInfo.angleOffset / (maxFovAngle + 0.01f));
     if (proximity < 0.0f) proximity = 0.0f;
     if (proximity > 1.0f) proximity = 1.0f;
-    float weight = proximity * proximity;
+    pullFactor *= (0.35f + 0.65f * (proximity * proximity));
 
-    float assistRate = (0.03f + 0.15f * s) * weight;
-
-    if ((userDeltaYaw > 0.3f && diffYaw < -0.2f) || (userDeltaYaw < -0.3f && diffYaw > 0.2f)) {
-        assistRate *= 0.15f;
+    // Continuous Hermite SmoothStep Deadzone Easing (eliminates chatter at deadzone boundary!)
+    if (targetAngularDist < 0.35f) {
+        float t = (targetAngularDist - 0.06f) / (0.35f - 0.06f);
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        pullFactor *= (t * t * (3.0f - 2.0f * t));
     }
-    if ((userDeltaPitch > 0.3f && diffPitch < -0.2f) || (userDeltaPitch < -0.3f && diffPitch > 0.2f)) {
-        assistRate *= 0.15f;
+
+    // Idle hipfire damping: softly rest on target without aggressive pull
+    if (!isAiming && !isFiring) {
+        pullFactor *= 0.40f;
     }
 
-    float stepYaw = diffYaw * assistRate;
-    float stepPitch = diffPitch * assistRate;
+    float stepYaw = diffYaw * pullFactor;
+    float stepPitch = diffPitch * pullFactor;
 
-    float maxStepPerFrame = 0.4f + 1.2f * s;
+    // Sub-pixel noise suppression: if angular step is less than 0.008 degrees,
+    // do not write to transforms at all!
     float stepLen = sqrtf(stepYaw * stepYaw + stepPitch * stepPitch);
-    if (stepLen > maxStepPerFrame) {
-        float scale = maxStepPerFrame / stepLen;
+    if (stepLen < 0.008f) {
+        return;
+    }
+
+    // Angular velocity clamp: prevent abrupt camera snaps
+    float maxSpeedPerFrame = 0.20f + 0.65f * s;
+    if (stepLen > maxSpeedPerFrame) {
+        float scale = maxSpeedPerFrame / stepLen;
         stepYaw *= scale;
         stepPitch *= scale;
     }
@@ -2127,6 +2247,8 @@ static void processAimAssistLock(void *aimingControl) {
     setTransformLocalEulerAngles(azimuthNode, azEuler);
     setTransformLocalEulerAngles(elevationNode, elEuler);
 
+    // Keep AimingControl targetibleObject permanently cleared so the game engine's
+    // internal forced lock-on NEVER fights manual player control!
     if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8))) {
         *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0xC8) = nullptr;
     }
@@ -2136,7 +2258,8 @@ static void processAimAssistLock(void *aimingControl) {
 
     if (nowMs - g_lastAimAssistLogMs > 6000) {
         g_lastAimAssistLogMs = nowMs;
-        ModLog("[AIM_ASSIST] Smooth Assist Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+        ModLog("[AIM_ASSIST] %s Active -> Target: %s | Dist: %.1fm | Angle: %.1f deg | Smoothness: %d%% | Step: (%.2f, %.2f)",
+               isAiming ? "ADS Lock" : (isFiring ? "Firing Assist" : (isSwiping ? "Swipe Tracking" : "Sticky Lock")),
                targetInfo.isHead ? "HEAD BONE" : "BODY BONE",
                targetInfo.dist3D,
                targetInfo.angleOffset,
@@ -2148,18 +2271,38 @@ static void processAimAssistLock(void *aimingControl) {
 // 0. AimingControl.Update: RVA 0x4D27294
 void (*old_AimingControl_Update)(void *instance) = nullptr;
 void hook_AimingControl_Update(void *instance) {
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        g_activeAimingControl.store(instance);
+    if (instance == nullptr || !isUnityObjectAlive(instance)) {
+        return;
+    }
 
+    g_activeAimingControl.store(instance);
+
+    // Keep _targetibleObject and hasTarget cleared prior to engine update.
+    // When Aim Assist is OFF, clearing targetibleObject and calling ClearTargetibleObject
+    // prevents the game engine's built-in target selection from acquiring/tracking enemies.
+    // When Aim Assist is ON, clearing it prevents the engine's internal forced lock from fighting custom assist.
+    if (!g_aimAssistBoost.load()) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
-            *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+            }
         }
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
             *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
         }
-
-        if (g_espManager != nullptr && g_espManager->isEspEnabled.load()) {
-            g_espManager->updateOnEngineThread(instance);
+        if (AimingControl_ClearTargetibleObject != nullptr) {
+            AimingControl_ClearTargetibleObject(instance);
+        }
+    } else {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+                    *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+                }
+            }
         }
     }
 
@@ -2167,21 +2310,50 @@ void hook_AimingControl_Update(void *instance) {
         old_AimingControl_Update(instance);
     }
 
-    if (!g_aimAssistBoost.load()) {
-        if (instance != nullptr && isPointerReadable(instance)) {
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
-                *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8) = nullptr;
-            }
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
-                *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
-            }
-        }
-        g_hasLastFrameAngles = false;
+    if (instance == nullptr || !isUnityObjectAlive(instance)) {
         return;
     }
 
-    if (instance != nullptr && isUnityObjectAlive(instance)) {
-        processAimAssistLock(instance);
+    void *localFpc = g_localPlayerFPC.load();
+    if (localFpc == nullptr || !isUnityObjectAlive(localFpc)) {
+        return;
+    }
+
+    if (g_espMaster.load() && espManager != nullptr) {
+        updateEspData(instance);
+    }
+
+    if (!g_aimAssistBoost.load()) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xC8))) {
+            void **pObj = reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0xC8);
+            if (*pObj != nullptr) {
+                *pObj = nullptr;
+            }
+        }
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0xD0))) {
+            *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(instance) + 0xD0) = false;
+        }
+        if (AimingControl_ClearTargetibleObject != nullptr) {
+            AimingControl_ClearTargetibleObject(instance);
+        }
+        g_hasLastEngineAngles = false;
+        return;
+    }
+
+    processAimAssistLock(instance);
+}
+
+// AimingControl.OnDestroy: RVA 0x4D28714
+void (*old_AimingControl_OnDestroy)(void *instance) = nullptr;
+void hook_AimingControl_OnDestroy(void *instance) {
+    setLastAction("AimingControl_OnDestroy");
+    if (instance != nullptr && instance == g_activeAimingControl.load()) {
+        g_activeAimingControl.store(nullptr);
+        onESPClear();
+        resetAimAssistState(instance);
+    }
+    if (old_AimingControl_OnDestroy != nullptr) {
+        old_AimingControl_OnDestroy(instance);
     }
 }
 
@@ -2195,136 +2367,123 @@ static inline float getAimSensitivityFactor() {
 // 1. StrafeRotationConfig (0x52A6264, 0x52A6210, 0x52A624C, 0x52A65A4, 0x52A6598)
 float (*old_StrafeRotationConfig_get_MaxRotationPower)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_MaxRotationPower(void *instance) {
-    float power = old_StrafeRotationConfig_get_MaxRotationPower ? old_StrafeRotationConfig_get_MaxRotationPower(instance) : 0.2f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 0.25f + 0.45f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return power;
+    if (old_StrafeRotationConfig_get_MaxRotationPower != nullptr) {
+        return old_StrafeRotationConfig_get_MaxRotationPower(instance);
+    }
+    return 0.2f;
 }
 
 float (*old_StrafeRotationConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_FOVAreaMultiplier(void *instance) {
-    float fov = old_StrafeRotationConfig_get_FOVAreaMultiplier ? old_StrafeRotationConfig_get_FOVAreaMultiplier(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.05f + 0.25f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return fov;
+    if (old_StrafeRotationConfig_get_FOVAreaMultiplier != nullptr) {
+        return old_StrafeRotationConfig_get_FOVAreaMultiplier(instance);
+    }
+    return 1.0f;
 }
 
 float (*old_StrafeRotationConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_DefaultStateMaxDistance(void *instance) {
-    float dist = old_StrafeRotationConfig_get_DefaultStateMaxDistance ? old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 70.0f + 50.0f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return dist;
+    if (old_StrafeRotationConfig_get_DefaultStateMaxDistance != nullptr) {
+        return old_StrafeRotationConfig_get_DefaultStateMaxDistance(instance);
+    }
+    return 50.0f;
 }
 
 float (*old_StrafeRotationConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_ZoomedStateMaxDistance(void *instance) {
-    float dist = old_StrafeRotationConfig_get_ZoomedStateMaxDistance ? old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 140.0f + 110.0f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return dist;
+    if (old_StrafeRotationConfig_get_ZoomedStateMaxDistance != nullptr) {
+        return old_StrafeRotationConfig_get_ZoomedStateMaxDistance(instance);
+    }
+    return 100.0f;
 }
 
 float (*old_StrafeRotationConfig_get_FOVPowerMultiplier)(void *instance) = nullptr;
 float hook_StrafeRotationConfig_get_FOVPowerMultiplier(void *instance) {
-    float fov = old_StrafeRotationConfig_get_FOVPowerMultiplier ? old_StrafeRotationConfig_get_FOVPowerMultiplier(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.10f + 0.40f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return fov;
+    if (old_StrafeRotationConfig_get_FOVPowerMultiplier != nullptr) {
+        return old_StrafeRotationConfig_get_FOVPowerMultiplier(instance);
+    }
+    return 1.0f;
 }
 
 // 2. SpinSlowdownConfig (0x4600D68, 0x4600BCC, 0x4600BD8, 0x4600C44, 0x4600C5C)
 float (*old_SpinSlowdownConfig_get_MaxSlowdownValue)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_MaxSlowdownValue(void *instance) {
-    float val = old_SpinSlowdownConfig_get_MaxSlowdownValue ? old_SpinSlowdownConfig_get_MaxSlowdownValue(instance) : 0.3f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 0.15f + 0.20f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return val;
+    if (old_SpinSlowdownConfig_get_MaxSlowdownValue != nullptr) {
+        return old_SpinSlowdownConfig_get_MaxSlowdownValue(instance);
+    }
+    return 0.3f;
 }
 
 float (*old_SpinSlowdownConfig_get_FOVAreaMultiplier)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_FOVAreaMultiplier(void *instance) {
-    float fov = old_SpinSlowdownConfig_get_FOVAreaMultiplier ? old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.05f + 0.20f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return fov;
+    if (old_SpinSlowdownConfig_get_FOVAreaMultiplier != nullptr) {
+        return old_SpinSlowdownConfig_get_FOVAreaMultiplier(instance);
+    }
+    return 1.0f;
 }
 
 float (*old_SpinSlowdownConfig_get_Radius)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_Radius(void *instance) {
-    float r = old_SpinSlowdownConfig_get_Radius ? old_SpinSlowdownConfig_get_Radius(instance) : 1.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 1.05f + 0.25f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return r;
+    if (old_SpinSlowdownConfig_get_Radius != nullptr) {
+        return old_SpinSlowdownConfig_get_Radius(instance);
+    }
+    return 1.0f;
 }
 
 float (*old_SpinSlowdownConfig_get_DefaultStateMaxDistance)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_DefaultStateMaxDistance(void *instance) {
-    float dist = old_SpinSlowdownConfig_get_DefaultStateMaxDistance ? old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance) : 50.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 70.0f + 50.0f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return dist;
+    if (old_SpinSlowdownConfig_get_DefaultStateMaxDistance != nullptr) {
+        return old_SpinSlowdownConfig_get_DefaultStateMaxDistance(instance);
+    }
+    return 50.0f;
 }
 
 float (*old_SpinSlowdownConfig_get_ZoomedStateMaxDistance)(void *instance) = nullptr;
 float hook_SpinSlowdownConfig_get_ZoomedStateMaxDistance(void *instance) {
-    float dist = old_SpinSlowdownConfig_get_ZoomedStateMaxDistance ? old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance) : 100.0f;
-    if (g_aimAssistBoost.load()) {
-        float factor = getAimSensitivityFactor();
-        return 140.0f + 110.0f * factor;
+    if (!g_aimAssistBoost.load()) {
+        return 0.0f;
     }
-    return dist;
+    if (old_SpinSlowdownConfig_get_ZoomedStateMaxDistance != nullptr) {
+        return old_SpinSlowdownConfig_get_ZoomedStateMaxDistance(instance);
+    }
+    return 100.0f;
 }
 
 // 3. StrafeRotationAimAssist.Calculate (0x4F0E254)
 Vector2 (*old_StrafeRotation_Calculate)(void *instance, Vector2 currentDelta, Vector2 smoothed) = nullptr;
 Vector2 hook_StrafeRotation_Calculate(void *instance, Vector2 currentDelta, Vector2 smoothed) {
-    if (old_StrafeRotation_Calculate == nullptr) return currentDelta;
-    Vector2 result = old_StrafeRotation_Calculate(instance, currentDelta, smoothed);
-    if (!g_aimAssistBoost.load()) return result;
-
-    float assistX = result.x - currentDelta.x;
-    float assistY = result.y - currentDelta.y;
-    float assistMag = sqrtf(assistX * assistX + assistY * assistY);
-
-    if (assistMag < 0.0001f) {
+    if (!g_aimAssistBoost.load()) {
         return currentDelta;
     }
-
-    float factor = getAimSensitivityFactor();
-    float boost = 1.15f + 0.85f * factor;
-    assistX *= boost;
-    assistY *= boost;
-
-    float maxStep = 2.0f + 2.5f * factor;
-    float boostedMag = sqrtf(assistX * assistX + assistY * assistY);
-    if (boostedMag > maxStep) {
-        float scale = maxStep / boostedMag;
-        assistX *= scale;
-        assistY *= scale;
-    }
-
-    result.x = currentDelta.x + assistX;
-    result.y = currentDelta.y + assistY;
-    return result;
+    if (old_StrafeRotation_Calculate == nullptr) return currentDelta;
+    return old_StrafeRotation_Calculate(instance, currentDelta, smoothed);
 }
 
 // 4. AimAssistManager.SetEnabled (0x529060C)
@@ -2332,7 +2491,7 @@ void (*old_AimAssistManager_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_AimAssistManager_SetEnabled(void *instance, bool enabled) {
     g_activeAimAssistManager.store(instance);
     if (old_AimAssistManager_SetEnabled != nullptr) {
-        old_AimAssistManager_SetEnabled(instance, g_aimAssistBoost.load());
+        old_AimAssistManager_SetEnabled(instance, enabled && g_aimAssistBoost.load());
     }
 }
 
@@ -2341,7 +2500,7 @@ void (*old_NewAutoAim_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_NewAutoAim_SetEnabled(void *instance, bool enabled) {
     g_activeNewAutoAim.store(instance);
     if (old_NewAutoAim_SetEnabled != nullptr) {
-        old_NewAutoAim_SetEnabled(instance, g_aimAssistBoost.load());
+        old_NewAutoAim_SetEnabled(instance, enabled && g_aimAssistBoost.load());
     }
 }
 
@@ -2350,14 +2509,19 @@ void (*old_BaseAimAssist_SetEnabled)(void *instance, bool enabled) = nullptr;
 void hook_BaseAimAssist_SetEnabled(void *instance, bool enabled) {
     g_activeBaseAimAssist.store(instance);
     if (old_BaseAimAssist_SetEnabled != nullptr) {
-        old_BaseAimAssist_SetEnabled(instance, g_aimAssistBoost.load());
+        old_BaseAimAssist_SetEnabled(instance, enabled && g_aimAssistBoost.load());
     }
 }
 
 // 7. BaseAimAssist.IsValidTarget (0x4478A70) & NewAutoAim.IsValidTarget (0x421C254)
 bool (*old_BaseAimAssist_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
-    if (!g_aimAssistBoost.load()) return false;
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        g_activeBaseAimAssist.store(instance);
+    }
+    if (!g_aimAssistBoost.load()) {
+        return false;
+    }
     if (old_BaseAimAssist_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
     if (isTargetibleObjectTeammate(targetibleObject)) {
@@ -2371,7 +2535,12 @@ bool hook_BaseAimAssist_IsValidTarget(void *instance, void *targetibleObject) {
 
 bool (*old_NewAutoAim_IsValidTarget)(void *instance, void *targetibleObject) = nullptr;
 bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
-    if (!g_aimAssistBoost.load()) return false;
+    if (instance != nullptr && isUnityObjectAlive(instance)) {
+        g_activeNewAutoAim.store(instance);
+    }
+    if (!g_aimAssistBoost.load()) {
+        return false;
+    }
     if (old_NewAutoAim_IsValidTarget == nullptr) return false;
     if (targetibleObject == nullptr || !isUnityObjectAlive(targetibleObject)) return false;
     if (isTargetibleObjectTeammate(targetibleObject)) {
@@ -2383,9 +2552,9 @@ bool hook_NewAutoAim_IsValidTarget(void *instance, void *targetibleObject) {
     return old_NewAutoAim_IsValidTarget(instance, targetibleObject);
 }
 
-static void resetAimAssistState(void *aimingControlInstance = nullptr) {
+static void resetAimAssistState(void *aimingControlInstance) {
     void *ac = aimingControlInstance ? aimingControlInstance : g_activeAimingControl.load();
-    if (ac != nullptr && isPointerReadable(ac)) {
+    if (ac != nullptr && isPointerReadable(ac) && isUnityObjectAlive(ac)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0xC8))) {
             *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0xC8) = nullptr;
         }
@@ -2396,16 +2565,17 @@ static void resetAimAssistState(void *aimingControlInstance = nullptr) {
             AimingControl_ClearTargetibleObject(ac);
         }
     }
+    g_hasLastEngineAngles = false;
     void *mgr = g_activeAimAssistManager.load();
-    if (old_AimAssistManager_SetEnabled != nullptr && mgr != nullptr && isPointerReadable(mgr)) {
+    if (old_AimAssistManager_SetEnabled != nullptr && mgr != nullptr && isPointerReadable(mgr) && isUnityObjectAlive(mgr)) {
         old_AimAssistManager_SetEnabled(mgr, false);
     }
     void *na = g_activeNewAutoAim.load();
-    if (old_NewAutoAim_SetEnabled != nullptr && na != nullptr && isPointerReadable(na)) {
+    if (old_NewAutoAim_SetEnabled != nullptr && na != nullptr && isPointerReadable(na) && isUnityObjectAlive(na)) {
         old_NewAutoAim_SetEnabled(na, false);
     }
     void *ba = g_activeBaseAimAssist.load();
-    if (old_BaseAimAssist_SetEnabled != nullptr && ba != nullptr && isPointerReadable(ba)) {
+    if (old_BaseAimAssist_SetEnabled != nullptr && ba != nullptr && isPointerReadable(ba) && isUnityObjectAlive(ba)) {
         old_BaseAimAssist_SetEnabled(ba, false);
     }
 }
@@ -2506,6 +2676,8 @@ static void registerAllHooks() {
     // 1. Client-Side Fast FireRate & Weapon Hooks
     mgr.registerHook(Offsets::FPC_UPDATE,                    reinterpret_cast<void*>(hook_FirstPersonController_Update),        reinterpret_cast<void**>(&old_FirstPersonController_Update),        "FirstPersonController.Update");
     mgr.registerHook(Offsets::WEAPON_CAN_SHOOT,              reinterpret_cast<void*>(hook_WeaponShooterBehaviour_CanShoot),     reinterpret_cast<void**>(&old_WeaponShooterBehaviour_CanShoot),     "WeaponShooterBehaviour.CanShoot");
+    mgr.registerHook(Offsets::WEAPON_SET_CLIP_AMMO,          reinterpret_cast<void*>(hook_WeaponShooterBehaviour_SetClipAmmo),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_SetClipAmmo),  "WeaponShooterBehaviour.SetClipAmmo");
+    mgr.registerHook(Offsets::WEAPON_GET_CLIP_AMMO,          reinterpret_cast<void*>(hook_WeaponShooterBehaviour_GetClipAmmo),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_GetClipAmmo),  "WeaponShooterBehaviour.GetClipAmmo");
     mgr.registerHook(Offsets::WEAPON_SET_COOLDOWN,           reinterpret_cast<void*>(hook_WeaponShooterBehaviour_SetCooldown),  reinterpret_cast<void**>(&old_WeaponShooterBehaviour_SetCooldown),  "WeaponShooterBehaviour.SetCooldown");
     mgr.registerHook(Offsets::FPC_GET_SHOT_INTERVAL1,        reinterpret_cast<void*>(hook_FPC_GetShotInterval1),                reinterpret_cast<void**>(&old_FPC_GetShotInterval1),                "FirstPersonController.GetShotInterval1");
     mgr.registerHook(Offsets::FPC_GET_SHOT_INTERVAL2,        reinterpret_cast<void*>(hook_FPC_GetShotInterval2),                reinterpret_cast<void**>(&old_FPC_GetShotInterval2),                "FirstPersonController.GetShotInterval2");
@@ -2520,6 +2692,8 @@ static void registerAllHooks() {
     mgr.registerHook(Offsets::AIMING_CONTROL_RECOIL3,        reinterpret_cast<void*>(hook_AimingControl_Recoil3),               reinterpret_cast<void**>(&old_AimingControl_Recoil3),               "AimingControl.RecoilShift3");
 
     // 3. Entity Lifecycle Hooks
+    mgr.registerHook(Offsets::FPC_ON_DESTROY,                reinterpret_cast<void*>(hook_FirstPersonController_OnDestroy),     reinterpret_cast<void**>(&old_FirstPersonController_OnDestroy),     "FirstPersonController.OnDestroy");
+    mgr.registerHook(Offsets::AIMING_CONTROL_ON_DESTROY,     reinterpret_cast<void*>(hook_AimingControl_OnDestroy),             reinterpret_cast<void**>(&old_AimingControl_OnDestroy),             "AimingControl.OnDestroy");
     mgr.registerHook(Offsets::NETWORK_PLAYER_UPDATE,         reinterpret_cast<void*>(hook_NetworkPlayer_Update),                reinterpret_cast<void**>(&old_NetworkPlayer_Update),                "NetworkPlayer.Update");
     mgr.registerHook(Offsets::NETWORK_PLAYER_ON_DESTROY,     reinterpret_cast<void*>(hook_NetworkPlayer_OnDestroy),            reinterpret_cast<void**>(&old_NetworkPlayer_OnDestroy),            "NetworkPlayer.OnDestroy");
     mgr.registerHook(Offsets::BOT_PLAYER_START,              reinterpret_cast<void*>(hook_BotPlayer_Start),                     reinterpret_cast<void**>(&old_BotPlayer_Start),                     "BotPlayer.Start");
@@ -2596,15 +2770,18 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
         OBFUSCATE("Toggle_Aim Assist (Auto-Lock Radius)"), // featNum 4
         OBFUSCATE("SeekBar_Aim Smoothness (Sticky Lock)_0_100"), // featNum 5
-        OBFUSCATE("Collapse_👁️ TAB ESP & VISUAL OVERLAY"),
-        OBFUSCATE("CollapseAdd_Toggle_ESP Master Switch"),          // featNum 6
-        OBFUSCATE("CollapseAdd_Toggle_ESP Line (Snapline)"),       // featNum 7
-        OBFUSCATE("CollapseAdd_Toggle_ESP Box (2D Box)"),          // featNum 8
-        OBFUSCATE("CollapseAdd_Toggle_ESP Health Bar"),            // featNum 9
-        OBFUSCATE("CollapseAdd_Toggle_ESP Distance & Info"),       // featNum 10
-        OBFUSCATE("CollapseAdd_Toggle_ESP Filter Tim (Hanya Musuh)_True"), // featNum 11
+        OBFUSCATE("14_Toggle_Unlimited Ammo (Clip Ammo)"), // featNum 14
+        OBFUSCATE("Category_👁️ ESP OVERLAY SYSTEM"),
+        OBFUSCATE("Toggle_ESP Master Switch"),           // featNum 6
+        OBFUSCATE("Toggle_ESP 2D Box_True"),             // featNum 7
+        OBFUSCATE("Toggle_ESP Line (Tracer)_True"),      // featNum 8
+        OBFUSCATE("Toggle_ESP Distance_True"),           // featNum 9
+        OBFUSCATE("Toggle_ESP Health Bar_True"),         // featNum 10
+        OBFUSCATE("Toggle_ESP Name & Bot Info_True"),    // featNum 11
+        OBFUSCATE("Toggle_ESP Enemy Only_True"),         // featNum 12
+        OBFUSCATE("SeekBar_ESP Max Distance_10_300"),    // featNum 13
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian (100 = 100% magnetic sticky lock).<br><br>• <b>TAB ESP & Visual Overlay:</b> Render overlay real-time untuk Player & Bot (otomatis target keduanya) dengan fitur Snapline, 2D Box, Health Bar, dan Distance. Dilengkapi Filter Tim (Hanya Musuh) yang secara cerdas membedakan musuh dan rekan tim.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>Unlimited Ammo (Clip Ammo):</b> Peluru klip tidak pernah habis (999 peluru) dengan validasi hierarki pointer ammo controller aman tanpa crash.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian. Saat nilai di-mentokkan (100), bidikan akan selalu lengket (100% magnetic sticky lock) pada bone body atau head musuh (seperti Big Head). Nilai rendah memberikan assist natural.<br><br>• <b>ESP Overlay System:</b> Visual overlay mendeteksi posisi Real Player & Bot secara real-time dari WorldToViewportPoint camera (Box 2D, Line tracer, Jarak meter, Health bar, dan info Bot/Player).<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2663,7 +2840,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             setLastAction(boolean ? "Toggle Fast FireRate: ON" : "Toggle Fast FireRate: OFF");
 
             if (boolean) {
-                Toast(env, ctx, OBFUSCATE("Fast FireRate: ON (Tembakan Berkecepatan Tinggi - Client Side)"), ToastLength::LENGTH_SHORT);
+                Toast(env, ctx, OBFUSCATE("Fast FireRate & Unlimited Ammo: ON (Client Side)"), ToastLength::LENGTH_SHORT);
             } else {
                 Toast(env, ctx, OBFUSCATE("Fast FireRate: OFF (Normal)"), ToastLength::LENGTH_SHORT);
             }
@@ -2717,44 +2894,79 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
         }
 
         case 6: { // Toggle_ESP Master Switch
-            if (g_espManager != nullptr) g_espManager->isEspEnabled.store(boolean);
+            g_espMaster.store(boolean);
+            if (!boolean) {
+                onESPClear();
+            }
             ModLog("[TOGGLE] Feature #6 [ESP Master Switch] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle ESP Master: ON" : "Toggle ESP Master: OFF");
+
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("ESP Master Overlay: ON"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("ESP Master Overlay: OFF"), ToastLength::LENGTH_SHORT);
+            }
             break;
         }
 
-        case 7: { // Toggle_ESP Line (Snapline)
-            if (g_espManager != nullptr) g_espManager->espLine.store(boolean);
-            ModLog("[TOGGLE] Feature #7 [ESP Line] set to: %s", stateStr);
-            setLastAction(boolean ? "Toggle ESP Line: ON" : "Toggle ESP Line: OFF");
-            break;
-        }
-
-        case 8: { // Toggle_ESP Box (2D Box)
-            if (g_espManager != nullptr) g_espManager->espBox.store(boolean);
-            ModLog("[TOGGLE] Feature #8 [ESP Box] set to: %s", stateStr);
+        case 7: { // Toggle_ESP 2D Box
+            g_espBox.store(boolean);
+            ModLog("[TOGGLE] Feature #7 [ESP 2D Box] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle ESP Box: ON" : "Toggle ESP Box: OFF");
             break;
         }
 
-        case 9: { // Toggle_ESP Health Bar
-            if (g_espManager != nullptr) g_espManager->espHealth.store(boolean);
-            ModLog("[TOGGLE] Feature #9 [ESP Health Bar] set to: %s", stateStr);
-            setLastAction(boolean ? "Toggle ESP Health: ON" : "Toggle ESP Health: OFF");
+        case 8: { // Toggle_ESP Line (Tracer)
+            g_espLine.store(boolean);
+            ModLog("[TOGGLE] Feature #8 [ESP Line Tracer] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle ESP Line: ON" : "Toggle ESP Line: OFF");
             break;
         }
 
-        case 10: { // Toggle_ESP Distance & Info
-            if (g_espManager != nullptr) g_espManager->espDistance.store(boolean);
-            ModLog("[TOGGLE] Feature #10 [ESP Distance] set to: %s", stateStr);
+        case 9: { // Toggle_ESP Distance
+            g_espDistance.store(boolean);
+            ModLog("[TOGGLE] Feature #9 [ESP Distance] set to: %s", stateStr);
             setLastAction(boolean ? "Toggle ESP Distance: ON" : "Toggle ESP Distance: OFF");
             break;
         }
 
-        case 11: { // Toggle_ESP Filter Tim (Hanya Musuh)
-            if (g_espManager != nullptr) g_espManager->espTeamFilter.store(boolean);
-            ModLog("[TOGGLE] Feature #11 [ESP Filter Tim] set to: %s", stateStr);
-            setLastAction(boolean ? "Toggle ESP Filter Tim: ON" : "Toggle ESP Filter Tim: OFF");
+        case 10: { // Toggle_ESP Health Bar
+            g_espHealth.store(boolean);
+            ModLog("[TOGGLE] Feature #10 [ESP Health Bar] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle ESP Health: ON" : "Toggle ESP Health: OFF");
+            break;
+        }
+
+        case 11: { // Toggle_ESP Name & Bot Info
+            g_espName.store(boolean);
+            ModLog("[TOGGLE] Feature #11 [ESP Name & Bot Info] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle ESP Name: ON" : "Toggle ESP Name: OFF");
+            break;
+        }
+
+        case 12: { // Toggle_ESP Enemy Only
+            g_espEnemyOnly.store(boolean);
+            ModLog("[TOGGLE] Feature #12 [ESP Enemy Only] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle ESP Enemy Only: ON" : "Toggle ESP Enemy Only: OFF");
+            break;
+        }
+
+        case 13: { // SeekBar_ESP Max Distance_10_300
+            g_espMaxDistance.store(value);
+            ModLog("[SLIDER] Feature #13 [ESP Max Distance] set to: %d meters", value);
+            setLastAction("Slider ESP Max Distance changed");
+            break;
+        }
+
+        case 14: { // 14_Toggle_Unlimited Ammo (Clip Ammo)
+            g_unlimitedAmmo.store(boolean);
+            ModLog("[TOGGLE] Feature #14 [Unlimited Ammo (Clip Ammo)] set to: %s", stateStr);
+            setLastAction(boolean ? "Toggle Unlimited Ammo: ON" : "Toggle Unlimited Ammo: OFF");
+            if (boolean) {
+                Toast(env, ctx, OBFUSCATE("Unlimited Ammo: ON (Peluru Tak Terbatas)"), ToastLength::LENGTH_SHORT);
+            } else {
+                Toast(env, ctx, OBFUSCATE("Unlimited Ammo: OFF (Normal)"), ToastLength::LENGTH_SHORT);
+            }
             break;
         }
 
@@ -2804,96 +3016,13 @@ void lib_main() {
     ModLog("=================================================================");
     ModLog("[INIT] Native constructor executed. Primary log: %s", DEBUG_LOG_PATHS[0]);
 
-    if (g_espManager == nullptr) {
-        g_espManager = new ESPManager();
-        ModLog("[ESP] ESPManager initialized.");
+    if (espManager == nullptr) {
+        espManager = new ESPManager();
+        ModLog("[ESP] ESPManager initialized successfully");
     }
 
     pthread_t ptid;
     pthread_create(&ptid, NULL, hack_thread, NULL);
-}
-
-extern "C" {
-
-JNIEXPORT jint JNICALL
-Java_com_android_support_ESPView_getESPData(JNIEnv *env, jclass clazz, jfloatArray outArray, jint screenW, jint screenH) {
-    if (g_espManager == nullptr || !g_espManager->isEspEnabled.load()) {
-        return 0;
-    }
-    if (outArray == nullptr) return 0;
-
-    if (screenW > 0 && screenH > 0) {
-        s_espClientWidth.store(screenW);
-        s_espClientHeight.store(screenH);
-    }
-
-    uint64_t now = getCurrentTimeMs();
-    if (now - s_espLastProduceMs.load() > 1500) {
-        return 0;
-    }
-
-    jsize len = env->GetArrayLength(outArray);
-    int maxEntities = len / 8;
-    if (maxEntities <= 0) return 0;
-    if (maxEntities > 64) maxEntities = 64;
-
-    int count = 0;
-    {
-        std::lock_guard<std::mutex> lock(s_espSharedMutex);
-        count = std::min(s_espSharedCount, maxEntities);
-        if (count > 0) {
-            env->SetFloatArrayRegion(outArray, 0, count * 8, reinterpret_cast<const jfloat *>(s_espSharedBuffer));
-        }
-    }
-    return count;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_android_support_ESPView_isEspEnabled(JNIEnv *env, jclass clazz) {
-    return (g_espManager != nullptr && g_espManager->isEspEnabled.load()) ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_android_support_ESPView_isEspBox(JNIEnv *env, jclass clazz) {
-    return (g_espManager != nullptr && g_espManager->espBox.load()) ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_android_support_ESPView_isEspLine(JNIEnv *env, jclass clazz) {
-    return (g_espManager != nullptr && g_espManager->espLine.load()) ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_android_support_ESPView_isEspHealth(JNIEnv *env, jclass clazz) {
-    return (g_espManager != nullptr && g_espManager->espHealth.load()) ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_android_support_ESPView_isEspDistance(JNIEnv *env, jclass clazz) {
-    return (g_espManager != nullptr && g_espManager->espDistance.load()) ? JNI_TRUE : JNI_FALSE;
-}
-
-} // extern "C"
-
-int RegisterESPView(JNIEnv *env) {
-    JNINativeMethod methods[] = {
-        {OBFUSCATE("getESPData"), OBFUSCATE("([FII)I"), reinterpret_cast<void *>(Java_com_android_support_ESPView_getESPData)},
-        {OBFUSCATE("isEspEnabled"), OBFUSCATE("()Z"), reinterpret_cast<void *>(Java_com_android_support_ESPView_isEspEnabled)},
-        {OBFUSCATE("isEspBox"), OBFUSCATE("()Z"), reinterpret_cast<void *>(Java_com_android_support_ESPView_isEspBox)},
-        {OBFUSCATE("isEspLine"), OBFUSCATE("()Z"), reinterpret_cast<void *>(Java_com_android_support_ESPView_isEspLine)},
-        {OBFUSCATE("isEspHealth"), OBFUSCATE("()Z"), reinterpret_cast<void *>(Java_com_android_support_ESPView_isEspHealth)},
-        {OBFUSCATE("isEspDistance"), OBFUSCATE("()Z"), reinterpret_cast<void *>(Java_com_android_support_ESPView_isEspDistance)},
-    };
-    jclass clazz = env->FindClass(OBFUSCATE("com/android/support/ESPView"));
-    if (!clazz) {
-        env->ExceptionClear();
-        return JNI_OK;
-    }
-    if (env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0])) != 0) {
-        env->ExceptionClear();
-        return JNI_OK;
-    }
-    return JNI_OK;
 }
 
 int RegisterMenu(JNIEnv *env) {
@@ -2910,6 +3039,8 @@ int RegisterMenu(JNIEnv *env) {
             {OBFUSCATE("GetTotalCount"), OBFUSCATE("()I"), reinterpret_cast<void *>(GetTotalCount)},
             {OBFUSCATE("IsInGame"), OBFUSCATE("()Z"), reinterpret_cast<void *>(IsInGame)},
             {OBFUSCATE("ResetEntityCounters"), OBFUSCATE("()V"), reinterpret_cast<void *>(ResetEntityCounters)},
+            {OBFUSCATE("GetESPData"), OBFUSCATE("(II)[F"), reinterpret_cast<void *>(GetESPData)},
+            {OBFUSCATE("GetESPSetting"), OBFUSCATE("(I)Z"), reinterpret_cast<void *>(GetESPSetting)},
     };
 
     jclass clazz = env->FindClass(OBFUSCATE("com/android/support/Menu"));
@@ -2956,6 +3087,5 @@ JNI_OnLoad(JavaVM *vm, void *reserved) {
         return JNI_ERR;
     if (RegisterMain(env) != 0)
         return JNI_ERR;
-    RegisterESPView(env);
     return JNI_VERSION_1_6;
 }

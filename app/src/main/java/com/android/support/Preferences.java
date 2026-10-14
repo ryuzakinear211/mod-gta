@@ -41,7 +41,7 @@ public class Preferences {
             Menu.instance.setStatusHudVisible(bool);
         }
         if (featureNum == 6 && Menu.instance != null) {
-            Menu.instance.setESPVisible(bool);
+            Menu.instance.setEspOverlayVisible(bool);
         }
     }
 

@@ -47,7 +47,7 @@ namespace Offsets {
     constexpr uintptr_t UNITY_WORLD_TO_VIEWPORT_POINT       = 0x851DF1C;
     constexpr uintptr_t UNITY_WORLD_TO_SCREEN_POINT         = 0x851DE04;
     constexpr uintptr_t UNITY_CAMERA_GET_MAIN               = 0x851ED38;
-    constexpr uintptr_t UNITY_CAMERA_GET_CURRENT            = 0x851EDD4;
+    constexpr uintptr_t UNITY_CAMERA_GET_FOV                = 0x85173F4;
     constexpr uintptr_t UNITY_SET_ROTATION_INJECTED         = 0x85B1E5C;
     constexpr uintptr_t UNITY_LOOK_ROTATION_INJECTED        = 0x8588584;
     constexpr uintptr_t UNITY_COLLIDER_GET_ENABLED          = 0x864B404;
@@ -62,8 +62,9 @@ namespace Offsets {
     constexpr uintptr_t FPC_GET_CURRENT_WEAPON              = 0x408FC44;
     constexpr uintptr_t FPC_GET_SHOOTER_BEHAVIOUR           = 0x409188C;
     constexpr uintptr_t WEAPON_SET_CLIP_AMMO                = 0x405A39C;
+    constexpr uintptr_t WEAPON_GET_CLIP_AMMO                = 0x405A650;
     constexpr uintptr_t ACTK_OP_IMPLICIT_FLOAT              = 0x3D6E4DC;
-    constexpr uintptr_t TARGET_INFO_GET_TARGET_TYPE         = 0x40AAA58;
+    constexpr uintptr_t FPC_GET_NETWORK_PLAYER              = 0x40A1050;
     constexpr uintptr_t WEAPON_CAN_SHOOT                    = 0x405BBF0;
     constexpr uintptr_t WEAPON_SET_COOLDOWN                 = 0x405D084;
     constexpr uintptr_t WEAPON_SHOOT_ACTION_GETTER          = 0x405C8DC;
@@ -92,8 +93,10 @@ namespace Offsets {
     constexpr uintptr_t AIMING_CONTROL_SET_TARGETIBLE_OBJ   = 0x4D287F8;
     constexpr uintptr_t AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ = 0x4D2883C;
     constexpr uintptr_t AIMING_CONTROL_ADD_DELTA            = 0x4D281AC;
-    constexpr uintptr_t NETWORK_PLAYER_IS_TEAMMATE          = 0x42CE9CC;
+    constexpr uintptr_t BOT_PLAYER_GET_TEAM                 = 0x4449610;
     constexpr uintptr_t BOT_PLAYER_HEALTH_GET_HEALTH        = 0x4BEE4FC;
+    constexpr uintptr_t FPC_ON_DESTROY                      = 0x40A3A84;
+    constexpr uintptr_t AIMING_CONTROL_ON_DESTROY           = 0x4D28714;
 
     // ---------------------------------------------------------------------
     // Native Aim Assist & Sensitivity RVAs
@@ -390,7 +393,7 @@ inline void (*SetLocalEulerAngles_Injected)(void *, const Vector3 *, int) = null
 inline void (*WorldToViewportPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
 inline void (*WorldToScreenPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
 inline void *(*Camera_get_main)() = nullptr;
-inline void *(*Camera_get_current)() = nullptr;
+inline float (*Camera_get_fieldOfView)(void *) = nullptr;
 inline void (*set_rotation_Injected)(void *, const Quaternion *) = nullptr;
 inline void (*LookRotation_Injected)(const Vector3 *, const Vector3 *, Quaternion *) = nullptr;
 inline bool (*Collider_get_enabled)(void *) = nullptr;
@@ -402,7 +405,7 @@ inline void* (*get_CurrentWeapon)(void *fpc) = nullptr;
 inline void* (*get_ShooterBehaviour)(void *fpc, void *item) = nullptr;
 inline void (*set_ClipAmmo)(void *shooter, int ammo) = nullptr;
 inline ObscuredFloat (*actk_op_Implicit_Float)(float val) = nullptr;
-inline int (*get_TargetType)(void *targetInfo) = nullptr;
+inline void *(*FPC_GetNetworkPlayer)(void *fpc) = nullptr;
 
 inline bool (*get_AllyObjectToogle)(void *) = nullptr;
 inline bool (*get_IsAutoAimAllowed)(void *) = nullptr;
@@ -411,7 +414,7 @@ inline void *(*BotPlayer_GetTargetibleObject)(void *) = nullptr;
 inline void (*AimingControl_SetTargetibleObject)(void *, void *) = nullptr;
 inline void (*AimingControl_ClearTargetibleObject)(void *) = nullptr;
 inline void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
-inline bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
+inline int (*BotPlayer_GetTeam)(void *) = nullptr;
 inline float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
 
 // Safe wrapper to set local scale on a Transform
@@ -455,56 +458,7 @@ inline bool worldToViewport(void *cameraObj, const Vector3 &worldPos, Vector3 &v
     void *nativeCam = getNativeUnityPointer(cameraObj);
     if (nativeCam == nullptr) return false;
     WorldToViewportPoint_Injected(nativeCam, &worldPos, 2, &viewportPos);
-    return (viewportPos.z > 0.05f);
-}
-
-// Robust dual projector: tries Viewport first then ScreenPoint fallback, returns canvas screen coordinates
-inline bool worldToScreenOrViewport(void *cameraObj, const Vector3 &worldPos, Vector3 &outScreen, int screenW, int screenH) {
-    if (cameraObj == nullptr || !isUnityObjectAlive(cameraObj)) return false;
-    void *nativeCam = getNativeUnityPointer(cameraObj);
-    if (nativeCam == nullptr) return false;
-
-    // 1. Try WorldToViewportPoint_Injected (Normalized 0.0 - 1.0)
-    if (WorldToViewportPoint_Injected != nullptr) {
-        Vector3 vp(0.0f, 0.0f, 0.0f);
-        WorldToViewportPoint_Injected(nativeCam, &worldPos, 2, &vp);
-        if (!std::isnan(vp.x) && !std::isnan(vp.y) && !std::isnan(vp.z) &&
-            !std::isinf(vp.x) && !std::isinf(vp.y) && !std::isinf(vp.z) && vp.z > 0.05f) {
-            outScreen.x = vp.x * static_cast<float>(screenW);
-            outScreen.y = (1.0f - vp.y) * static_cast<float>(screenH);
-            outScreen.z = vp.z;
-            return true;
-        }
-    }
-
-    // 2. Try WorldToScreenPoint_Injected (Pixel Coordinates, bottom-left origin in Unity)
-    if (WorldToScreenPoint_Injected != nullptr) {
-        Vector3 sp(0.0f, 0.0f, 0.0f);
-        WorldToScreenPoint_Injected(nativeCam, &worldPos, 2, &sp);
-        if (!std::isnan(sp.x) && !std::isnan(sp.y) && !std::isnan(sp.z) &&
-            !std::isinf(sp.x) && !std::isinf(sp.y) && !std::isinf(sp.z) && sp.z > 0.05f) {
-            outScreen.x = sp.x;
-            outScreen.y = static_cast<float>(screenH) - sp.y;
-            outScreen.z = sp.z;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-// Universal safe position resolver: works on both Transform and any Component (Camera, FPC, etc.)
-inline Vector3 safeGetAnyPosition(void *unityObj) {
-    Vector3 pos(0.0f, 0.0f, 0.0f);
-    if (unityObj == nullptr || !isUnityObjectAlive(unityObj)) return pos;
-    void *trans = unityObj;
-    if (get_transform != nullptr) {
-        void *t = get_transform(unityObj);
-        if (t != nullptr && isUnityObjectAlive(t)) {
-            trans = t;
-        }
-    }
-    return getTransformPosition(trans);
+    return (viewportPos.z > 0.1f);
 }
 
 // =========================================================================
@@ -550,7 +504,7 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::UNITY_WORLD_TO_VIEWPORT_POINT,       WorldToViewportPoint_Injected, "WorldToViewportPoint_Injected");
     resolvePointer(base, Offsets::UNITY_WORLD_TO_SCREEN_POINT,         WorldToScreenPoint_Injected,   "WorldToScreenPoint_Injected");
     resolvePointer(base, Offsets::UNITY_CAMERA_GET_MAIN,               Camera_get_main,               "Camera_get_main");
-    resolvePointer(base, Offsets::UNITY_CAMERA_GET_CURRENT,            Camera_get_current,            "Camera_get_current");
+    resolvePointer(base, Offsets::UNITY_CAMERA_GET_FOV,                Camera_get_fieldOfView,        "Camera_get_fieldOfView");
     resolvePointer(base, Offsets::UNITY_SET_ROTATION_INJECTED,         set_rotation_Injected,         "set_rotation_Injected");
     resolvePointer(base, Offsets::UNITY_LOOK_ROTATION_INJECTED,        LookRotation_Injected,         "LookRotation_Injected");
     resolvePointer(base, Offsets::UNITY_COLLIDER_GET_ENABLED,          Collider_get_enabled,          "Collider_get_enabled");
@@ -563,7 +517,7 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::FPC_GET_SHOOTER_BEHAVIOUR,           get_ShooterBehaviour,          "get_ShooterBehaviour");
     resolvePointer(base, Offsets::WEAPON_SET_CLIP_AMMO,                set_ClipAmmo,                  "set_ClipAmmo");
     resolvePointer(base, Offsets::ACTK_OP_IMPLICIT_FLOAT,              actk_op_Implicit_Float,        "actk_op_Implicit_Float");
-    resolvePointer(base, Offsets::TARGET_INFO_GET_TARGET_TYPE,         get_TargetType,                "get_TargetType");
+    resolvePointer(base, Offsets::FPC_GET_NETWORK_PLAYER,              FPC_GetNetworkPlayer,          "FPC_GetNetworkPlayer");
 
     // Aim Assist & Filtering Pointers
     resolvePointer(base, Offsets::TARGETIBLE_GET_ALLY_OBJECT_TOOGLE,   get_AllyObjectToogle,          "get_AllyObjectToogle");
@@ -573,7 +527,7 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::AIMING_CONTROL_SET_TARGETIBLE_OBJ,   AimingControl_SetTargetibleObject, "AimingControl_SetTargetibleObject");
     resolvePointer(base, Offsets::AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ, AimingControl_ClearTargetibleObject, "AimingControl_ClearTargetibleObject");
     resolvePointer(base, Offsets::AIMING_CONTROL_ADD_DELTA,            AimingControl_AddDelta,        "AimingControl_AddDelta");
-    resolvePointer(base, Offsets::NETWORK_PLAYER_IS_TEAMMATE,          NetworkPlayer_IsTeammate,      "NetworkPlayer_IsTeammate");
+    resolvePointer(base, Offsets::BOT_PLAYER_GET_TEAM,                 BotPlayer_GetTeam,             "BotPlayer_GetTeam");
     resolvePointer(base, Offsets::BOT_PLAYER_HEALTH_GET_HEALTH,        BotPlayerHealth_GetHealth,     "BotPlayerHealth_GetHealth");
 }
 
