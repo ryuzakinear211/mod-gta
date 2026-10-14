@@ -47,7 +47,6 @@ namespace Offsets {
     constexpr uintptr_t UNITY_WORLD_TO_VIEWPORT_POINT       = 0x851DF1C;
     constexpr uintptr_t UNITY_WORLD_TO_SCREEN_POINT         = 0x851DE04;
     constexpr uintptr_t UNITY_CAMERA_GET_MAIN               = 0x851ED38;
-    constexpr uintptr_t UNITY_CAMERA_GET_FOV                = 0x85173F4;
     constexpr uintptr_t UNITY_SET_ROTATION_INJECTED         = 0x85B1E5C;
     constexpr uintptr_t UNITY_LOOK_ROTATION_INJECTED        = 0x8588584;
     constexpr uintptr_t UNITY_COLLIDER_GET_ENABLED          = 0x864B404;
@@ -62,9 +61,8 @@ namespace Offsets {
     constexpr uintptr_t FPC_GET_CURRENT_WEAPON              = 0x408FC44;
     constexpr uintptr_t FPC_GET_SHOOTER_BEHAVIOUR           = 0x409188C;
     constexpr uintptr_t WEAPON_SET_CLIP_AMMO                = 0x405A39C;
-    constexpr uintptr_t WEAPON_GET_CLIP_AMMO                = 0x405A650;
     constexpr uintptr_t ACTK_OP_IMPLICIT_FLOAT              = 0x3D6E4DC;
-    constexpr uintptr_t FPC_GET_NETWORK_PLAYER              = 0x40A1050;
+    constexpr uintptr_t TARGET_INFO_GET_TARGET_TYPE         = 0x40AAA58;
     constexpr uintptr_t WEAPON_CAN_SHOOT                    = 0x405BBF0;
     constexpr uintptr_t WEAPON_SET_COOLDOWN                 = 0x405D084;
     constexpr uintptr_t WEAPON_SHOOT_ACTION_GETTER          = 0x405C8DC;
@@ -77,17 +75,6 @@ namespace Offsets {
     constexpr uintptr_t AIMING_CONTROL_RECOIL1              = 0x4D27AB8;
     constexpr uintptr_t AIMING_CONTROL_RECOIL2              = 0x4D27E20;
     constexpr uintptr_t AIMING_CONTROL_RECOIL3              = 0x4D284B0;
-    constexpr uintptr_t UNITY_OBJECT_GET_NAME              = 0x85A392C;
-    constexpr uintptr_t UI_TEXT_GET_TEXT                   = 0x86FFFC8;
-    constexpr uintptr_t ITEM_BEHAVIOUR_AWAKE               = 0x5294D74;
-    constexpr uintptr_t ITEM_BEHAVIOUR_START               = 0x5293EB4;
-    constexpr uintptr_t ITEM_WEAPON_INIT1                  = 0x5160388;
-    constexpr uintptr_t ITEM_WEAPON_INIT2                  = 0x51604DC;
-    constexpr uintptr_t ITEM_WEAPON_INIT3                  = 0x5160684;
-    constexpr uintptr_t FPC_SET_CURRENT_WEAPON             = 0x408FCD4;
-    constexpr uintptr_t FPC_SET_CURRENT_WEAPON2            = 0x40A5788;
-    constexpr uintptr_t FPC_EQUIP_COROUTINE                = 0x4097C90;
-    constexpr uintptr_t MAIN_MENU_SCROLL_ITEM_SET_DATA     = 0x4FA985C;
 
     // ---------------------------------------------------------------------
     // Entity Lifecycle & Target Filtering RVAs
@@ -104,10 +91,8 @@ namespace Offsets {
     constexpr uintptr_t AIMING_CONTROL_SET_TARGETIBLE_OBJ   = 0x4D287F8;
     constexpr uintptr_t AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ = 0x4D2883C;
     constexpr uintptr_t AIMING_CONTROL_ADD_DELTA            = 0x4D281AC;
-    constexpr uintptr_t BOT_PLAYER_GET_TEAM                 = 0x4449610;
+    constexpr uintptr_t NETWORK_PLAYER_IS_TEAMMATE          = 0x42CE9CC;
     constexpr uintptr_t BOT_PLAYER_HEALTH_GET_HEALTH        = 0x4BEE4FC;
-    constexpr uintptr_t FPC_ON_DESTROY                      = 0x40A3A84;
-    constexpr uintptr_t AIMING_CONTROL_ON_DESTROY           = 0x4D28714;
 
     // ---------------------------------------------------------------------
     // Native Aim Assist & Sensitivity RVAs
@@ -404,7 +389,6 @@ inline void (*SetLocalEulerAngles_Injected)(void *, const Vector3 *, int) = null
 inline void (*WorldToViewportPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
 inline void (*WorldToScreenPoint_Injected)(void *, const Vector3 *, int, Vector3 *) = nullptr;
 inline void *(*Camera_get_main)() = nullptr;
-inline float (*Camera_get_fieldOfView)(void *) = nullptr;
 inline void (*set_rotation_Injected)(void *, const Quaternion *) = nullptr;
 inline void (*LookRotation_Injected)(const Vector3 *, const Vector3 *, Quaternion *) = nullptr;
 inline bool (*Collider_get_enabled)(void *) = nullptr;
@@ -416,7 +400,7 @@ inline void* (*get_CurrentWeapon)(void *fpc) = nullptr;
 inline void* (*get_ShooterBehaviour)(void *fpc, void *item) = nullptr;
 inline void (*set_ClipAmmo)(void *shooter, int ammo) = nullptr;
 inline ObscuredFloat (*actk_op_Implicit_Float)(float val) = nullptr;
-inline void *(*FPC_GetNetworkPlayer)(void *fpc) = nullptr;
+inline int (*get_TargetType)(void *targetInfo) = nullptr;
 
 inline bool (*get_AllyObjectToogle)(void *) = nullptr;
 inline bool (*get_IsAutoAimAllowed)(void *) = nullptr;
@@ -425,12 +409,8 @@ inline void *(*BotPlayer_GetTargetibleObject)(void *) = nullptr;
 inline void (*AimingControl_SetTargetibleObject)(void *, void *) = nullptr;
 inline void (*AimingControl_ClearTargetibleObject)(void *) = nullptr;
 inline void (*AimingControl_AddDelta)(void *, Vector2) = nullptr;
-inline int (*BotPlayer_GetTeam)(void *) = nullptr;
+inline bool (*NetworkPlayer_IsTeammate)(void *, void *) = nullptr;
 inline float (*BotPlayerHealth_GetHealth)(void *) = nullptr;
-
-// Inventory & Weapon Inspection Pointers
-inline void* (*Object_get_name)(void *) = nullptr;
-inline void* (*Text_get_text)(void *) = nullptr;
 
 // Safe wrapper to set local scale on a Transform
 inline void safeSetLocalScale(void *transformObj, const Vector3 &scale) {
@@ -519,7 +499,6 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::UNITY_WORLD_TO_VIEWPORT_POINT,       WorldToViewportPoint_Injected, "WorldToViewportPoint_Injected");
     resolvePointer(base, Offsets::UNITY_WORLD_TO_SCREEN_POINT,         WorldToScreenPoint_Injected,   "WorldToScreenPoint_Injected");
     resolvePointer(base, Offsets::UNITY_CAMERA_GET_MAIN,               Camera_get_main,               "Camera_get_main");
-    resolvePointer(base, Offsets::UNITY_CAMERA_GET_FOV,                Camera_get_fieldOfView,        "Camera_get_fieldOfView");
     resolvePointer(base, Offsets::UNITY_SET_ROTATION_INJECTED,         set_rotation_Injected,         "set_rotation_Injected");
     resolvePointer(base, Offsets::UNITY_LOOK_ROTATION_INJECTED,        LookRotation_Injected,         "LookRotation_Injected");
     resolvePointer(base, Offsets::UNITY_COLLIDER_GET_ENABLED,          Collider_get_enabled,          "Collider_get_enabled");
@@ -532,7 +511,7 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::FPC_GET_SHOOTER_BEHAVIOUR,           get_ShooterBehaviour,          "get_ShooterBehaviour");
     resolvePointer(base, Offsets::WEAPON_SET_CLIP_AMMO,                set_ClipAmmo,                  "set_ClipAmmo");
     resolvePointer(base, Offsets::ACTK_OP_IMPLICIT_FLOAT,              actk_op_Implicit_Float,        "actk_op_Implicit_Float");
-    resolvePointer(base, Offsets::FPC_GET_NETWORK_PLAYER,              FPC_GetNetworkPlayer,          "FPC_GetNetworkPlayer");
+    resolvePointer(base, Offsets::TARGET_INFO_GET_TARGET_TYPE,         get_TargetType,                "get_TargetType");
 
     // Aim Assist & Filtering Pointers
     resolvePointer(base, Offsets::TARGETIBLE_GET_ALLY_OBJECT_TOOGLE,   get_AllyObjectToogle,          "get_AllyObjectToogle");
@@ -542,10 +521,8 @@ inline void initAllFunctionPointers(uintptr_t base) {
     resolvePointer(base, Offsets::AIMING_CONTROL_SET_TARGETIBLE_OBJ,   AimingControl_SetTargetibleObject, "AimingControl_SetTargetibleObject");
     resolvePointer(base, Offsets::AIMING_CONTROL_CLEAR_TARGETIBLE_OBJ, AimingControl_ClearTargetibleObject, "AimingControl_ClearTargetibleObject");
     resolvePointer(base, Offsets::AIMING_CONTROL_ADD_DELTA,            AimingControl_AddDelta,        "AimingControl_AddDelta");
-    resolvePointer(base, Offsets::BOT_PLAYER_GET_TEAM,                 BotPlayer_GetTeam,             "BotPlayer_GetTeam");
+    resolvePointer(base, Offsets::NETWORK_PLAYER_IS_TEAMMATE,          NetworkPlayer_IsTeammate,      "NetworkPlayer_IsTeammate");
     resolvePointer(base, Offsets::BOT_PLAYER_HEALTH_GET_HEALTH,        BotPlayerHealth_GetHealth,     "BotPlayerHealth_GetHealth");
-    resolvePointer(base, Offsets::UNITY_OBJECT_GET_NAME,               Object_get_name,               "Object_get_name");
-    resolvePointer(base, Offsets::UI_TEXT_GET_TEXT,                    Text_get_text,                 "Text_get_text");
 }
 
 // =========================================================================

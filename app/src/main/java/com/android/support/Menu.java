@@ -56,8 +56,6 @@ import android.widget.Toast;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
-import java.util.HashMap;
 
 import static android.view.ViewGroup.LayoutParams.WRAP_CONTENT;
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
@@ -68,8 +66,6 @@ import org.xml.sax.ErrorHandler;
 
 public class Menu {
     //********** Here you can easly change the menu appearance **********//
-
-    public static final Map<Integer, Spinner> spinners = new HashMap<>();
 
     //region Variable
     public static final String TAG = "Mod_Menu"; //Tag for logcat
@@ -120,17 +116,8 @@ public class Menu {
     public boolean autoCount = true;
     private Handler statusHandler;
     private Runnable statusRunnable;
-
-    // ESP Overlay System
-    public ESPOverlayView mEspOverlay;
-    public WindowManager.LayoutParams espParams;
-    public boolean mEspMaster = false;
-    public boolean mEspBox = true;
-    public boolean mEspLine = true;
-    public boolean mEspDistance = true;
-    public boolean mEspHealth = true;
-    public boolean mEspName = true;
-    public boolean mEspEnemyOnly = true;
+    public ESPView mEspView;
+    private WindowManager.LayoutParams espParams;
 
     //initialize methods from the native library
     native void Init(Context context, TextView title, TextView subTitle);
@@ -156,10 +143,6 @@ public class Menu {
     native boolean IsInGame();
 
     native void ResetEntityCounters();
-
-    native float[] GetESPData(int screenWidth, int screenHeight);
-
-    native boolean GetESPSetting(int settingId);
 
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
@@ -240,13 +223,12 @@ public class Menu {
                 try {
                     settingsOpen = !settingsOpen;
                     if (settingsOpen) {
-                        scrollView.removeAllViews();
+                        scrollView.removeView(mods);
                         scrollView.addView(mSettings);
                         scrollView.scrollTo(0, 0);
                     } else {
-                        scrollView.removeAllViews();
+                        scrollView.removeView(mSettings);
                         scrollView.addView(mods);
-                        scrollView.scrollTo(0, 0);
                     }
                 } catch (IllegalStateException e) {
                 }
@@ -325,9 +307,9 @@ public class Menu {
                         mWindowManager.removeView(mStatusHud);
                     } catch (Exception ignored) {}
                 }
-                if (mEspOverlay != null) {
+                if (mEspView != null) {
                     try {
-                        mWindowManager.removeView(mEspOverlay);
+                        mWindowManager.removeView(mEspView);
                     } catch (Exception ignored) {}
                 }
                 return false;
@@ -375,6 +357,7 @@ public class Menu {
         Init(context, title, subTitle);
         createStatusHud(context);
         createEspOverlay(context);
+        setESPVisible(Preferences.loadPrefBool("ESP Master Switch", 6, false));
     }
 
     public void ShowMenu() {
@@ -420,9 +403,9 @@ public class Menu {
                 mWindowManager.addView(mStatusHud, hudParams);
             } catch (Exception ignored) {}
         }
-        if (mEspOverlay != null) {
+        if (mEspView != null) {
             try {
-                mWindowManager.addView(mEspOverlay, espParams);
+                mWindowManager.addView(mEspView, espParams);
             } catch (Exception ignored) {}
         }
 
@@ -454,9 +437,9 @@ public class Menu {
                 mWindowManager.addView(mStatusHud, hudParams);
             } catch (Exception ignored) {}
         }
-        if (mEspOverlay != null) {
+        if (mEspView != null) {
             try {
-                mWindowManager.addView(mEspOverlay, espParams);
+                mWindowManager.addView(mEspView, espParams);
             } catch (Exception ignored) {}
         }
     }
@@ -544,6 +527,38 @@ public class Menu {
         statusHandler.postDelayed(statusRunnable, 1000);
     }
 
+    private void createEspOverlay(final Context context) {
+        int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
+        espParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                context instanceof Activity ? WindowManager.LayoutParams.TYPE_APPLICATION : iparams,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+        );
+        espParams.gravity = Gravity.TOP | Gravity.START;
+        espParams.x = 0;
+        espParams.y = 0;
+
+        mEspView = new ESPView(context);
+        mEspView.setVisibility(View.GONE);
+    }
+
+    public void setESPVisible(final boolean visible) {
+        if (mEspView != null) {
+            mEspView.post(new Runnable() {
+                @Override
+                public void run() {
+                    mEspView.setVisibility(visible ? View.VISIBLE : View.GONE);
+                }
+            });
+        }
+    }
+
     public void setStatusHudVisible(final boolean visible) {
         showStatusHud = visible;
         autoCount = visible;
@@ -593,71 +608,6 @@ public class Menu {
             Log.e(TAG, "Update status error", e);
         }
     }
-
-    public float[] getNativeEspData(int width, int height) {
-        try {
-            return GetESPData(width, height);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    public boolean isEspMasterActive() {
-        return mEspMaster;
-    }
-
-    public boolean isEspBoxActive() {
-        return mEspBox;
-    }
-
-    public boolean isEspLineActive() {
-        return mEspLine;
-    }
-
-    public boolean isEspDistanceActive() {
-        return mEspDistance;
-    }
-
-    public boolean isEspHealthActive() {
-        return mEspHealth;
-    }
-
-    public boolean isEspNameActive() {
-        return mEspName;
-    }
-
-    public void setEspOverlayVisible(final boolean visible) {
-        mEspMaster = visible;
-        if (mEspOverlay != null) {
-            mEspOverlay.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (visible) {
-                        mEspOverlay.startLoop();
-                    } else {
-                        mEspOverlay.stopLoop();
-                    }
-                }
-            });
-        }
-    }
-
-    private void createEspOverlay(final Context context) {
-        int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
-        espParams = new WindowManager.LayoutParams(
-                MATCH_PARENT,
-                MATCH_PARENT,
-                context instanceof Activity ? WindowManager.LayoutParams.TYPE_APPLICATION : iparams,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-        );
-        mEspOverlay = new ESPOverlayView(context);
-        mEspOverlay.setVisibility(View.GONE);
-    }
-
 
     private View.OnTouchListener onTouchListener() {
         return new View.OnTouchListener() {
@@ -710,11 +660,13 @@ public class Menu {
     }
 
     private void featureList(String[] listFT, LinearLayout linearLayout) {
+        //Currently looks messy right now. Let me know if you have improvements
         int featNum, subFeat = 0;
         LinearLayout llBak = linearLayout;
 
         for (int i = 0; i < listFT.length; i++) {
             boolean switchedOn = false;
+            //Log.i("featureList", listFT[i]);
             String feature = listFT[i];
             if (feature.contains("_True")) {
                 switchedOn = true;
@@ -723,6 +675,7 @@ public class Menu {
 
             linearLayout = llBak;
             if (feature.contains("CollapseAdd_")) {
+                //if (collapse != null)
                 linearLayout = mCollapse;
                 feature = feature.replaceFirst("CollapseAdd_", "");
             }
@@ -820,24 +773,7 @@ public class Menu {
         switchR.setText(featName);
         switchR.setTextColor(TEXT_COLOR_2);
         switchR.setPadding(10, 5, 0, 5);
-        boolean loadedBool = Preferences.loadPrefBool(featName, featNum, swiOn);
-        switchR.setChecked(loadedBool);
-        if (featNum == 6 && loadedBool) {
-            setEspOverlayVisible(true);
-        } else if (featNum == 7) {
-            mEspBox = loadedBool;
-        } else if (featNum == 8) {
-            mEspLine = loadedBool;
-        } else if (featNum == 9) {
-            mEspDistance = loadedBool;
-        } else if (featNum == 10) {
-            mEspHealth = loadedBool;
-        } else if (featNum == 11) {
-            mEspName = loadedBool;
-        } else if (featNum == 12) {
-            mEspEnemyOnly = loadedBool;
-        }
-
+        switchR.setChecked(Preferences.loadPrefBool(featName, featNum, swiOn));
         switchR.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             public void onCheckedChanged(CompoundButton compoundButton, boolean bool) {
                 Preferences.changeFeatureBool(featName, featNum, bool);
@@ -851,32 +787,8 @@ public class Menu {
                         Preferences.isExpanded = bool;
                         scrollView.setLayoutParams(bool ? scrlLLExpanded : scrlLL);
                         break;
-                    case 6: // ESP Master Switch
-                        setEspOverlayVisible(bool);
-                        break;
-                    case 7: // ESP 2D Box
-                        mEspBox = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 8: // ESP Line Tracer
-                        mEspLine = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 9: // ESP Distance
-                        mEspDistance = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 10: // ESP Health Bar
-                        mEspHealth = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 11: // ESP Name & Bot Info
-                        mEspName = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 12: // ESP Enemy Only
-                        mEspEnemyOnly = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
+                    case 6: // ESP Master Toggle
+                        setESPVisible(bool);
                         break;
                 }
             }
@@ -938,7 +850,7 @@ public class Menu {
                 switch (featNum) {
 
                     case -6:
-                        scrollView.removeAllViews();
+                        scrollView.removeView(mSettings);
                         scrollView.addView(mods);
                         break;
                     case -100:
@@ -1045,38 +957,8 @@ public class Menu {
             public void onNothingSelected(AdapterView<?> parent) {
             }
         });
-        spinners.put(featNum, spinner);
         linearLayout2.addView(spinner);
         linLayout.addView(linearLayout2);
-    }
-
-    public static void updateSpinnerList(final int featNum, final String list) {
-        if (instance != null && spinners.containsKey(featNum)) {
-            final Spinner sp = spinners.get(featNum);
-            if (sp != null) {
-                sp.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        List<String> lists = new LinkedList<>(Arrays.asList(list.split(",")));
-                        ArrayAdapter aa = new ArrayAdapter(instance.getContext, android.R.layout.simple_spinner_dropdown_item, lists);
-                        aa.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-                        sp.setAdapter(aa);
-                    }
-                });
-            }
-        }
-    }
-
-    public static void refreshMenu() {
-        if (instance != null && instance.mods != null) {
-            instance.mods.post(new Runnable() {
-                @Override
-                public void run() {
-                    instance.mods.removeAllViews();
-                    instance.featureList(instance.GetFeatureList(), instance.mods);
-                }
-            });
-        }
     }
 
     private void InputNum(LinearLayout linLayout, final int featNum, final String featName, final int maxValue) {
@@ -1393,15 +1275,20 @@ public class Menu {
         if (rootFrame != null) {
             rootFrame.setVisibility(view);
         }
+        if (mEspView != null && view != View.VISIBLE) {
+            mEspView.setVisibility(View.GONE);
+        } else if (mEspView != null && view == View.VISIBLE && Preferences.loadPrefBool("ESP Master Switch", 6, false)) {
+            mEspView.setVisibility(View.VISIBLE);
+        }
     }
 
     public void onDestroy() {
         if (rootFrame != null) {
             mWindowManager.removeView(rootFrame);
         }
-        if (mEspOverlay != null) {
+        if (mEspView != null) {
             try {
-                mWindowManager.removeView(mEspOverlay);
+                mWindowManager.removeView(mEspView);
             } catch (Exception ignored) {}
         }
     }
