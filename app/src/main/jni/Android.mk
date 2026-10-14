@@ -18,6 +18,14 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)
 
 # Here you add the cpp file to compile
 LOCAL_SRC_FILES := Main.cpp \
+	Core/MemoryHelper.cpp \
+	Core/Logger.cpp \
+	Core/CrashHandler.cpp \
+	Features/FeatureManager.cpp \
+	Features/FastFireRate.cpp \
+	Features/NoRecoil.cpp \
+	Features/BigHead.cpp \
+	Features/StatusPanel.cpp \
 	Substrate/hde64.c \
 	Substrate/SubstrateDebug.cpp \
 	Substrate/SubstrateHook.cpp \
@@ -25,8 +33,8 @@ LOCAL_SRC_FILES := Main.cpp \
 	Substrate/SymbolFinder.cpp \
 	KittyMemory/KittyMemory.cpp \
 	KittyMemory/MemoryPatch.cpp \
-    KittyMemory/MemoryBackup.cpp \
-    KittyMemory/KittyUtils.cpp \
-	And64InlineHook/And64InlineHook.cpp \
+	KittyMemory/MemoryBackup.cpp \
+	KittyMemory/KittyUtils.cpp \
+	And64InlineHook/And64InlineHook.cpp
 
 include $(BUILD_SHARED_LIBRARY)

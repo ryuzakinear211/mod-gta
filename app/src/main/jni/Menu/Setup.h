@@ -1,9 +1,11 @@
 #include <sstream>
 #include "Menu/Menu.h"
 #include "Menu/get_device_api_level_inlines.h"
+#include "Includes/Logger.h"
+#include "Includes/Utils.h"
 
 //Jni stuff from MrDarkRX https://github.com/MrDarkRXx/DarkMod-Floating
-void setDialog(jobject ctx, JNIEnv *env, const char *title, const char *msg){
+inline void setDialog(jobject ctx, JNIEnv *env, const char *title, const char *msg){
     jclass Alert = env->FindClass(OBFUSCATE("android/app/AlertDialog$Builder"));
     jmethodID AlertCons = env->GetMethodID(Alert, OBFUSCATE("<init>"), OBFUSCATE("(Landroid/content/Context;)V"));
 
@@ -30,7 +32,7 @@ void setDialog(jobject ctx, JNIEnv *env, const char *title, const char *msg){
     env->CallVoidMethod(creaetob, show);
 }
 
-void Toast(JNIEnv *env, jobject thiz, const char *text, int length) {
+inline void Toast(JNIEnv *env, jobject thiz, const char *text, int length) {
     jstring jstr = env->NewStringUTF(text);
     jclass toast = env->FindClass(OBFUSCATE("android/widget/Toast"));
     jmethodID methodMakeText =env->GetStaticMethodID(toast,OBFUSCATE("makeText"),OBFUSCATE("(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;"));
@@ -39,7 +41,7 @@ void Toast(JNIEnv *env, jobject thiz, const char *text, int length) {
     env->CallVoidMethod(toastobj, methodShow);
 }
 
-void startActivityPermisson(JNIEnv *env, jobject ctx){
+inline void startActivityPermisson(JNIEnv *env, jobject ctx){
     jclass native_context = env->GetObjectClass(ctx);
     jmethodID startActivity = env->GetMethodID(native_context, OBFUSCATE("startActivity"),OBFUSCATE("(Landroid/content/Intent;)V"));
 
@@ -64,7 +66,7 @@ void startActivityPermisson(JNIEnv *env, jobject ctx){
     env->CallVoidMethod(ctx, startActivity, intent);
 }
 
-void startService(JNIEnv *env, jobject ctx){
+inline void startService(JNIEnv *env, jobject ctx){
     jclass native_context = env->GetObjectClass(ctx);
     jclass intentClass = env->FindClass(OBFUSCATE("android/content/Intent"));
     jclass actionString = env->FindClass(OBFUSCATE("com/android/support/Launcher"));
@@ -74,13 +76,13 @@ void startService(JNIEnv *env, jobject ctx){
     env->CallObjectMethod(ctx, startActivityMethodId, intent);
 }
 
-void *exit_thread(void *) {
+inline void *exit_thread(void *) {
     sleep(5);
     exit(0);
 }
 
 //Needed jclass parameter because this is a static java method
-void CheckOverlayPermission(JNIEnv *env, jclass thiz, jobject ctx){
+inline void CheckOverlayPermission(JNIEnv *env, jclass thiz, jobject ctx){
     //If overlay permission option is greyed out, make sure to add android.permission.SYSTEM_ALERT_WINDOW in manifest
 
     LOGI(OBFUSCATE("Check overlay permission"));
@@ -107,7 +109,7 @@ void CheckOverlayPermission(JNIEnv *env, jclass thiz, jobject ctx){
     startService(env, ctx);
 }
 
-void Init(JNIEnv *env, jobject thiz, jobject ctx, jobject title, jobject subtitle){
+inline void Init(JNIEnv *env, jobject thiz, jobject ctx, jobject title, jobject subtitle){
     //Set title
     setText(env, title, OBFUSCATE("<b><font color='#00E5FF'>GTA SA FPS</font></b>"));
 

@@ -1,0 +1,117 @@
+#include "FeatureManager.h"
+#include "FastFireRate.h"
+#include "NoRecoil.h"
+#include "BigHead.h"
+#include "StatusPanel.h"
+#include "../GameOffsets.h"
+#include "../Core/MemoryHelper.h"
+#include "../Core/Logger.h"
+#include "../Includes/obfuscate.h"
+#include "../Menu/Setup.h"
+
+namespace FeatureManager {
+
+    // Central FirstPersonController.Update Hook: RVA 0x40A1BF4
+    static void (*old_FPC_Update)(void *instance) = nullptr;
+    static void hook_FPC_Update(void *instance) {
+        if (instance) {
+            FastFireRate::OnLocalPlayerUpdate(instance);
+        }
+        if (old_FPC_Update) old_FPC_Update(instance);
+    }
+
+    void InitAll() {
+        LOG_INFO("=================================================================");
+        LOG_INFO("Initializing GTA SA FPS Modular Features from dump.cs...");
+        LOG_INFO("=================================================================");
+
+        FastFireRate::Init();
+        NoRecoil::Init();
+        BigHead::Init();
+        StatusPanel::Init();
+
+        // Install local player lifecycle hook
+        Memory::HookRVA(Offsets::FPC::Update, reinterpret_cast<void*>(hook_FPC_Update), reinterpret_cast<void**>(&old_FPC_Update));
+
+        LOG_INFO("[FEATURE_MGR] All modules and core hooks initialized successfully.");
+    }
+
+    jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
+        const char *features[] = {
+            OBFUSCATE("Category_🎮 FITUR GTA SA FPS"),
+            OBFUSCATE("Toggle_Status Panel Overlay"),         // featNum 0
+            OBFUSCATE("Toggle_Big Head"),                     // featNum 1
+            OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 2
+            OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
+            OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
+            OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
+                      "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
+                      "<font color='#FFFFFF'>"
+                      "• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>"
+                      "• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>"
+                      "• <b>Fast FireRate:</b> Tembakan kecepatan tinggi (Client-Side).<br><br>"
+                      "• <b>No Recoil:</b> 0% hentakan senjata (Bidikan lurus stabil).<br><br>"
+                      "• <b>Engine:</b> Modular Architecture berbasis dump.cs."
+                      "</font></div>")
+        };
+
+        int total = sizeof(features) / sizeof(features[0]);
+        jobjectArray ret = env->NewObjectArray(total, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
+
+        for (int i = 0; i < total; i++) {
+            env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
+        }
+
+        return ret;
+    }
+
+    void OnToggle(JNIEnv *env, jclass clazz, jobject ctx,
+                  jint featNum, jstring featName, jint value,
+                  jboolean boolean, jstring str) {
+
+        LOG_INFO("[TOGGLE] Feature #%d changed -> boolean=%d, value=%d", featNum, (int)boolean, value);
+
+        switch (featNum) {
+            case 0: { // Status Panel Overlay
+                StatusPanel::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "StatusPanel: ON" : "StatusPanel: OFF");
+                Toast(env, ctx, boolean ? OBFUSCATE("Status Panel & Counter: ON")
+                                        : OBFUSCATE("Status Panel & Counter: OFF"),
+                      ToastLength::LENGTH_SHORT);
+                break;
+            }
+
+            case 1: { // Big Head
+                BigHead::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "BigHead: ON" : "BigHead: OFF");
+                Toast(env, ctx, boolean ? OBFUSCATE("Big Head: ON (Kepala Membesar)")
+                                        : OBFUSCATE("Big Head: OFF (Normal)"),
+                      ToastLength::LENGTH_SHORT);
+                break;
+            }
+
+            case 2: { // Fast FireRate
+                FastFireRate::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "FastFireRate: ON" : "FastFireRate: OFF");
+                Toast(env, ctx, boolean ? OBFUSCATE("Fast FireRate: ON (Client-Side)")
+                                        : OBFUSCATE("Fast FireRate: OFF (Normal)"),
+                      ToastLength::LENGTH_SHORT);
+                break;
+            }
+
+            case 3: { // No Recoil
+                NoRecoil::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "NoRecoil: ON" : "NoRecoil: OFF");
+                Toast(env, ctx, boolean ? OBFUSCATE("No Recoil: ON (Client-Side)")
+                                        : OBFUSCATE("No Recoil: OFF (Normal)"),
+                      ToastLength::LENGTH_SHORT);
+                break;
+            }
+
+            default:
+                LOG_WARN("[TOGGLE] Unknown feature ID: %d", featNum);
+                break;
+        }
+    }
+
+} // namespace FeatureManager

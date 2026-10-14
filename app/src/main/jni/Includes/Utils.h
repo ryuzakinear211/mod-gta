@@ -10,11 +10,11 @@
 #include "Logger.h"
 
 typedef unsigned long DWORD;
-static uintptr_t libBase;
+inline uintptr_t libBase = 0;
 
-bool libLoaded = false;
+inline bool libLoaded = false;
 
-DWORD findLibrary(const char *library) {
+inline DWORD findLibrary(const char *library) {
     char filename[0xFF] = {0},
             buffer[1024] = {0};
     FILE *fp = NULL;
@@ -44,27 +44,29 @@ DWORD findLibrary(const char *library) {
     return address;
 }
 
-DWORD getAbsoluteAddress(const char *libraryName, DWORD relativeAddr) {
-    libBase = findLibrary(libraryName);
+inline DWORD getAbsoluteAddress(const char *libraryName, DWORD relativeAddr) {
+    if (libBase == 0) {
+        libBase = findLibrary(libraryName);
+    }
     if (libBase == 0)
         return 0;
     return (reinterpret_cast<DWORD>(libBase + relativeAddr));
 }
 
 
-jboolean isGameLibLoaded(JNIEnv *env, jobject thiz) {
+inline jboolean isGameLibLoaded(JNIEnv *env, jobject thiz) {
     return libLoaded;
 }
 
-bool isLibraryLoaded(const char *libraryName) {
-    //libLoaded = true;
+inline bool isLibraryLoaded(const char *libraryName) {
+    if (libLoaded) return true;
     char line[512] = {0};
     FILE *fp = fopen(OBFUSCATE("/proc/self/maps"), OBFUSCATE("rt"));
     if (fp != NULL) {
         while (fgets(line, sizeof(line), fp)) {
-            std::string a = line;
             if (strstr(line, libraryName)) {
                 libLoaded = true;
+                fclose(fp);
                 return true;
             }
         }
@@ -73,7 +75,7 @@ bool isLibraryLoaded(const char *libraryName) {
     return false;
 }
 
-uintptr_t string2Offset(const char *c) {
+inline uintptr_t string2Offset(const char *c) {
     int base = 16;
     // See if this function catches all possibilities.
     // If it doesn't, the function would have to be amended

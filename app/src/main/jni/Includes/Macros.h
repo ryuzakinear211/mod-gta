@@ -11,7 +11,7 @@
 
 #endif
 
-void hook(void *offset, void* ptr, void **orig)
+inline void hook(void *offset, void* ptr, void **orig)
 {
     if (offset == NULL) {
         LOGE(OBFUSCATE("Hook address is NULL, skipping hook."));
@@ -36,11 +36,11 @@ void hook(void *offset, void* ptr, void **orig)
 #define HOOKSYM_NO_ORIG(sym, ptr)  hook(dlsym(dlopen(targetLibName, 4), OBFUSCATE(sym)), (void *)ptr, NULL)
 #define HOOKSYM_LIB_NO_ORIG(lib, sym, ptr) hook(dlsym(dlopen(OBFUSCATE(lib), 4), OBFUSCATE(sym)), (void *)ptr, NULL)
 
-std::vector<MemoryPatch> memoryPatches;
-std::vector<uint64_t> offsetVector;
+inline std::vector<MemoryPatch> memoryPatches;
+inline std::vector<uint64_t> offsetVector;
 
 // Patching a offset without switch.
-void patchOffset(const char *fileName, uint64_t offset, std::string hexBytes, bool isOn) {
+inline void patchOffset(const char *fileName, uint64_t offset, std::string hexBytes, bool isOn) {
 
     MemoryPatch patch = MemoryPatch::createWithHex(fileName, offset, hexBytes);
 
@@ -70,7 +70,7 @@ void patchOffset(const char *fileName, uint64_t offset, std::string hexBytes, bo
     }
 }
 
-void patchOffsetSym(uintptr_t absolute_address, std::string hexBytes, bool isOn) {
+inline void patchOffsetSym(uintptr_t absolute_address, std::string hexBytes, bool isOn) {
 
     MemoryPatch patch = MemoryPatch::createWithHex(absolute_address, hexBytes);
 

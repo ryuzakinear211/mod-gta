@@ -117,17 +117,6 @@ public class Menu {
     private Handler statusHandler;
     private Runnable statusRunnable;
 
-    // ESP Overlay System
-    public ESPOverlayView mEspOverlay;
-    public WindowManager.LayoutParams espParams;
-    public boolean mEspMaster = false;
-    public boolean mEspBox = true;
-    public boolean mEspLine = true;
-    public boolean mEspDistance = true;
-    public boolean mEspHealth = true;
-    public boolean mEspName = true;
-    public boolean mEspEnemyOnly = true;
-
     //initialize methods from the native library
     native void Init(Context context, TextView title, TextView subTitle);
 
@@ -152,10 +141,6 @@ public class Menu {
     native boolean IsInGame();
 
     native void ResetEntityCounters();
-
-    native float[] GetESPData(int screenWidth, int screenHeight);
-
-    native boolean GetESPSetting(int settingId);
 
     //Here we write the code for our Menu
     // Reference: https://www.androidhive.info/2016/11/android-floating-widget-like-facebook-chat-head/
@@ -236,13 +221,12 @@ public class Menu {
                 try {
                     settingsOpen = !settingsOpen;
                     if (settingsOpen) {
-                        scrollView.removeAllViews();
+                        scrollView.removeView(mods);
                         scrollView.addView(mSettings);
                         scrollView.scrollTo(0, 0);
                     } else {
-                        scrollView.removeAllViews();
+                        scrollView.removeView(mSettings);
                         scrollView.addView(mods);
-                        scrollView.scrollTo(0, 0);
                     }
                 } catch (IllegalStateException e) {
                 }
@@ -321,11 +305,6 @@ public class Menu {
                         mWindowManager.removeView(mStatusHud);
                     } catch (Exception ignored) {}
                 }
-                if (mEspOverlay != null) {
-                    try {
-                        mWindowManager.removeView(mEspOverlay);
-                    } catch (Exception ignored) {}
-                }
                 return false;
             }
         });
@@ -370,7 +349,6 @@ public class Menu {
 
         Init(context, title, subTitle);
         createStatusHud(context);
-        createEspOverlay(context);
     }
 
     public void ShowMenu() {
@@ -416,11 +394,6 @@ public class Menu {
                 mWindowManager.addView(mStatusHud, hudParams);
             } catch (Exception ignored) {}
         }
-        if (mEspOverlay != null) {
-            try {
-                mWindowManager.addView(mEspOverlay, espParams);
-            } catch (Exception ignored) {}
-        }
 
         overlayRequired = true;
     }
@@ -448,11 +421,6 @@ public class Menu {
         if (mStatusHud != null) {
             try {
                 mWindowManager.addView(mStatusHud, hudParams);
-            } catch (Exception ignored) {}
-        }
-        if (mEspOverlay != null) {
-            try {
-                mWindowManager.addView(mEspOverlay, espParams);
             } catch (Exception ignored) {}
         }
     }
@@ -590,71 +558,6 @@ public class Menu {
         }
     }
 
-    public float[] getNativeEspData(int width, int height) {
-        try {
-            return GetESPData(width, height);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
-    public boolean isEspMasterActive() {
-        return mEspMaster;
-    }
-
-    public boolean isEspBoxActive() {
-        return mEspBox;
-    }
-
-    public boolean isEspLineActive() {
-        return mEspLine;
-    }
-
-    public boolean isEspDistanceActive() {
-        return mEspDistance;
-    }
-
-    public boolean isEspHealthActive() {
-        return mEspHealth;
-    }
-
-    public boolean isEspNameActive() {
-        return mEspName;
-    }
-
-    public void setEspOverlayVisible(final boolean visible) {
-        mEspMaster = visible;
-        if (mEspOverlay != null) {
-            mEspOverlay.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (visible) {
-                        mEspOverlay.startLoop();
-                    } else {
-                        mEspOverlay.stopLoop();
-                    }
-                }
-            });
-        }
-    }
-
-    private void createEspOverlay(final Context context) {
-        int iparams = Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O ? 2038 : 2002;
-        espParams = new WindowManager.LayoutParams(
-                MATCH_PARENT,
-                MATCH_PARENT,
-                context instanceof Activity ? WindowManager.LayoutParams.TYPE_APPLICATION : iparams,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-        );
-        mEspOverlay = new ESPOverlayView(context);
-        mEspOverlay.setVisibility(View.GONE);
-    }
-
-
     private View.OnTouchListener onTouchListener() {
         return new View.OnTouchListener() {
             final View collapsedView = mCollapsed;
@@ -706,11 +609,13 @@ public class Menu {
     }
 
     private void featureList(String[] listFT, LinearLayout linearLayout) {
+        //Currently looks messy right now. Let me know if you have improvements
         int featNum, subFeat = 0;
         LinearLayout llBak = linearLayout;
 
         for (int i = 0; i < listFT.length; i++) {
             boolean switchedOn = false;
+            //Log.i("featureList", listFT[i]);
             String feature = listFT[i];
             if (feature.contains("_True")) {
                 switchedOn = true;
@@ -719,6 +624,7 @@ public class Menu {
 
             linearLayout = llBak;
             if (feature.contains("CollapseAdd_")) {
+                //if (collapse != null)
                 linearLayout = mCollapse;
                 feature = feature.replaceFirst("CollapseAdd_", "");
             }
@@ -816,24 +722,7 @@ public class Menu {
         switchR.setText(featName);
         switchR.setTextColor(TEXT_COLOR_2);
         switchR.setPadding(10, 5, 0, 5);
-        boolean loadedBool = Preferences.loadPrefBool(featName, featNum, swiOn);
-        switchR.setChecked(loadedBool);
-        if (featNum == 6 && loadedBool) {
-            setEspOverlayVisible(true);
-        } else if (featNum == 7) {
-            mEspBox = loadedBool;
-        } else if (featNum == 8) {
-            mEspLine = loadedBool;
-        } else if (featNum == 9) {
-            mEspDistance = loadedBool;
-        } else if (featNum == 10) {
-            mEspHealth = loadedBool;
-        } else if (featNum == 11) {
-            mEspName = loadedBool;
-        } else if (featNum == 12) {
-            mEspEnemyOnly = loadedBool;
-        }
-
+        switchR.setChecked(Preferences.loadPrefBool(featName, featNum, swiOn));
         switchR.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
             public void onCheckedChanged(CompoundButton compoundButton, boolean bool) {
                 Preferences.changeFeatureBool(featName, featNum, bool);
@@ -846,33 +735,6 @@ public class Menu {
                     case -3:
                         Preferences.isExpanded = bool;
                         scrollView.setLayoutParams(bool ? scrlLLExpanded : scrlLL);
-                        break;
-                    case 6: // ESP Master Switch
-                        setEspOverlayVisible(bool);
-                        break;
-                    case 7: // ESP 2D Box
-                        mEspBox = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 8: // ESP Line Tracer
-                        mEspLine = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 9: // ESP Distance
-                        mEspDistance = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 10: // ESP Health Bar
-                        mEspHealth = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 11: // ESP Name & Bot Info
-                        mEspName = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
-                        break;
-                    case 12: // ESP Enemy Only
-                        mEspEnemyOnly = bool;
-                        if (mEspOverlay != null) mEspOverlay.postInvalidate();
                         break;
                 }
             }
@@ -934,7 +796,7 @@ public class Menu {
                 switch (featNum) {
 
                     case -6:
-                        scrollView.removeAllViews();
+                        scrollView.removeView(mSettings);
                         scrollView.addView(mods);
                         break;
                     case -100:
@@ -1364,11 +1226,6 @@ public class Menu {
     public void onDestroy() {
         if (rootFrame != null) {
             mWindowManager.removeView(rootFrame);
-        }
-        if (mEspOverlay != null) {
-            try {
-                mWindowManager.removeView(mEspOverlay);
-            } catch (Exception ignored) {}
         }
     }
 }
