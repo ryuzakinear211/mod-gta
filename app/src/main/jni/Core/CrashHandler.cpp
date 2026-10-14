@@ -1,5 +1,7 @@
 #include "CrashHandler.h"
 #include "Logger.h"
+#include <cstddef>
+#include <cstdint>
 #include <csignal>
 #include <cstring>
 #include <cstdio>

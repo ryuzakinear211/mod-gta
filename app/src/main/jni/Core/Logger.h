@@ -2,6 +2,8 @@
 #define MOD_LOGGER_H
 
 #include <android/log.h>
+#include <cstddef>
+#include <cstdint>
 #include <cstdarg>
 
 #define MOD_TAG "Mod_GTA"
