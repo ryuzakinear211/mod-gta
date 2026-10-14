@@ -114,6 +114,8 @@ public class Menu {
     public WindowManager.LayoutParams hudParams;
     public boolean showStatusHud = false;
     public boolean autoCount = true;
+    private Handler statusHandler;
+    private Runnable statusRunnable;
     // ESP Overlay System
     public ESPOverlayView mEspOverlay;
     public WindowManager.LayoutParams espParams;
@@ -310,6 +312,9 @@ public class Menu {
         hideBtn.setOnLongClickListener(new View.OnLongClickListener() {
             public boolean onLongClick(View view) {
                 Toast.makeText(view.getContext(), "Menu killed", Toast.LENGTH_LONG).show();
+                if (statusHandler != null && statusRunnable != null) {
+                    statusHandler.removeCallbacks(statusRunnable);
+                }
                 rootFrame.removeView(mRootContainer);
                 mWindowManager.removeView(rootFrame);
                 if (mStatusHud != null) {
@@ -1317,8 +1322,16 @@ public class Menu {
     }
 
     public void onDestroy() {
+        if (statusHandler != null && statusRunnable != null) {
+            statusHandler.removeCallbacks(statusRunnable);
+        }
         if (rootFrame != null) {
             mWindowManager.removeView(rootFrame);
+        }
+        if (mStatusHud != null) {
+            try {
+                mWindowManager.removeView(mStatusHud);
+            } catch (Exception ignored) {}
         }
         if (mEspOverlay != null) {
             try {
