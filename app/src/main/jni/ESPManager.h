@@ -17,6 +17,7 @@ static inline int extractTargetType(void *targetInfo);
 static inline bool isTargetInfoAlive(void *targetInfo);
 static inline int getBotTeam(void *botPlayer);
 static inline bool isTargetibleObjectTeammate(void *targetibleObj);
+static inline int getTeamFromBotService(void *targetibleObj);
 
 // Struct for passing active entities directly from Status Overlay synchronization
 struct ESPEntityItem {
@@ -264,6 +265,19 @@ public:
             // Team & Enemy discrimination using game engine logic
             bool isEnemy = isEntityEnemy(netPlayer, targetibleObj, isBot ? entityObj : nullptr);
 
+            int localTeam = g_localPlayerTeam.load();
+            int targetTeam = isBot ? getBotTeam(entityObj) : -1;
+            if (targetTeam == -1 && targetibleObj != nullptr) {
+                targetTeam = getTeamFromBotService(targetibleObj);
+            }
+            if (localTeam >= 0 && targetTeam >= 0) {
+                if (localTeam == targetTeam) {
+                    isEnemy = false;
+                } else {
+                    isEnemy = true;
+                }
+            }
+
             // Filter Enemy Only:
             // Jika fitur Enemy Only aktif, rekan satu tim tidak digambar pada layar.
             if (enemyOnly) {
@@ -278,8 +292,6 @@ public:
                 }
 
                 // 3. Perbandingan langsung tim lokal vs tim target (TeamA = 0, TeamB = 1)
-                int localTeam = g_localPlayerTeam.load();
-                int targetTeam = isBot ? getBotTeam(entityObj) : -1;
                 if (localTeam >= 0 && targetTeam >= 0 && localTeam == targetTeam) {
                     continue;
                 }
