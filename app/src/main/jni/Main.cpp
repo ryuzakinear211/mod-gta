@@ -990,9 +990,41 @@ static void onBotPlayerUpdate(void *instance) {
         }
     }
 
-    // Dynamic Player Team Calibration from Bot TargetInfo / Teammate check
+    // Dynamic Player Team Calibration from Bot
     int bTeam = getBotTeam(instance);
     if (bTeam == 0 || bTeam == 1) {
+        // 1. Proactive calibration from TargetibleObjectCustomSettings (available on match start)
+        void *tObj = nullptr;
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(instance) + 0x60))) {
+            tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(instance) + 0x60);
+        }
+        if (tObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
+            tObj = BotPlayer_GetTargetibleObject(instance);
+        }
+        if (tObj != nullptr && isPointerReadable(tObj) && isUnityObjectAlive(tObj)) {
+            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tObj) + 0x90))) {
+                void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tObj) + 0x90);
+                if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
+                    bool isAlly = false;
+                    bool allyRead = false;
+                    if (get_AllyObjectToogle != nullptr) {
+                        isAlly = get_AllyObjectToogle(customSettings);
+                        allyRead = true;
+                    } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
+                        isAlly = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20);
+                        allyRead = true;
+                    }
+
+                    if (allyRead && isAlly) {
+                        g_localPlayerTeam.store(bTeam);
+                    } else if (get_IsAutoAimAllowed != nullptr && get_IsAutoAimAllowed(customSettings)) {
+                        g_localPlayerTeam.store(1 - bTeam);
+                    }
+                }
+            }
+        }
+
+        // 2. Secondary calibration from TargetInfo bitmask if available
         if (netPlayer != nullptr && isPointerReadable(netPlayer)) {
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
                 void *tInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
@@ -1331,14 +1363,38 @@ static inline int classifyEntityAffiliation(void *netPlayer, void *targetibleObj
         }
     }
 
-    // 4. TargetibleObjectCustomSettings Ally Toggle Check
+    // 4. TargetibleObjectCustomSettings Ally Toggle & Auto Aim Check
     if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
             void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
             if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
-                    if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20)) {
-                        return -1; // Ally Toggle is active!
+                // A. Check get_AllyObjectToogle
+                bool isAlly = false;
+                bool allyRead = false;
+                if (get_AllyObjectToogle != nullptr) {
+                    isAlly = get_AllyObjectToogle(customSettings);
+                    allyRead = true;
+                } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20))) {
+                    isAlly = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(customSettings) + 0x20);
+                    allyRead = true;
+                }
+
+                if (allyRead && isAlly) {
+                    if (botPlayer != nullptr) {
+                        int bTeam = getBotTeam(botPlayer);
+                        if (bTeam == 0 || bTeam == 1) g_localPlayerTeam.store(bTeam);
+                    }
+                    return -1; // Confirmed Ally/Teammate!
+                }
+
+                // B. Check get_IsAutoAimAllowed
+                if (get_IsAutoAimAllowed != nullptr) {
+                    if (get_IsAutoAimAllowed(customSettings)) {
+                        if (botPlayer != nullptr) {
+                            int bTeam = getBotTeam(botPlayer);
+                            if (bTeam == 0 || bTeam == 1) g_localPlayerTeam.store(1 - bTeam);
+                        }
+                        return 1; // Confirmed Enemy!
                     }
                 }
             }
@@ -1370,23 +1426,26 @@ static inline bool isEntityEnemy(void *entityNetPlayer, void *targetibleObj, voi
     int cls = classifyEntityAffiliation(entityNetPlayer, targetibleObj, botPlayer);
     if (cls == 1) return true;
     if (cls == -1) return false;
+
     if (botPlayer != nullptr) {
         int bTeam = getBotTeam(botPlayer);
         int myTeam = g_localPlayerTeam.load();
         if (bTeam >= 0 && myTeam >= 0) {
             return (bTeam != myTeam);
         }
-        // If myTeam is uncalibrated, default bot to enemy unless proven teammate (cls == -1)
-        return true;
     }
+
     void *localNet = g_localPlayerNetPlayer.load();
-    if (entityNetPlayer != nullptr) {
-        if (localNet != nullptr && entityNetPlayer == localNet) {
-            return false;
-        }
-        return true;
+    if (entityNetPlayer != nullptr && localNet != nullptr && entityNetPlayer == localNet) {
+        return false;
     }
-    return false;
+    void *localFpc = g_localPlayerFPC.load();
+    if (botPlayer != nullptr && localFpc != nullptr && botPlayer == localFpc) {
+        return false;
+    }
+
+    // Default to true so targets aren't mistakenly hidden before team calibration
+    return true;
 }
 
 static inline bool isNetworkPlayerTeammate(void *netPlayer) {
@@ -1413,48 +1472,23 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
         }
     }
 
-    // 2. Check BotPlayer health (BotPlayerHealth at 0x30)
+    // 2. Check BotPlayer active state (death disables the MonoBehaviour in Unity)
     if (botPlayer != nullptr && isPointerReadable(botPlayer) && isUnityObjectAlive(botPlayer)) {
         if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(botPlayer)) {
             return true;
         }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30))) {
-            void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(botPlayer) + 0x30);
-            if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
-                // Max HP is at offset 0x30 in BotPlayerHealth
-                float maxHp = 0.0f;
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(botHealth) + 0x30))) {
-                    maxHp = *reinterpret_cast<float *>(reinterpret_cast<uintptr_t>(botHealth) + 0x30);
-                }
-                if (BotPlayerHealth_GetHealth != nullptr) {
-                    float hp = BotPlayerHealth_GetHealth(botHealth);
-                    // Only consider dead if max HP was properly loaded (> 0) and current HP <= 0.
-                    // If hp == 0.0f and maxHp == 0.0f (pre-combat lazy uninitialized), the bot is alive!
-                    if (maxHp > 0.0f && hp <= 0.0f) {
-                        return true;
-                    }
-                }
-            }
-        }
     }
 
-    // 3. Check NetworkPlayer
+    // 3. Check NetworkPlayer active state
     if (netPlayer != nullptr && isPointerReadable(netPlayer) && isUnityObjectAlive(netPlayer)) {
         if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(netPlayer)) {
             return true;
-        }
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0))) {
-            void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0xC0);
-            if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-                if (!isTargetInfoAlive(targetInfo)) {
-                    return true;
-                }
-            }
         }
     }
 
     return false;
 }
+
 
 static bool isTargetObstructedByWall(const Vector3 &camPos, const Vector3 &bonePos) {
     if (Internal_RaycastTest_Injected == nullptr) return false;
@@ -1614,10 +1648,61 @@ static void updateEspData(void *aimingControl) {
         return;
     }
 
+    // Proactive Local Player Team Calibration before rendering
+    if (g_localPlayerTeam.load() == -1) {
+        for (const auto &item : activeEntities) {
+            if (item.isBot && item.object != nullptr) {
+                int bTeam = getBotTeam(item.object);
+                if (bTeam == 0 || bTeam == 1) {
+                    void *tObj = nullptr;
+                    if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(item.object) + 0x60))) {
+                        tObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(item.object) + 0x60);
+                    }
+                    if (tObj == nullptr && BotPlayer_GetTargetibleObject != nullptr) {
+                        tObj = BotPlayer_GetTargetibleObject(item.object);
+                    }
+                    if (tObj != nullptr && isPointerReadable(tObj) && isUnityObjectAlive(tObj)) {
+                        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(tObj) + 0x90))) {
+                            void *cs = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(tObj) + 0x90);
+                            if (cs != nullptr && isPointerReadable(cs) && isUnityObjectAlive(cs)) {
+                                bool isAlly = false;
+                                bool readAlly = false;
+                                if (get_AllyObjectToogle != nullptr) {
+                                    isAlly = get_AllyObjectToogle(cs);
+                                    readAlly = true;
+                                } else if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(cs) + 0x20))) {
+                                    isAlly = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(cs) + 0x20);
+                                    readAlly = true;
+                                }
+                                if (readAlly && isAlly) {
+                                    g_localPlayerTeam.store(bTeam);
+                                    ModLog("[TEAM] Proactive Calibrated Local Player Team -> %d (from Ally Bot)", bTeam);
+                                    break;
+                                } else if (get_IsAutoAimAllowed != nullptr && get_IsAutoAimAllowed(cs)) {
+                                    g_localPlayerTeam.store(1 - bTeam);
+                                    ModLog("[TEAM] Proactive Calibrated Local Player Team -> %d (from Enemy Bot auto-aim)", 1 - bTeam);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     std::vector<float> buffer;
     buffer.reserve(activeEntities.size() * 9);
 
-    espManager->collectESPDataFromList(cam, screenWidth, screenHeight, maxDist, enemyOnly, activeEntities, buffer);
+    int drawnCount = espManager->collectESPDataFromList(cam, screenWidth, screenHeight, maxDist, enemyOnly, activeEntities, buffer);
+
+    static uint64_t lastEspLogMs = 0;
+    uint64_t nowMs = getCurrentTimeMs();
+    if (nowMs - lastEspLogMs > 5000) {
+        lastEspLogMs = nowMs;
+        ModLog("[ESP] Update: %zu active | drawn=%d | localTeam=%d | enemyOnly=%d",
+               activeEntities.size(), drawnCount, g_localPlayerTeam.load(), enemyOnly ? 1 : 0);
+    }
 
     {
         std::lock_guard<std::mutex> lock(g_espDataMutex);

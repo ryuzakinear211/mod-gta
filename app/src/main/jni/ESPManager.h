@@ -157,7 +157,12 @@ public:
             bool isDead = false;
 
             if (isBot) {
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x30))) {
+                // If BotPlayer itself is inactive/disabled in Unity, it is dead
+                if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(entityObj)) {
+                    isDead = true;
+                }
+
+                if (!isDead && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0x30))) {
                     void *botHealth = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0x30);
                     if (botHealth != nullptr && isPointerReadable(botHealth) && isUnityObjectAlive(botHealth)) {
                         // Max HP field is at offset 0x30 in BotPlayerHealth
@@ -178,29 +183,21 @@ public:
                             hpRead = true;
                         }
 
-                        if (hpRead) {
-                            if (hp > 0.0f) {
-                                currentHp = static_cast<int>(hp);
-                            } else if (mHp > 0.0f && hp <= 0.0f) {
-                                // Only confirmed dead if max HP was loaded (> 0) and current HP <= 0
-                                isDead = true;
-                            } else {
-                                // Newly spawned or pre-damage idle state: default to alive and full HP
-                                currentHp = maxHp;
-                            }
+                        if (hpRead && hp > 0.0f) {
+                            currentHp = static_cast<int>(hp);
+                        } else {
+                            // Freshly spawned or pre-damage idle state: default to alive and full HP!
+                            currentHp = maxHp;
                         }
                     }
                 }
             } else {
                 // Real player
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0))) {
-                    void *targetInfo = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(entityObj) + 0xC0);
-                    if (targetInfo != nullptr && isPointerReadable(targetInfo)) {
-                        if (!isTargetInfoAlive(targetInfo)) {
-                            isDead = true;
-                        }
-                    }
+                if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(entityObj)) {
+                    isDead = true;
                 }
+                currentHp = 100;
+                maxHp = 100;
             }
 
             if (isDead) {
@@ -267,25 +264,23 @@ public:
             // Team & Enemy discrimination using game engine logic
             bool isEnemy = isEntityEnemy(netPlayer, targetibleObj, isBot ? entityObj : nullptr);
 
-            // Perbaikan Filter Tim:
-            // Bandingkan tim lokal (localPlayer->team) dengan tim target (targetPed->team).
-            // Jika nilai tim target sama dengan tim lokal, lakukan continue / skip render agar rekan tim tidak digambar.
+            // Filter Enemy Only:
+            // Jika fitur Enemy Only aktif, rekan satu tim tidak digambar pada layar.
             if (enemyOnly) {
-                // 1. Pengecekan status Teammate/Ally dari TargetibleObject (CustomSettings Ally Toggle)
-                if (targetibleObj != nullptr && isTargetibleObjectTeammate(targetibleObj)) {
-                    continue; // Rekan tim lokal -> skip render!
+                // 1. Status konfirmasi musuh: jika bukan musuh, langsung skip!
+                if (!isEnemy) {
+                    continue;
                 }
 
-                // 2. Perbandingan langsung tim lokal vs tim target (TeamA = 0, TeamB = 1)
+                // 2. Pengecekan status Teammate/Ally dari TargetibleObject
+                if (targetibleObj != nullptr && isTargetibleObjectTeammate(targetibleObj)) {
+                    continue;
+                }
+
+                // 3. Perbandingan langsung tim lokal vs tim target (TeamA = 0, TeamB = 1)
                 int localTeam = g_localPlayerTeam.load();
                 int targetTeam = isBot ? getBotTeam(entityObj) : -1;
-
                 if (localTeam >= 0 && targetTeam >= 0 && localTeam == targetTeam) {
-                    continue; // Nilai tim target sama dengan tim lokal -> skip render!
-                }
-
-                // 3. Filter konfirmasi musuh
-                if (!isEnemy) {
                     continue;
                 }
             }
