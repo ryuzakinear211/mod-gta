@@ -555,7 +555,7 @@ void hook_FirstPersonController_Update(void *instance) {
             }
         }
         if (g_espManager != nullptr && g_espManager->isEspEnabled.load()) {
-            g_espManager->updateOnEngineThread(nullptr);
+            g_espManager->updateOnEngineThread(g_activeAimingControl.load());
         }
     }
     if (old_FirstPersonController_Update != nullptr) {
@@ -1057,8 +1057,8 @@ static bool isNetworkPlayerTeammate(void *netPlayer) {
 }
 
 static bool isTargetibleObjectTeammate(void *targetibleObj) {
-    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return true;
-    if (!isUnityObjectAlive(targetibleObj)) return true;
+    if (targetibleObj == nullptr || !isPointerReadable(targetibleObj)) return false;
+    if (!isUnityObjectAlive(targetibleObj)) return false;
 
     // Ignore self if targetibleObject belongs to local player
     void *localTObj = g_localPlayerTargetibleObject.load();
@@ -1090,27 +1090,12 @@ static bool isTargetibleObjectTeammate(void *targetibleObj) {
                     return true;
                 }
             }
-            // C. Call get_IsAutoAimAllowed (RVA 0x4DED124)
-            if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
-                return true;
-            }
-            // D. Direct check on _allyData at offset 0x30
+            // C. Direct check on _allyData at offset 0x30
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x30))) {
                 void *allyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x30);
                 if (allyData != nullptr && isPointerReadable(allyData) &&
                     isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(allyData) + 0x10))) {
                     if (*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(allyData) + 0x10)) {
-                        return true;
-                    }
-                }
-            }
-            // E. Direct check on _enemyData at offset 0x28 -> IsAutoAimAllowed (0x11)
-            if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x28))) {
-                void *enemyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x28);
-                if (enemyData != nullptr && isPointerReadable(enemyData) &&
-                    isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
-                    bool autoAimAllowed = *reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11);
-                    if (!autoAimAllowed) {
                         return true;
                     }
                 }
@@ -1122,7 +1107,7 @@ static bool isTargetibleObjectTeammate(void *targetibleObj) {
 }
 
 static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targetibleObj) {
-    // 1. If TargetibleObject is present, verify active state and enabled combat colliders
+    // 1. If TargetibleObject is present, verify active state
     if (targetibleObj != nullptr && isPointerReadable(targetibleObj) && isUnityObjectAlive(targetibleObj)) {
         if (Behaviour_get_isActiveAndEnabled != nullptr && !Behaviour_get_isActiveAndEnabled(targetibleObj)) {
             return true;
@@ -1137,27 +1122,11 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
             if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48))) {
                 bodyCol = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x48);
             }
-            bool headAlive = (headCol != nullptr && isUnityObjectAlive(headCol) && Collider_get_enabled(headCol));
-            bool bodyAlive = (bodyCol != nullptr && isUnityObjectAlive(bodyCol) && Collider_get_enabled(bodyCol));
-            if (!headAlive && !bodyAlive && (headCol != nullptr || bodyCol != nullptr)) {
-                return true;
-            }
-        }
-
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90))) {
-            void *customSettings = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(targetibleObj) + 0x90);
-            if (customSettings != nullptr && isPointerReadable(customSettings) && isUnityObjectAlive(customSettings)) {
-                if (get_IsAutoAimAllowed != nullptr && !get_IsAutoAimAllowed(customSettings)) {
+            bool headValid = (headCol != nullptr && isUnityObjectAlive(headCol));
+            bool bodyValid = (bodyCol != nullptr && isUnityObjectAlive(bodyCol));
+            if (headValid && bodyValid) {
+                if (!Collider_get_enabled(headCol) && !Collider_get_enabled(bodyCol)) {
                     return true;
-                }
-                if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(customSettings) + 0x28))) {
-                    void *enemyData = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(customSettings) + 0x28);
-                    if (enemyData != nullptr && isPointerReadable(enemyData) &&
-                        isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
-                        if (!(*reinterpret_cast<bool *>(reinterpret_cast<uintptr_t>(enemyData) + 0x11))) {
-                            return true;
-                        }
-                    }
                 }
             }
         }
@@ -1200,14 +1169,6 @@ static bool isEntityDeadOrCorpse(void *netPlayer, void *botPlayer, void *targeti
                     if (!isAlive) {
                         return true;
                     }
-                }
-            }
-        }
-        if (Collider_get_enabled != nullptr && isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(netPlayer) + 0x90))) {
-            void *col = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(netPlayer) + 0x90);
-            if (col != nullptr && isUnityObjectAlive(col)) {
-                if (!Collider_get_enabled(col)) {
-                    return true;
                 }
             }
         }
@@ -1581,6 +1542,32 @@ static TargetBoneInfo findBestTargetBone(const Vector3 &camPos, float currentYaw
 // Real-time ESP Entity Query, Team Filtering & Screen Projection
 // =========================================================================
 
+static void* getBestActiveCamera(void *passedAimingControl = nullptr) {
+    void *cameraObj = nullptr;
+    void *ac = passedAimingControl ? passedAimingControl : g_activeAimingControl.load();
+    if (ac != nullptr && isUnityObjectAlive(ac)) {
+        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(ac) + 0x20))) {
+            cameraObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(ac) + 0x20);
+            if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
+                return cameraObj;
+            }
+        }
+    }
+    if (Camera_get_main != nullptr) {
+        cameraObj = Camera_get_main();
+        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
+            return cameraObj;
+        }
+    }
+    if (Camera_get_current != nullptr) {
+        cameraObj = Camera_get_current();
+        if (cameraObj != nullptr && isUnityObjectAlive(cameraObj)) {
+            return cameraObj;
+        }
+    }
+    return nullptr;
+}
+
 ESPManager::ESPManager() {
     isEspEnabled.store(false);
     espLine.store(false);
@@ -1588,8 +1575,6 @@ ESPManager::ESPManager() {
     espHealth.store(true);
     espDistance.store(true);
     espTeamFilter.store(true);
-    espShowBots.store(true);
-    espShowPlayers.store(true);
 }
 
 ESPManager::~ESPManager() = default;
@@ -1624,6 +1609,12 @@ void ESPManager::updateOnEngineThread(void *passedAimingControl) {
         s_espSharedCount = count;
         s_espLastProduceMs.store(now);
     }
+
+    static uint64_t s_lastEspLogMs = 0;
+    if (now - s_lastEspLogMs > 5000) {
+        s_lastEspLogMs = now;
+        ModLog("[ESP] Producer Active -> Visible: %d targets | Screen: %dx%d", count, screenW, screenH);
+    }
 }
 
 int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int screenW, int screenH, void *passedAimingControl) {
@@ -1634,23 +1625,13 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
         return 0;
     }
 
-    void *cameraObj = nullptr;
-    void *aimingControl = passedAimingControl ? passedAimingControl : g_activeAimingControl.load();
-    if (aimingControl != nullptr && isUnityObjectAlive(aimingControl)) {
-        if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20))) {
-            cameraObj = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x20);
-        }
-    }
-    if (cameraObj == nullptr || !isUnityObjectAlive(cameraObj)) {
-        if (Camera_get_main != nullptr) {
-            cameraObj = Camera_get_main();
-        }
-    }
+    void *cameraObj = getBestActiveCamera(passedAimingControl);
     if (cameraObj == nullptr || !isUnityObjectAlive(cameraObj)) {
         return 0;
     }
 
-    Vector3 camPos(0.0f, 0.0f, 0.0f);
+    Vector3 camPos = getTransformPosition(cameraObj);
+    void *aimingControl = passedAimingControl ? passedAimingControl : g_activeAimingControl.load();
     if (aimingControl != nullptr && isUnityObjectAlive(aimingControl)) {
         if (isPointerReadable(reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(aimingControl) + 0x30))) {
             void *elevationNode = *reinterpret_cast<void **>(reinterpret_cast<uintptr_t>(aimingControl) + 0x30);
@@ -1658,9 +1639,6 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
                 camPos = getTransformPosition(elevationNode);
             }
         }
-    }
-    if (camPos.x == 0.0f && camPos.y == 0.0f && camPos.z == 0.0f) {
-        camPos = getTransformPosition(cameraObj);
     }
 
     std::vector<void*> candidateNetPlayers;
@@ -1691,16 +1669,11 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
 
     int count = 0;
     bool filterTeam = espTeamFilter.load();
-    bool showBots = espShowBots.load();
-    bool showPlayers = espShowPlayers.load();
 
     auto processEntity = [&](void *headTransform, void *bodyTransform, void *targetibleObj,
                              void *netPlayer, void *fallbackEntity, void *botPlayer,
                              bool isBotEntity, float knownHealth) {
         if (count >= maxCount) return;
-
-        if (isBotEntity && !showBots) return;
-        if (!isBotEntity && !showPlayers) return;
 
         void *localNet = g_localPlayerNetPlayer.load();
         if (netPlayer != nullptr && localNet != nullptr && netPlayer == localNet) {
@@ -1749,38 +1722,32 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
             return;
         }
 
-        Vector3 headVp(0.0f, 0.0f, 0.0f);
-        Vector3 rootVp(0.0f, 0.0f, 0.0f);
-        bool headOk = worldToViewport(cameraObj, headWorld, headVp);
-        bool rootOk = worldToViewport(cameraObj, rootWorld, rootVp);
+        Vector3 headScreen(0.0f, 0.0f, 0.0f);
+        Vector3 rootScreen(0.0f, 0.0f, 0.0f);
+        bool headOk = worldToScreenOrViewport(cameraObj, headWorld, headScreen, screenW, screenH);
+        bool rootOk = worldToScreenOrViewport(cameraObj, rootWorld, rootScreen, screenW, screenH);
 
         if (!headOk && !rootOk) {
             return;
         }
-        if (headVp.z <= 0.1f && rootVp.z <= 0.1f) {
-            return;
-        }
 
         if (!headOk) {
-            headVp = rootVp;
-            headVp.y += 0.12f;
+            headScreen = rootScreen;
+            float estH = std::max(20.0f, (static_cast<float>(screenH) * 0.12f) / (std::max(0.1f, rootScreen.z * 0.08f)));
+            headScreen.y -= estH;
         }
         if (!rootOk) {
-            rootVp = headVp;
-            rootVp.y -= 0.12f;
+            rootScreen = headScreen;
+            float estH = std::max(20.0f, (static_cast<float>(screenH) * 0.12f) / (std::max(0.1f, headScreen.z * 0.08f)));
+            rootScreen.y += estH;
         }
 
-        float headScreenX = headVp.x * static_cast<float>(screenW);
-        float headScreenY = (1.0f - headVp.y) * static_cast<float>(screenH);
-        float rootScreenX = rootVp.x * static_cast<float>(screenW);
-        float rootScreenY = (1.0f - rootVp.y) * static_cast<float>(screenH);
-
-        if (headScreenX < -400.0f || headScreenX > screenW + 400.0f ||
-            headScreenY < -400.0f || headScreenY > screenH + 400.0f) {
+        if (headScreen.x < -400.0f || headScreen.x > screenW + 400.0f ||
+            headScreen.y < -400.0f || headScreen.y > screenH + 400.0f) {
             return;
         }
 
-        float dist = headVp.z;
+        float dist = headScreen.z;
         if (dist <= 0.1f) {
             Vector3 diff = headWorld - camPos;
             dist = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
@@ -1800,10 +1767,10 @@ int ESPManager::getVisibleEntities(ESPEntityData *outArray, int maxCount, int sc
 
         ESPEntityData &data = outArray[count++];
         data.type = static_cast<float>(entityType);
-        data.screenHeadX = headScreenX;
-        data.screenHeadY = headScreenY;
-        data.screenRootX = rootScreenX;
-        data.screenRootY = rootScreenY;
+        data.screenHeadX = headScreen.x;
+        data.screenHeadY = headScreen.y;
+        data.screenRootX = rootScreen.x;
+        data.screenRootY = rootScreen.y;
         data.distance = dist;
         data.health = (knownHealth > 0.0f) ? knownHealth : 100.0f;
         data.isObstructed = static_cast<float>(isBlocked);
@@ -2627,10 +2594,8 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
         OBFUSCATE("CollapseAdd_Toggle_ESP Health Bar"),            // featNum 9
         OBFUSCATE("CollapseAdd_Toggle_ESP Distance & Info"),       // featNum 10
         OBFUSCATE("CollapseAdd_Toggle_ESP Filter Tim (Hanya Musuh)_True"), // featNum 11
-        OBFUSCATE("CollapseAdd_Toggle_ESP Target Bot_True"),       // featNum 12
-        OBFUSCATE("CollapseAdd_Toggle_ESP Target Player_True"),     // featNum 13
         OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
-        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian (100 = 100% magnetic sticky lock).<br><br>• <b>TAB ESP & Visual Overlay:</b> Render overlay real-time untuk Player & Bot dengan fitur Snapline, 2D Box, Health Bar, dan Distance. Dilengkapi Filter Tim (Hanya Musuh) yang secara cerdas membedakan musuh dan rekan tim.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
+        OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'><font color='#00FF7F'><b>[ GTA SA FPS MOD MENU ]</b></font><br><font color='#FFFFFF'>• <b>Status Panel Overlay:</b> HUD real-time counter Player & Bot.<br><br>• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>• <b>Fast FireRate (Client-Side):</b> Tembakan senjata berkecepatan tinggi hanya untuk client (player) via dynamic weapon memory & ACTk ObscuredFloat bypass.<br><br>• <b>No Recoil (Client-Side):</b> Menghilangkan hentakan/recoil senjata player 100% (Bidikan lurus tanpa getaran).<br><br>• <b>Aim Assist (Auto-Lock):</b> Hook AimingControl & Camera dari dump.cs. Otomatis mengabaikan rekan tim & langsung mengunci (lock) target saat arah bidikan dekat dengan bone player/bot.<br><br>• <b>Aim Smoothness Slider (0-100):</b> Menyesuaikan kehalusan kuncian (100 = 100% magnetic sticky lock).<br><br>• <b>TAB ESP & Visual Overlay:</b> Render overlay real-time untuk Player & Bot (otomatis target keduanya) dengan fitur Snapline, 2D Box, Health Bar, dan Distance. Dilengkapi Filter Tim (Hanya Musuh) yang secara cerdas membedakan musuh dan rekan tim.<br><br>• <b>Debug Logger:</b> Aktif otomatis ke <i>/storage/0/emulated/Document/mod_gta_debug.log</i></font></div>")
     };
 
     int Total_Feature = (sizeof features / sizeof features[0]);
@@ -2784,20 +2749,6 @@ void Changes(JNIEnv *env, jclass clazz, jobject ctx,
             break;
         }
 
-        case 12: { // Toggle_ESP Target Bot
-            if (g_espManager != nullptr) g_espManager->espShowBots.store(boolean);
-            ModLog("[TOGGLE] Feature #12 [ESP Target Bot] set to: %s", stateStr);
-            setLastAction(boolean ? "Toggle ESP Target Bot: ON" : "Toggle ESP Target Bot: OFF");
-            break;
-        }
-
-        case 13: { // Toggle_ESP Target Player
-            if (g_espManager != nullptr) g_espManager->espShowPlayers.store(boolean);
-            ModLog("[TOGGLE] Feature #13 [ESP Target Player] set to: %s", stateStr);
-            setLastAction(boolean ? "Toggle ESP Target Player: ON" : "Toggle ESP Target Player: OFF");
-            break;
-        }
-
         default:
             ModLog("[TOGGLE] Unknown Feature #%d changed to: val=%d, bool=%d", featNum, value, static_cast<int>(boolean));
             break;
@@ -2868,7 +2819,7 @@ Java_com_android_support_ESPView_getESPData(JNIEnv *env, jclass clazz, jfloatArr
     }
 
     uint64_t now = getCurrentTimeMs();
-    if (now - s_espLastProduceMs.load() > 500) {
+    if (now - s_espLastProduceMs.load() > 1500) {
         return 0;
     }
 

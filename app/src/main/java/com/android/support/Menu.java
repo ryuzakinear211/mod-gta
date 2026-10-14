@@ -19,6 +19,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
+import android.os.Looper;
 import android.text.Html;
 import android.text.InputFilter;
 import android.text.InputType;
@@ -551,14 +552,17 @@ public class Menu {
 
     public void setESPVisible(final boolean visible) {
         mIsEspActive = visible;
-        if (mEspView != null) {
-            mEspView.post(new Runnable() {
-                @Override
-                public void run() {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                if (mEspView != null) {
                     mEspView.setVisibility(visible ? View.VISIBLE : View.GONE);
+                    if (visible) {
+                        mEspView.invalidate();
+                    }
                 }
-            });
-        }
+            }
+        });
     }
 
     public void setStatusHudVisible(final boolean visible) {

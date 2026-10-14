@@ -47,8 +47,6 @@ public:
     std::atomic<bool> espHealth{true};         // Dynamic Vertical Health Bar
     std::atomic<bool> espDistance{true};       // Distance and Entity Tag
     std::atomic<bool> espTeamFilter{true};     // Filter Tim: Only Enemies when true, show all when false
-    std::atomic<bool> espShowBots{true};       // Show Bot targets
-    std::atomic<bool> espShowPlayers{true};    // Show Real Player targets
 
     ESPManager();
     ~ESPManager();
