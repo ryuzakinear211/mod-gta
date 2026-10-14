@@ -58,6 +58,36 @@ namespace NoRecoil {
         if (old_Aiming_Recoil3) old_Aiming_Recoil3(instance, recoil, smooth, returnSpeed, resistance);
     }
 
+    void OnLocalPlayerUpdate(void *fpc) {
+        if (!s_enabled.load(std::memory_order_relaxed) || !Memory::IsValidPtr(fpc)) return;
+
+        // 1. AnimController at offset 0xB8
+        void *animCtrl = Memory::ReadField<void*>(fpc, Offsets::FPC::AnimController);
+        if (!Memory::IsValidPtr(animCtrl)) return;
+
+        // 2. AnimEffectList at offset 0x30
+        void *animList = Memory::ReadField<void*>(animCtrl, 0x30);
+        if (!Memory::IsValidPtr(animList)) return;
+
+        // 3. AttackAnimEffect at offset 0x38
+        void *attackAnim = Memory::ReadField<void*>(animList, 0x38);
+        if (!Memory::IsValidPtr(attackAnim)) return;
+
+        // Zero current weapon/camera recoil vectors safely (0x1F0 to 0x22C)
+        void *recoilVecStart = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(attackAnim) + 0x1F0);
+        void *recoilVecEnd   = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(attackAnim) + 0x228);
+        if (Memory::IsValidPtr(recoilVecStart) && Memory::IsValidPtr(recoilVecEnd)) {
+            memset(recoilVecStart, 0, 0x22C - 0x1F0);
+        }
+
+        // Zero _sumShift (Vector2) at 0x244 & 0x248
+        void *sumShiftPtr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(attackAnim) + 0x244);
+        if (Memory::IsValidPtr(sumShiftPtr)) {
+            *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(attackAnim) + 0x244) = 0.0f;
+            *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(attackAnim) + 0x248) = 0.0f;
+        }
+    }
+
     void Init() {
         Memory::HookRVA(Offsets::FPC::RecoilShift,            reinterpret_cast<void*>(hook_FPC_Recoil),     reinterpret_cast<void**>(&old_FPC_Recoil));
         Memory::HookRVA(Offsets::AimingControl::RecoilShift1, reinterpret_cast<void*>(hook_Aiming_Recoil1), reinterpret_cast<void**>(&old_Aiming_Recoil1));

@@ -6,6 +6,7 @@ namespace NoRecoil {
     void Init();
     void SetEnabled(bool enable);
     bool IsEnabled();
+    void OnLocalPlayerUpdate(void *fpc);
 
 } // namespace NoRecoil
 

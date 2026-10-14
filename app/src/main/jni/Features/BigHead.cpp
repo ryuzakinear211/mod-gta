@@ -30,8 +30,6 @@ namespace BigHead {
         void *nativePtr = Memory::ReadField<void*>(transformObj, Offsets::Unity::Transform_m_CachedPtr);
         if (Memory::IsValidPtr(nativePtr)) {
             set_localScale_Injected(nativePtr, &scale);
-        } else {
-            set_localScale_Injected(transformObj, &scale);
         }
     }
 

@@ -45,6 +45,18 @@ namespace Offsets {
 
         // Transform cached C++ pointer offset in managed Component/Transform
         constexpr uintptr_t Transform_m_CachedPtr = 0x10;
+
+        // Application.set_targetFrameRate(int)
+        // dump.cs RVA: 0x85137C0
+        constexpr uintptr_t SetTargetFrameRate = 0x85137C0;
+
+        // Application.get_targetFrameRate() -> int
+        // dump.cs RVA: 0x851378C
+        constexpr uintptr_t GetTargetFrameRate = 0x851378C;
+
+        // QualitySettings.set_vSyncCount(int)
+        // dump.cs RVA: 0x8536E1C
+        constexpr uintptr_t SetVSyncCount = 0x8536E1C;
     }
 
     // ----------------------------------------------------------------------------------

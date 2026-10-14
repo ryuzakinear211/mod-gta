@@ -360,15 +360,15 @@ public class Menu {
 
             @Override
             public void run() {
-                //If the save preferences is enabled, it will check if game lib is loaded before starting menu
-                //Comment the if-else code out except startService if you want to run the app and test preferences
-                if (Preferences.loadPref && !IsGameLibLoaded() && !stopChecking) {
+                // Wait for the game library (libil2cpp.so) to be fully loaded before building feature list,
+                // ensuring all toggles attach cleanly and work in real-time from the start.
+                if (!IsGameLibLoaded() && !stopChecking) {
                     if (!viewLoaded) {
-                        Category(mods, "Save preferences was been enabled. Waiting for game lib to be loaded...\n\nForce load menu may not apply mods instantly. You would need to reactivate them again");
+                        Category(mods, "Memuat game library (libil2cpp.so)...\nMohon tunggu sebentar.");
                         Button(mods, -100, "Force load menu");
                         viewLoaded = true;
                     }
-                    handler.postDelayed(this, 600);
+                    handler.postDelayed(this, 300);
                 } else {
                     mods.removeAllViews();
                     featureList(GetFeatureList(), mods);

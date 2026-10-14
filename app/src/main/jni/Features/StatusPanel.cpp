@@ -35,9 +35,7 @@ namespace StatusPanel {
         // BigHead check (runs directly on render thread)
         BigHead::OnNetworkPlayerUpdate(instance);
 
-        if (!s_enabled.load(std::memory_order_relaxed)) return;
-
-        // Throttle map insertion/locking: check once every 500ms instead of every frame (60 FPS)
+        // Keep entity tracking active continuously in background so re-enabling HUD displays stats instantly
         uint64_t now = GetCurrentTimeMs();
         std::lock_guard<std::mutex> lock(s_entityMutex);
         auto it = s_networkPlayers.find(instance);
@@ -53,7 +51,7 @@ namespace StatusPanel {
     }
 
     void OnBotPlayerStart(void *instance) {
-        if (!instance || !s_enabled.load(std::memory_order_relaxed)) return;
+        if (!instance) return;
         uint64_t now = GetCurrentTimeMs();
         std::lock_guard<std::mutex> lock(s_entityMutex);
         s_botPlayers[instance] = now;
@@ -69,8 +67,6 @@ namespace StatusPanel {
 
         // BigHead check
         BigHead::OnBotPlayerUpdate(instance);
-
-        if (!s_enabled.load(std::memory_order_relaxed)) return;
 
         uint64_t now = GetCurrentTimeMs();
         std::lock_guard<std::mutex> lock(s_entityMutex);

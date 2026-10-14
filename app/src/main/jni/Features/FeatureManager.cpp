@@ -3,6 +3,7 @@
 #include "NoRecoil.h"
 #include "BigHead.h"
 #include "StatusPanel.h"
+#include "FPSUnlock.h"
 #include "../GameOffsets.h"
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
@@ -13,9 +14,17 @@ namespace FeatureManager {
 
     // Central FirstPersonController.Update Hook: RVA 0x40A1BF4
     static void (*old_FPC_Update)(void *instance) = nullptr;
+    static uint32_t s_fpsFrameCounter = 0;
+
     static void hook_FPC_Update(void *instance) {
         if (instance) {
             FastFireRate::OnLocalPlayerUpdate(instance);
+            NoRecoil::OnLocalPlayerUpdate(instance);
+
+            // Re-enforce 60 FPS across level loads and menu transitions
+            if (++s_fpsFrameCounter % 120 == 0) {
+                FPSUnlock::ApplyFrameRate();
+            }
         }
         if (old_FPC_Update) old_FPC_Update(instance);
     }
@@ -29,6 +38,7 @@ namespace FeatureManager {
         NoRecoil::Init();
         BigHead::Init();
         StatusPanel::Init();
+        FPSUnlock::Init();
 
         // Install local player lifecycle hook
         Memory::HookRVA(Offsets::FPC::Update, reinterpret_cast<void*>(hook_FPC_Update), reinterpret_cast<void**>(&old_FPC_Update));
@@ -43,6 +53,7 @@ namespace FeatureManager {
             OBFUSCATE("Toggle_Big Head"),                     // featNum 1
             OBFUSCATE("Toggle_Fast FireRate (Client-Side)"), // featNum 2
             OBFUSCATE("Toggle_No Recoil (Client-Side)"),     // featNum 3
+            OBFUSCATE("Toggle_Unlock 60 FPS (Ultra Smooth)"),// featNum 4
             OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
             OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
@@ -51,6 +62,7 @@ namespace FeatureManager {
                       "• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>"
                       "• <b>Fast FireRate:</b> Tembakan kecepatan tinggi (Client-Side).<br><br>"
                       "• <b>No Recoil:</b> 0% hentakan senjata (Bidikan lurus stabil).<br><br>"
+                      "• <b>Unlock 60 FPS:</b> Buka limit 30 FPS untuk gameplay 60 FPS halus.<br><br>"
                       "• <b>Engine:</b> Modular Architecture berbasis dump.cs."
                       "</font></div>")
         };
@@ -104,6 +116,15 @@ namespace FeatureManager {
                 ModLogger::SetLastAction(boolean ? "NoRecoil: ON" : "NoRecoil: OFF");
                 Toast(env, ctx, boolean ? OBFUSCATE("No Recoil: ON (Client-Side)")
                                         : OBFUSCATE("No Recoil: OFF (Normal)"),
+                      ToastLength::LENGTH_SHORT);
+                break;
+            }
+
+            case 4: { // Unlock 60 FPS
+                FPSUnlock::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "FPSUnlock: ON (60 FPS)" : "FPSUnlock: OFF (30 FPS)");
+                Toast(env, ctx, boolean ? OBFUSCATE("Unlock 60 FPS: ON (Ultra Halus)")
+                                        : OBFUSCATE("Unlock 60 FPS: OFF (30 FPS Default)"),
                       ToastLength::LENGTH_SHORT);
                 break;
             }

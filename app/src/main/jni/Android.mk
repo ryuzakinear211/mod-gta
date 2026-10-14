@@ -26,6 +26,7 @@ LOCAL_SRC_FILES := Main.cpp \
 	Features/NoRecoil.cpp \
 	Features/BigHead.cpp \
 	Features/StatusPanel.cpp \
+	Features/FPSUnlock.cpp \
 	Substrate/hde64.c \
 	Substrate/SubstrateDebug.cpp \
 	Substrate/SubstrateHook.cpp \

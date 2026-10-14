@@ -31,6 +31,8 @@ static void* hack_thread(void *) {
     // Initialize all modular game features
     FeatureManager::InitAll();
 
+    libLoaded = true;
+    LOG_INFO("[THREAD] %s initialization complete. libLoaded marked TRUE.", Offsets::TargetLib::Name);
     ModLogger::SetLastAction("Features loaded and active");
     return nullptr;
 }

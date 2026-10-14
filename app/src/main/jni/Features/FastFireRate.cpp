@@ -77,10 +77,10 @@ namespace FastFireRate {
 
         // Apply weapon memory edits if feature is active
         if (s_enabled.load(std::memory_order_relaxed) && Memory::IsValidPtr(s_localPlayerShooter)) {
-            // 1. Force Full-Auto mode (_shootAction = 0)
+            // 1. Force Full-Auto mode (_shootAction = 0) for non-bolt-action weapons
             int *shootActionPtr = reinterpret_cast<int*>(
                 reinterpret_cast<uintptr_t>(s_localPlayerShooter) + Offsets::WeaponShooter::ShootAction);
-            if (Memory::IsValidPtr(shootActionPtr)) {
+            if (Memory::IsValidPtr(shootActionPtr) && *shootActionPtr != 1) {
                 if (!s_hasOrigShootAction) {
                     s_origShootAction = *shootActionPtr;
                     s_hasOrigShootAction = true;
@@ -88,7 +88,25 @@ namespace FastFireRate {
                 *shootActionPtr = 0; // AUTO
             }
 
-            // 2. Keep clip ammo filled
+            // 2. Zero internal weapon cooldown ObscuredFloat fields at 0x18C & 0x1B0
+            static ObscuredFloat s_cachedZeroVal = {0};
+            static bool s_hasCachedZero = false;
+            if (!s_hasCachedZero && actk_op_Implicit_Float != nullptr) {
+                s_cachedZeroVal = actk_op_Implicit_Float(0.0f);
+                s_hasCachedZero = true;
+            }
+            if (s_hasCachedZero) {
+                void *cd1 = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(s_localPlayerShooter) + Offsets::WeaponShooter::Cooldown1);
+                if (Memory::IsValidPtr(cd1)) {
+                    memcpy(cd1, &s_cachedZeroVal, sizeof(ObscuredFloat));
+                }
+                void *cd2 = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(s_localPlayerShooter) + Offsets::WeaponShooter::Cooldown2);
+                if (Memory::IsValidPtr(cd2)) {
+                    memcpy(cd2, &s_cachedZeroVal, sizeof(ObscuredFloat));
+                }
+            }
+
+            // 3. Keep clip ammo filled
             if (set_ClipAmmo != nullptr) {
                 set_ClipAmmo(s_localPlayerShooter, 999);
             }
@@ -151,8 +169,9 @@ namespace FastFireRate {
         if (s_enabled.load(std::memory_order_relaxed) && Memory::IsValidPtr(instance)) {
             void *fpc = Memory::ReadField<void*>(instance, 0x20);
             if (fpc == s_localPlayerFPC && fpc != nullptr) {
-                Memory::WriteField<bool>(instance, 0x28, true);
-                Memory::WriteField<float>(instance, 0x2C, 100.0f);
+                // Do NOT force IsImmediate (+0x28) to true! That breaks hip fire.
+                // Speed up firing coroutine via speed multiplier at +0x2C
+                Memory::WriteField<float>(instance, 0x2C, 10.0f);
             }
         }
         return old_ShootCoroutine_MoveNext ? old_ShootCoroutine_MoveNext(instance) : false;
