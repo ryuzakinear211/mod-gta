@@ -2,6 +2,7 @@
 #define FEATURE_STATUS_PANEL_H
 
 #include <string>
+#include <vector>
 
 namespace StatusPanel {
 

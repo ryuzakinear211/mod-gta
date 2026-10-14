@@ -3,6 +3,7 @@
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
 #include "BigHead.h"
+#include <vector>
 #include <mutex>
 #include <unordered_map>
 #include <set>
