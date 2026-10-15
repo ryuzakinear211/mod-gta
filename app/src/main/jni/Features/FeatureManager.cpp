@@ -7,6 +7,7 @@
 #include "ESP.h"
 #include "Chams.h"
 #include "RewardBooster.h"
+#include "NotificationReward.h"
 #include "../GameOffsets.h"
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
@@ -46,6 +47,7 @@ namespace FeatureManager {
         ESP::Init();
         Chams::Init();
         RewardBooster::Init();
+        NotificationReward::Init();
 
         // Install local player lifecycle hook
         Memory::HookRVA(Offsets::FPC::Update, reinterpret_cast<void*>(hook_FPC_Update), reinterpret_cast<void**>(&old_FPC_Update));
@@ -76,11 +78,13 @@ namespace FeatureManager {
             OBFUSCATE("SeekBar_Tebal Garis_1_10"),             // featNum 15
             OBFUSCATE("Category_💰 FITUR REWARD & CURRENCY"),
             OBFUSCATE("Toggle_Reward Booster 5000 (Money/Gold)"), // featNum 16
+            OBFUSCATE("Button_🎁 Ambil Ulang Reward Notifikasi"), // featNum 17
             OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
             OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
                       "<font color='#FFFFFF'>"
                       "• <b>Reward Booster:</b> Tingkatkan setiap claim reward uang/gold ke 5000 (Client-Side).<br><br>"
+                      "• <b>Reward Notifikasi:</b> Panggil ulang klaim reward izin notifikasi secara berulang.<br><br>"
                       "• <b>ESP Master:</b> Deteksi posisi player/bot secara visual 2D box & line.<br><br>"
                       "• <b>Chams:</b> Tembus pandang / render karakter tembus dinding (OpenGL-ES) Anti-Map.<br><br>"
                       "• <b>Chams Enemy Only:</b> Filter tim aktif: hanya karakter musuh yang tembus pandang.<br><br>"
@@ -234,6 +238,12 @@ namespace FeatureManager {
                 if (boolean && ctx != nullptr) {
                     Toast(env, ctx, OBFUSCATE("Reward Booster 5000: ON (Money/Gold)"), ToastLength::LENGTH_SHORT);
                 }
+                break;
+            }
+
+            case 17: { // Ambil Ulang Reward Notifikasi (One-Time Push Notification Reward Re-Claim)
+                NotificationReward::TriggerReward(env, ctx);
+                ModLogger::SetLastAction("NotifReward: Triggered");
                 break;
             }
 

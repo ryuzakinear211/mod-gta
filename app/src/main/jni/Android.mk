@@ -30,6 +30,7 @@ LOCAL_SRC_FILES := Main.cpp \
 	Features/ESP.cpp \
 	Features/Chams.cpp \
 	Features/RewardBooster.cpp \
+	Features/NotificationReward.cpp \
 	Substrate/hde64.c \
 	Substrate/SubstrateDebug.cpp \
 	Substrate/SubstrateHook.cpp \

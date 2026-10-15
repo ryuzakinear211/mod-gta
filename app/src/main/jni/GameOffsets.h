@@ -341,6 +341,47 @@ namespace Offsets {
         constexpr uintptr_t RewardView_Setup       = 0x49F9E48; // BaseRewardElementView.Setup(...)
     }
 
+    // ----------------------------------------------------------------------------------
+    // Push Notification Permission & One-Time Reward Re-Claim
+    // ----------------------------------------------------------------------------------
+    namespace Notification {
+        // SettingKey enum from dump.cs (TypeDefIndex: 7618)
+        namespace SettingKey {
+            constexpr int PushNotificationReward     = 23;
+            constexpr int PushNotificationTimechest  = 24;
+            constexpr int PushNotificationSocial     = 25;
+        }
+
+        // Settings Provider (dump.cs class: abaaabbaaabababaabbbaaabababaaabaababbabbbaaaab)
+        constexpr uintptr_t Settings_GetSetting      = 0x41C8788; // aaaaabaaabbbbababbaabbabaaabbaabbaaabaabbaaaabb(SettingKey) -> Setting<T>
+        constexpr uintptr_t Settings_GetInstance     = 0x41C8830; // bbbaabaaaabababbbaabbaabbaaabbbaababbbbaaabbbaa() -> SettingsProvider
+
+        // Generic Reactive Setting (dump.cs class: aaaaaaabbbbabaaaabbabbbaabbbbaaaaabaabbabbaaaba<bool>)
+        constexpr uintptr_t SettingBool_GetValue     = 0x6EF91D0; // aaaaaaabbbbabaaaabbabbbaabbbbaaaaabaabbabbaaaba<bool>.get_Value() -> bool
+        constexpr uintptr_t SettingBool_SetValue     = 0x6EF9410; // aaaaaaabbbbabaaaabbabbbaabbbbaaaaabaabbabbaaaba<bool>.bbbbbabbbabbaababaaababaabbbaababbababbababbaba(bool)
+        constexpr uintptr_t SettingBool_Save         = 0x6EF9214; // aaaaaaabbbbabaaaabbabbbaabbbbaaaaabaabbabbaaaba<bool>.babbaaaaaaaabbaaababbaababbbbaaaabaaaababababbb()
+
+        // Permission Controller (dump.cs class: baaabaaabaabbabbbabbaabaaabaabbbbaaaabbaabbabbb)
+        constexpr uintptr_t PermissionController_ctor       = 0x3F8A84C; // .ctor(PermissionRequestScreen)
+        constexpr uintptr_t PermissionController_Check      = 0x3F89344; // abbbaabaababaabbaabbaabaabbaaabaaabaabaaaaaaaaa() -> bool
+        constexpr uintptr_t PermissionController_Show       = 0x3F8B5E0; // aabbabbbababbaaababaabaabbbbbabbabaaaaabbaaaabb() -> void
+        constexpr uintptr_t PermissionController_OnGranted1 = 0x3F89DC8; // bbabbbaabaabbababbabaabaabbbaabbaaabaaaaabbabba(bool)
+        constexpr uintptr_t PermissionController_OnGranted2 = 0x3F8A914; // bbaabbaaaaabaaabbbaaababbbabbbbaaabababaaaaabbb(bool)
+        constexpr uintptr_t PermissionController_OnResult   = 0x3F8A73C; // baaabbaaaabaabbaaaababbabbbbabababababaaaaaabab(bool)
+
+        // Permission Request Screen (dump.cs class: PermissionRequestScreen)
+        constexpr uintptr_t PermissionScreen_ctor           = 0x445E34C; // .ctor()
+        constexpr uintptr_t PermissionScreen_OnClickYes     = 0x445E3E0; // OnClickYes()
+        constexpr uintptr_t PermissionScreen_OnClickNo      = 0x445E404; // OnClickNo()
+        constexpr uintptr_t PermissionScreen_SetState       = 0x445E290; // babbbbabbabbabbabbaaabaabaabaabbabbaaaaabbbabbb(bool, bool)
+
+        // UnityEngine.PlayerPrefs RVAs from dump.cs (TypeDefIndex: 15451)
+        constexpr uintptr_t PlayerPrefs_SetInt              = 0x858FE70; // SetInt(string, int)
+        constexpr uintptr_t PlayerPrefs_GetInt              = 0x858FED0; // GetInt(string, int)
+        constexpr uintptr_t PlayerPrefs_DeleteKey           = 0x8590870; // DeleteKey(string)
+        constexpr uintptr_t PlayerPrefs_Save                = 0x8590A58; // Save()
+    }
+
 } // namespace Offsets
 
 #endif // GAME_OFFSETS_H
