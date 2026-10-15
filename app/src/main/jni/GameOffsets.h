@@ -73,6 +73,18 @@ namespace Offsets {
         // Behaviour.get_isActiveAndEnabled() -> bool
         // dump.cs RVA: 0x85974E0
         constexpr uintptr_t BehaviourGetIsActive = 0x85974E0;
+
+        // GameObject.SetActive(bool)
+        // dump.cs RVA: 0x859D140
+        constexpr uintptr_t GameObject_SetActive = 0x859D140;
+
+        // Component.get_gameObject() -> GameObject
+        // dump.cs RVA: 0x8597D00
+        constexpr uintptr_t Component_GetGameObject = 0x8597D00;
+
+        // Selectable.set_interactable(bool)
+        // dump.cs RVA: 0x88B7998
+        constexpr uintptr_t Selectable_SetInteractable = 0x88B7998;
     }
 
     // ----------------------------------------------------------------------------------
@@ -380,6 +392,67 @@ namespace Offsets {
         constexpr uintptr_t PlayerPrefs_GetInt              = 0x858FED0; // GetInt(string, int)
         constexpr uintptr_t PlayerPrefs_DeleteKey           = 0x8590870; // DeleteKey(string)
         constexpr uintptr_t PlayerPrefs_Save                = 0x8590A58; // Save()
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Quest & Reward Claim State (Freeze Claim / Infinite Repeat Claim)
+    // ----------------------------------------------------------------------------------
+    namespace Quest {
+        // QuestState enum from dump.cs (TypeDefIndex: 7402, abbabbbbababbababbaaaabaaaaabbabbbababbaaaaabab)
+        namespace QuestState {
+            constexpr int Active    = 0;
+            constexpr int Complete  = 1; // Completed, reward available to claim
+            constexpr int Finished  = 2; // Claimed / Finished
+            constexpr int Expired   = 3;
+            constexpr int Removed   = 4;
+            constexpr int Available = 5;
+        }
+
+        // Generic RewardState enum from dump.cs (TypeDefIndex: 3657, aaabababaaaababbbaaabbbbaaaaaabbababaababaaabba)
+        namespace RewardState {
+            constexpr int Locked    = 0;
+            constexpr int Available = 1; // Ready to claim
+            constexpr int Claimed   = 2; // Already claimed
+        }
+
+        // QuestData (dump.cs class: aabbbaababaababbababbabbaaabaabaaabaabbabbbbbab, TypeDefIndex: 3865)
+        constexpr uintptr_t QuestData_StateField             = 0x14;      // QuestState backing field
+        constexpr uintptr_t QuestData_GetState               = 0x50169A0; // baaaaaababaabbbaaaabbaaababbbabbbbabbbbbabbbabb() -> QuestState
+        constexpr uintptr_t QuestData_SetState1              = 0x50169C4; // aabababbbbabbaababbbbaaabbbbbaaabaababaabbbbaaa(QuestState)
+        constexpr uintptr_t QuestData_SetState2              = 0x501697C; // abaabaaabbaaaabaaabaabbabaaaababbbabaaabababbbb(QuestState)
+
+        // Quest Presenter / Wrapper (dump.cs class: bbaaaaaaaabbababaaaababbaababbabaabbbbbbbabbbab, TypeDefIndex: 2229)
+        constexpr uintptr_t QuestPresenter_GetState          = 0x4CE8A4C; // baaaaaababaabbbaaaabbaaababbbabbbbabbbbbabbbabb() -> QuestState
+
+        // QuestItemView (dump.cs class: UI.Quests.View.QuestItemView, TypeDefIndex: 8883)
+        constexpr uintptr_t QuestItemView_RewardAvailable    = 0x50;      // List<GameObject> _rewardAvailableState
+        constexpr uintptr_t QuestItemView_FinishedState      = 0x58;      // List<GameObject> _finishedState
+        constexpr uintptr_t QuestItemView_ClaimButton        = 0x98;      // Button _claimRewardButton
+        constexpr uintptr_t QuestItemView_QuestField         = 0xB0;      // abbbabbabaaabbaaabaababaaabbabaabbaabbbbabaaaab
+        constexpr uintptr_t QuestItemView_StateField         = 0xC8;      // QuestState
+        constexpr uintptr_t QuestItemView_UpdateState        = 0x4556AA8; // UpdateState() -> void
+
+        // DailyRepeatingQuestView (dump.cs class: UI.Quests.View.DailyRepeatingQuestView, TypeDefIndex: 8061)
+        constexpr uintptr_t DailyRepeatingQuestView_NotFinished     = 0x40; // List<GameObject> _notFinishedState
+        constexpr uintptr_t DailyRepeatingQuestView_RewardAvailable = 0x48; // List<GameObject> _rewardAvailableState
+        constexpr uintptr_t DailyRepeatingQuestView_FinishedState   = 0x50; // List<GameObject> _finishedState
+        constexpr uintptr_t DailyRepeatingQuestView_ClaimButton     = 0xA0; // Button _claimRewardButton
+        constexpr uintptr_t DailyRepeatingQuestView_QuestField      = 0xC8; // Quest
+        constexpr uintptr_t DailyRepeatingQuestView_StateField      = 0xD0; // QuestState
+        constexpr uintptr_t DailyRepeatingQuestView_UpdateState     = 0x43C3114; // UpdateState() -> void
+
+        // DailyQuestGroupRewardsView (dump.cs class: UI.Quests.View.DailyQuestGroupRewardsView, TypeDefIndex: 4109)
+        constexpr uintptr_t DailyQuestGroupRewards_GetState  = 0x5074A08; // aabaaaabaabbaabbababbbababbbabaaabbababbbbbbabb() -> RewardState
+
+        // GroupRewardItemView (dump.cs class: UI.Quests.View.GroupRewardItemView, TypeDefIndex: 10370)
+        constexpr uintptr_t GroupRewardItemView_ClaimButton  = 0x60;      // Button _claimRewardButton
+        constexpr uintptr_t GroupRewardItemView_CanClaim     = 0x4809AC4; // babaababbbbbaaaababbbaaaaaabbabababbbaabbbaaaba() -> bool
+
+        // DailyRewardContainer (dump.cs class: UI.Reward.View.DailyRewardContainer, TypeDefIndex: 9170)
+        constexpr uintptr_t DailyReward_ItemToggle           = 0x28;      // Toggle _itemToggle
+        constexpr uintptr_t DailyReward_ClaimedBg            = 0x48;      // GameObject _claimedBgGo
+        constexpr uintptr_t DailyReward_ClaimedFrame         = 0x50;      // GameObject _claimedFrameGo
+        constexpr uintptr_t DailyRewardContainer_Setup       = 0x45CB45C; // Setup(...) -> void
     }
 
 } // namespace Offsets

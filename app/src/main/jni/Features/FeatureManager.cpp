@@ -78,13 +78,15 @@ namespace FeatureManager {
             OBFUSCATE("SeekBar_Warna Biru_0_255"),             // featNum 14
             OBFUSCATE("SeekBar_Tebal Garis_1_10"),             // featNum 15
             OBFUSCATE("Category_💰 FITUR REWARD & CURRENCY"),
-            OBFUSCATE("Toggle_Reward Booster 5000 (Money/Gold)"), // featNum 16
-            OBFUSCATE("Button_🎁 Ambil Ulang Reward Notifikasi"), // featNum 17
+            OBFUSCATE("Toggle_Reward Booster 5000 (Money/Gold)"),       // featNum 16
+            OBFUSCATE("Toggle_Freeze Claim Reward (Klaim Berulang)"),   // featNum 17
+            OBFUSCATE("Button_🎁 Ambil Ulang Reward Notifikasi"),       // featNum 18
             OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
             OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
                       "<font color='#FFFFFF'>"
                       "• <b>Reward Booster:</b> Tingkatkan setiap claim reward uang/gold ke 5000 (Client-Side).<br><br>"
+                      "• <b>Freeze Claim:</b> Freeze status claim reward (Quest, Daily, Calendar) agar bisa diklaim berulang kali untuk boost uang.<br><br>"
                       "• <b>Reward Notifikasi:</b> Panggil ulang klaim reward izin notifikasi secara berulang.<br><br>"
                       "• <b>ESP Master:</b> Deteksi posisi player/bot secara visual 2D box & line.<br><br>"
                       "• <b>Chams:</b> Tembus pandang / render karakter tembus dinding (OpenGL-ES) Anti-Map.<br><br>"
@@ -242,7 +244,16 @@ namespace FeatureManager {
                 break;
             }
 
-            case 17: { // Ambil Ulang Reward Notifikasi (One-Time Push Notification Reward Re-Claim)
+            case 17: { // Freeze Claim Reward (Klaim Berulang)
+                RewardBooster::SetFreezeClaim(boolean);
+                ModLogger::SetLastAction(boolean ? "FreezeClaim: ON" : "FreezeClaim: OFF");
+                if (ctx != nullptr) {
+                    Toast(env, ctx, boolean ? OBFUSCATE("Freeze Claim: ON (Klaim Berulang Aktif)") : OBFUSCATE("Freeze Claim: OFF"), ToastLength::LENGTH_SHORT);
+                }
+                break;
+            }
+
+            case 18: { // Ambil Ulang Reward Notifikasi (One-Time Push Notification Reward Re-Claim)
                 NotificationReward::TriggerReward(env, ctx);
                 ModLogger::SetLastAction("NotifReward: Triggered");
                 break;
