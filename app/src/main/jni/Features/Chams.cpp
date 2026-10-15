@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstring>
 #include <algorithm>
+#include <vector>
+#include <mutex>
 
 #if defined(__aarch64__)
 #include "../And64InlineHook/And64InlineHook.hpp"
@@ -16,8 +18,12 @@
 namespace Chams {
 
     static std::atomic<bool> s_enabled{false};
+    static std::atomic<bool> s_enemyOnly{true}; // Ignore teammates by default
     static std::atomic<int>  s_mode{static_cast<int>(Mode::Shading)}; // Default: Shading / Wallhack
     static std::atomic<int>  s_shaderFilter{static_cast<int>(ShaderFilter::BodyBonesAuto)}; // Default: Body Bones (Anti-Map)
+
+    static std::mutex           s_teammatesMutex;
+    static std::vector<Vector3> s_teammatePositions;
 
     static std::atomic<float> s_r{255.0f}; // Default vibrant crimson red
     static std::atomic<float> s_g{42.0f};
@@ -154,6 +160,54 @@ namespace Chams {
         return shouldRender;
     }
 
+    // Check if the currently drawn mesh belongs to a teammate or local player
+    static inline bool IsCurrentMeshTeammate(GLint currProgram) {
+        if (!s_enemyOnly.load(std::memory_order_relaxed)) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(s_teammatesMutex);
+        if (s_teammatePositions.empty()) {
+            return false;
+        }
+
+        GLint loc = glGetUniformLocation(currProgram, "hlslcc_mtx4x4unity_ObjectToWorld[0]");
+        if (loc == -1) {
+            loc = glGetUniformLocation(currProgram, "unity_ObjectToWorld");
+        }
+        if (loc == -1) {
+            return false;
+        }
+
+        GLfloat m[16];
+        glGetUniformfv(currProgram, loc, m);
+
+        // Candidate 1: Column-major translation (m[12], m[13], m[14])
+        float cx1 = m[12], cy1 = m[13], cz1 = m[14];
+        // Candidate 2: Row-major translation (m[3], m[7], m[11])
+        float cx2 = m[3], cy2 = m[7], cz2 = m[11];
+
+        constexpr float MAX_DIST_SQ = 2.8f * 2.8f; // ~2.8m radius to account for character bone offsets
+
+        for (const auto &tp : s_teammatePositions) {
+            float dx1 = cx1 - tp.x;
+            float dy1 = cy1 - tp.y;
+            float dz1 = cz1 - tp.z;
+            if ((dx1 * dx1 + dy1 * dy1 + dz1 * dz1) <= MAX_DIST_SQ) {
+                return true;
+            }
+
+            float dx2 = cx2 - tp.x;
+            float dy2 = cy2 - tp.y;
+            float dz2 = cz2 - tp.z;
+            if ((dx2 * dx2 + dy2 * dy2 + dz2 * dz2) <= MAX_DIST_SQ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
         // Draw standard geometry first
         if (old_glDrawElements) {
@@ -180,6 +234,11 @@ namespace Chams {
 
         int filter = s_shaderFilter.load(std::memory_order_relaxed);
         if (!ShouldRenderMesh(currProgram, filter)) {
+            return;
+        }
+
+        // Filter out teammates and local player so only enemies are rendered in Chams
+        if (IsCurrentMeshTeammate(currProgram)) {
             return;
         }
 
@@ -353,6 +412,23 @@ namespace Chams {
 
     bool IsEnabled() {
         return s_enabled.load(std::memory_order_relaxed);
+    }
+
+    void SetEnemyOnly(bool enemyOnly) {
+        s_enemyOnly.store(enemyOnly, std::memory_order_relaxed);
+        LOG_INFO("[CHAMS] Enemy only filter: %s", enemyOnly ? "ON (Enemies Only)" : "OFF (All)");
+    }
+
+    bool IsEnemyOnly() {
+        return s_enemyOnly.load(std::memory_order_relaxed);
+    }
+
+    void UpdateTeammatePositions(const Vector3 *positions, size_t count) {
+        std::lock_guard<std::mutex> lock(s_teammatesMutex);
+        s_teammatePositions.clear();
+        if (positions && count > 0) {
+            s_teammatePositions.insert(s_teammatePositions.end(), positions, positions + count);
+        }
     }
 
     void SetMode(int mode) {

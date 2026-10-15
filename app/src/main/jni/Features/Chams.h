@@ -25,10 +25,20 @@ namespace Chams {
         AllMeshes     = 7  // Semua Mesh (Map & Player)
     };
 
+    struct Vector3 {
+        float x, y, z;
+        Vector3(float _x = 0.0f, float _y = 0.0f, float _z = 0.0f) : x(_x), y(_y), z(_z) {}
+    };
+
     void Init();
 
     void SetEnabled(bool enable);
     bool IsEnabled();
+
+    void SetEnemyOnly(bool enemyOnly);
+    bool IsEnemyOnly();
+
+    void UpdateTeammatePositions(const Vector3 *positions, size_t count);
 
     void SetMode(int mode);
     int GetMode();

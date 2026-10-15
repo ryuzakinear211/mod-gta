@@ -1,6 +1,7 @@
 #include "ESP.h"
 #include "StatusPanel.h"
 #include "BigHead.h"
+#include "Chams.h"
 #include "../GameOffsets.h"
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
@@ -671,6 +672,8 @@ namespace ESP {
         }
     }
 
+    static void SyncTeammatesToChams();
+
     void OnLocalPlayerUpdate(void *fpc) {
         if (!fpc || !IsUnityObjectAlive(fpc)) return;
         void *oldFpc = s_localPlayerFPC.exchange(fpc, std::memory_order_relaxed);
@@ -703,6 +706,45 @@ namespace ESP {
                 UpdateESPFrameData(cam);
             }
         }
+
+        // Sync teammates to Chams so Chams can ignore allies even if ESP is OFF
+        SyncTeammatesToChams();
+    }
+
+    static void SyncTeammatesToChams() {
+        if (!Chams::IsEnabled() || !Chams::IsEnemyOnly()) return;
+
+        static uint64_t s_lastChamsSync = 0;
+        uint64_t now = GetCurrentTimeMs();
+        if (now - s_lastChamsSync < 50) return; // Sync at ~20Hz
+        s_lastChamsSync = now;
+
+        std::vector<Chams::Vector3> teammates;
+
+        void *localFpc = s_localPlayerFPC.load(std::memory_order_relaxed);
+        if (localFpc && Memory::IsValidPtr(localFpc) && get_transform != nullptr && Transform_get_position != nullptr) {
+            void *lpTrans = get_transform(localFpc);
+            if (lpTrans && IsUnityObjectAlive(lpTrans)) {
+                Vector3 lpos = Transform_get_position(lpTrans);
+                teammates.push_back(Chams::Vector3(lpos.x, lpos.y, lpos.z));
+            }
+        }
+
+        std::vector<StatusPanel::EntitySnapshot> entities = StatusPanel::GetActiveEntities();
+        for (const auto &item : entities) {
+            void *entityObj = item.object;
+            if (!entityObj || !IsUnityObjectAlive(entityObj)) continue;
+            int affil = ClassifyAffiliation(entityObj, item.isBot, item.netPlayer);
+            if (affil == -1) { // Confirmed Teammate!
+                void *trans = get_transform ? get_transform(entityObj) : nullptr;
+                if (trans && IsUnityObjectAlive(trans) && Transform_get_position != nullptr) {
+                    Vector3 pos = Transform_get_position(trans);
+                    teammates.push_back(Chams::Vector3(pos.x, pos.y, pos.z));
+                }
+            }
+        }
+
+        Chams::UpdateTeammatePositions(teammates.data(), teammates.size());
     }
 
     void Init() {

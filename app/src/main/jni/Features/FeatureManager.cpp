@@ -66,8 +66,8 @@ namespace FeatureManager {
             OBFUSCATE("Toggle_True_ESP Health Bar & Info"),   // featNum 8
             OBFUSCATE("Category_🌈 FITUR CHAMS (RENDER THROUGH WALLS)"),
             OBFUSCATE("Toggle_Chams Master (Tembus Pandang)"), // featNum 9
-            OBFUSCATE("Spinner_Mode Chams_Shading (Wallhack),Default,Wireframe,Glow,Outline,Rainbow"), // featNum 10
-            OBFUSCATE("Spinner_Filter Shader_Otomatis Body Bone (Anti-Map),Skeletal Bones (_Bones),Normal Map (_BumpMap),Specular (_Shininess),Emissive (_EmisColor),Karakter Warna (_Color),Karakter Texture (_MainTex),Semua Mesh (Map & Player)"), // featNum 11
+            OBFUSCATE("Toggle_True_Chams Enemy Only (Filter Tim)"), // featNum 10
+            OBFUSCATE("Spinner_Mode Chams_Shading (Wallhack),Default,Wireframe,Glow,Outline,Rainbow"), // featNum 11
             OBFUSCATE("SeekBar_Warna Merah_0_255"),            // featNum 12
             OBFUSCATE("SeekBar_Warna Hijau_0_255"),            // featNum 13
             OBFUSCATE("SeekBar_Warna Biru_0_255"),             // featNum 14
@@ -77,8 +77,9 @@ namespace FeatureManager {
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
                       "<font color='#FFFFFF'>"
                       "• <b>ESP Master:</b> Deteksi posisi player/bot secara visual 2D box & line.<br><br>"
-                      "• <b>Chams:</b> Tembus pandang / render karakter tembus dinding (OpenGL-ES).<br><br>"
-                      "• <b>Enemy Only:</b> Otomatis memfilter dan menyembunyikan teman/tim sendiri.<br><br>"
+                      "• <b>Chams:</b> Tembus pandang / render karakter tembus dinding (OpenGL-ES) Anti-Map.<br><br>"
+                      "• <b>Chams Enemy Only:</b> Filter tim aktif: hanya karakter musuh yang tembus pandang.<br><br>"
+                      "• <b>Enemy Only ESP:</b> Otomatis memfilter dan menyembunyikan teman/tim sendiri pada ESP.<br><br>"
                       "• <b>Status Panel:</b> HUD real-time counter Player & Bot.<br><br>"
                       "• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>"
                       "• <b>Fast FireRate:</b> Tembakan kecepatan tinggi (Client-Side).<br><br>"
@@ -191,13 +192,14 @@ namespace FeatureManager {
                 break;
             }
 
-            case 10: { // Mode Chams
-                Chams::SetMode(value);
+            case 10: { // Chams Enemy Only (Filter Tim)
+                Chams::SetEnemyOnly(boolean);
+                ModLogger::SetLastAction(boolean ? "Chams EnemyOnly: ON" : "Chams EnemyOnly: OFF");
                 break;
             }
 
-            case 11: { // Filter Shader
-                Chams::SetShaderFilter(value);
+            case 11: { // Mode Chams
+                Chams::SetMode(value);
                 break;
             }
 
