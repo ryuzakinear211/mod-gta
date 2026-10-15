@@ -58,21 +58,17 @@ namespace Offsets {
         // dump.cs RVA: 0x8536E1C
         constexpr uintptr_t SetVSyncCount = 0x8536E1C;
 
-        // Transform.get_position_Injected(Transform, out Vector3)
-        // dump.cs RVA: 0x85B1394
-        constexpr uintptr_t GetPositionInjected = 0x85B1394;
+        // Transform.get_position() -> Vector3
+        // dump.cs RVA: 0x85B12FC
+        constexpr uintptr_t TransformGetPosition = 0x85B12FC;
 
         // Camera.get_main() -> Camera
         // dump.cs RVA: 0x851ED38
         constexpr uintptr_t CameraGetMain = 0x851ED38;
 
-        // Camera.WorldToViewportPoint_Injected(Camera, in Vector3, MonoOrStereoscopicEye, out Vector3)
-        // dump.cs RVA: 0x851DF1C
-        constexpr uintptr_t WorldToViewportPointInjected = 0x851DF1C;
-
-        // Camera.WorldToScreenPoint_Injected(Camera, in Vector3, MonoOrStereoscopicEye, out Vector3)
-        // dump.cs RVA: 0x851DE04
-        constexpr uintptr_t WorldToScreenPointInjected = 0x851DE04;
+        // Camera.WorldToScreenPoint(Vector3 position) -> Vector3
+        // dump.cs RVA: 0x851E1B0
+        constexpr uintptr_t CameraWorldToScreenPoint = 0x851E1B0;
 
         // Behaviour.get_isActiveAndEnabled() -> bool
         // dump.cs RVA: 0x85974E0
@@ -96,12 +92,13 @@ namespace Offsets {
         constexpr uintptr_t DamageDataBodyPart      = 0x409657C; // DamageData.ctor bodyPart argument
         constexpr uintptr_t ReportHitBodyPart       = 0x4096690; // Network report bodyPart argument
         constexpr uintptr_t HeadshotMultiplierBranch= 0x40968B8; // Damage multiplier branch
-        constexpr uintptr_t GetNetworkPlayer        = 0x4095AC4; // GetNetworkPlayer() -> NetworkPlayer
 
         // Fields (Offsets)
         constexpr uintptr_t CurrentWeapon           = 0x50;      // Equipped Weapon pointer
         constexpr uintptr_t AnimController          = 0xB8;      // Animation Controller pointer
+        constexpr uintptr_t AimingControl           = 0xF0;      // AimingControl pointer
         constexpr uintptr_t TargetibleObject        = 0x120;     // Local TargetibleObject pointer
+        constexpr uintptr_t FPSCamera               = 0x180;     // Camera pointer
     }
 
     // ----------------------------------------------------------------------------------
@@ -154,7 +151,6 @@ namespace Offsets {
         constexpr uintptr_t Update                  = 0x42CC8C8; // NetworkPlayer.Update()
         constexpr uintptr_t OnDestroy               = 0x42C9540; // NetworkPlayer.OnDestroy()
         constexpr uintptr_t Damage                  = 0x42CF248; // NetworkPlayer.Damage() patch point
-        constexpr uintptr_t GetTargetibleObject     = 0x42CD398; // GetTargetibleObject() -> TargetibleObject
 
         // Fields (Offsets)
         constexpr uintptr_t DollsManager            = 0x88;      // DollsManager pointer
@@ -170,31 +166,31 @@ namespace Offsets {
         constexpr uintptr_t Start                   = 0x44493F4; // BotPlayer.Start()
         constexpr uintptr_t Update                  = 0x444A310; // BotPlayer.Update()
         constexpr uintptr_t OnDestroy               = 0x4449EB0; // BotPlayer.OnDestroy()
-        constexpr uintptr_t GetTargetibleObject     = 0x444AC04; // GetTargetibleObject() -> TargetibleObject
-        constexpr uintptr_t GetTeam                 = 0x444AB94; // GetTeam() -> int
 
         // Fields (Offsets)
         constexpr uintptr_t BotLook                 = 0x28;      // BotPlayerLook pointer (Head Look Bone at +0x28)
-        constexpr uintptr_t BotHealth               = 0x30;      // BotPlayerHealth pointer
+        constexpr uintptr_t BotHealth               = 0x30;      // BotPlayerHealth pointer (Health at +0x2C, MaxHealth at +0x30)
         constexpr uintptr_t NetPlayer               = 0x50;      // NetworkPlayer reference
         constexpr uintptr_t ThirdPersonCtrl         = 0x58;      // ThirdPersonController pointer
         constexpr uintptr_t TargetibleObject        = 0x60;      // TargetibleObject pointer
     }
 
     // ----------------------------------------------------------------------------------
-    // BotPlayerHealth
-    // ----------------------------------------------------------------------------------
-    namespace BotPlayerHealth {
-        constexpr uintptr_t GetHealth               = 0x4BEE4FC; // GetHealth() -> float
-    }
-
-    // ----------------------------------------------------------------------------------
     // TargetibleObject & CustomSettings (Team Affiliation & Target Types)
     // ----------------------------------------------------------------------------------
     namespace Targetible {
-        constexpr uintptr_t CustomSettings          = 0x90;      // CustomSettings pointer
-        constexpr uintptr_t GetAllyObjectToggle     = 0x442C448; // get_AllyObjectToogle() -> bool
-        constexpr uintptr_t GetIsAutoAimAllowed     = 0x442C2F4; // get_IsAutoAimAllowed() -> bool
+        constexpr uintptr_t TargetPlace             = 0x20;      // Vector3 TargetPlace
+        constexpr uintptr_t BotLookAtTransform      = 0x38;      // Transform pointer (Head Look Bone)
+        constexpr uintptr_t HeadCollider            = 0x40;      // Collider pointer
+        constexpr uintptr_t FootTransform           = 0x80;      // Transform pointer (Feet/Ground)
+        constexpr uintptr_t CustomSettings          = 0x90;      // TargetibleObjectCustomSettings pointer
+    }
+
+    namespace CustomSettings {
+        constexpr uintptr_t IsAllyToggle            = 0x20;      // bool AllyObjectToogle
+        constexpr uintptr_t EnemyData               = 0x28;      // TargetibleObjectCustomSettingsData*
+        constexpr uintptr_t AllyData                = 0x30;      // TargetibleObjectCustomSettingsData*
+        constexpr uintptr_t IsAutoAimAllowed        = 0x11;      // bool on TargetibleObjectCustomSettingsData
     }
 
     // ----------------------------------------------------------------------------------
