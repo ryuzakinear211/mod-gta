@@ -306,6 +306,23 @@ namespace Offsets {
             constexpr int QuestPoints     = 999;
         }
 
+        // Domain Model: SerializableUserReward (dump.cs class: LastLevel.Legion.Dom.SerializableUserReward)
+        // Fields (Offsets)
+        constexpr uintptr_t SerialReward_Type      = 0x10; // RewardType enum
+        constexpr uintptr_t SerialReward_Value     = 0x14; // Currency enum ID
+        constexpr uintptr_t SerialReward_Count     = 0x18; // Amount int
+        // Methods (RVAs)
+        constexpr uintptr_t SerialReward_ctor      = 0x4B5447C; // SerializableUserReward..ctor(type, value, count, comp, meta)
+
+        // Domain Model: SerializableUserRewardList (dump.cs class: LastLevel.Legion.Dom.SerializableUserRewardList)
+        constexpr uintptr_t SerialList_AddReward   = 0x45262A0; // SerializableUserRewardList.Add(reward)
+        constexpr uintptr_t SerialList_GetList1    = 0x4525494; // -> List<RewardItem>
+        constexpr uintptr_t SerialList_GetList2    = 0x45255C0; // -> List<RewardItem>
+        constexpr uintptr_t SerialList_GetList3    = 0x45257F8; // -> List<RewardItem>
+        constexpr uintptr_t SerialList_GetList4    = 0x4525918; // -> List<RewardItem>
+        constexpr uintptr_t SerialList_GetList5    = 0x4525A38; // -> List<RewardItem>
+        constexpr uintptr_t SerialList_GetList6    = 0x4525C88; // -> List<RewardItem>
+
         // Reward Item (dump.cs class: abbbbabbbaaabababbbbbbbbaabbbbaababababaababbbb)
         // Fields (Offsets)
         constexpr uintptr_t RewardItem_Type        = 0x10; // RewardType enum
@@ -317,18 +334,11 @@ namespace Offsets {
         constexpr uintptr_t RewardItem_GetAmount   = 0x497D228; // RewardItem.GetAmount() -> int
         constexpr uintptr_t RewardItem_SetAmount   = 0x497D098; // RewardItem.SetAmount(int) -> void
 
+        // Reward Popup Data (dump.cs class: baabbabbbabaabaaaaaabbbabbbbbbbbbbbbabaaabbaaaa)
+        constexpr uintptr_t PopupData_ctor         = 0x41D8E50; // .ctor(p1, List<RewardItem>, p3)
+
         // UI View Setup (dump.cs: BaseRewardElementView.Setup)
         constexpr uintptr_t RewardView_Setup       = 0x49F9E48; // BaseRewardElementView.Setup(...)
-
-        // Currency / Wallet Manager (dump.cs class: ababaaababaabaabbbababaaaabbbbaabaababbbbaaabbb)
-        // Methods (RVAs)
-        constexpr uintptr_t Currency_AddInt1       = 0x437C304; // (Currency, int)
-        constexpr uintptr_t Currency_AddInt2       = 0x437C39C; // (Currency, int)
-        constexpr uintptr_t Currency_AddLong1      = 0x437C4EC; // (Currency, long)
-        constexpr uintptr_t Currency_AddLong2      = 0x437C6B8; // (Currency, long)
-        constexpr uintptr_t Currency_AddLong3      = 0x437C728; // (Currency, long)
-        constexpr uintptr_t Currency_AddInt3       = 0x437C7C8; // (Currency, int)
-        constexpr uintptr_t Currency_AddLong4      = 0x437C838; // (Currency, long)
     }
 
 } // namespace Offsets
