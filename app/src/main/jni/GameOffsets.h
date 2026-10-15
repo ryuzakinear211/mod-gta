@@ -387,6 +387,11 @@ namespace Offsets {
         constexpr uintptr_t PermissionScreen_OnClickNo      = 0x445E404; // OnClickNo()
         constexpr uintptr_t PermissionScreen_SetState       = 0x445E290; // babbbbabbabbabbabbaaabaabaabaabbabbaaaaabbbabbb(bool, bool)
 
+        // PushPopUpWindowUi (dump.cs: UI.Windows.Push.PushPopUpWindowUi, TypeDefIndex: 2761)
+        constexpr uintptr_t PushPopUpWindowUi_ctor          = 0x4E07DB0; // .ctor()
+        constexpr uintptr_t PushPopUpWindowUi_AcceptEnable  = 0x4E080A0; // AcceptEnablePush() -> void
+        constexpr uintptr_t PushPopUpWindowUi_ClosePopUp    = 0x4E08B24; // ClosePopUp() -> void
+
         // UnityEngine.PlayerPrefs RVAs from dump.cs (TypeDefIndex: 15451)
         constexpr uintptr_t PlayerPrefs_SetInt              = 0x858FE70; // SetInt(string, int)
         constexpr uintptr_t PlayerPrefs_GetInt              = 0x858FED0; // GetInt(string, int)
