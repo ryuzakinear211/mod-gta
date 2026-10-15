@@ -17,7 +17,7 @@ namespace Chams {
 
     static std::atomic<bool> s_enabled{false};
     static std::atomic<int>  s_mode{static_cast<int>(Mode::Shading)}; // Default: Shading / Wallhack
-    static std::atomic<int>  s_shaderFilter{static_cast<int>(ShaderFilter::MainTex)};
+    static std::atomic<int>  s_shaderFilter{static_cast<int>(ShaderFilter::BodyBonesAuto)}; // Default: Body Bones (Anti-Map)
 
     static std::atomic<float> s_r{255.0f}; // Default vibrant crimson red
     static std::atomic<float> s_g{42.0f};
@@ -34,14 +34,124 @@ namespace Chams {
     // Original GLES function pointers
     static void (*old_glDrawElements)(GLenum mode, GLsizei count, GLenum type, const void *indices) = nullptr;
 
-    static inline const char* GetShaderUniformName(int filter) {
-        switch (static_cast<ShaderFilter>(filter)) {
-            case ShaderFilter::MainTex:   return "_MainTex";
-            case ShaderFilter::Color:     return "_Color";
-            case ShaderFilter::MainTexST: return "_MainTex_ST";
-            case ShaderFilter::All:
-            default:                      return nullptr;
+    // Classification cache for GLES programs: -1 = uncomputed, 0 = reject, 1 = allow
+    static int8_t s_programFilterCache[8][256];
+
+    static inline void ClearProgramCache() {
+        memset(s_programFilterCache, -1, sizeof(s_programFilterCache));
+    }
+
+    // Check if the GL program belongs to static world/map/terrain geometry
+    static inline bool IsMapGeometryProgram(GLint program) {
+        if (program <= 0) return false;
+        // Static map/terrain in Unity uses baked lightmapping or splat maps
+        if (glGetUniformLocation(program, "unity_Lightmap") != -1) return true;
+        if (glGetUniformLocation(program, "unity_LightmapST") != -1) return true;
+        if (glGetUniformLocation(program, "unity_Lightmaps[0]") != -1) return true;
+        if (glGetUniformLocation(program, "unity_LightmapsInd[0]") != -1) return true;
+        if (glGetUniformLocation(program, "unity_DynamicLightmap") != -1) return true;
+        if (glGetUniformLocation(program, "_Control") != -1) return true;
+        if (glGetUniformLocation(program, "_TerrainHolesTexture") != -1) return true;
+        if (glGetUniformLocation(program, "_Splat0") != -1) return true;
+        return false;
+    }
+
+    // Check if the GL program uses skeletal bone matrices for GPU skinning
+    static inline bool HasBoneSkinning(GLint program) {
+        if (program <= 0) return false;
+        if (glGetUniformLocation(program, "_Bones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "_Bones") != -1) return true;
+        if (glGetUniformLocation(program, "hlslcc_mtx4x4_Bones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "unity_SkinMatrices") != -1) return true;
+        if (glGetUniformLocation(program, "unity_BoneMatrices") != -1) return true;
+        return false;
+    }
+
+    // Determine if the current mesh should be rendered in Chams
+    static inline bool ShouldRenderMesh(GLint program, int filter) {
+        if (program <= 0) return false;
+        if (filter < 0 || filter > 7) filter = 0;
+
+        if (program < 256) {
+            int8_t cached = s_programFilterCache[filter][program];
+            if (cached != -1) {
+                return cached == 1;
+            }
         }
+
+        ShaderFilter sf = static_cast<ShaderFilter>(filter);
+        bool shouldRender = false;
+
+        // Anti-map rule: Never render lightmapped static world objects unless explicitly in AllMeshes mode
+        bool isMap = (sf != ShaderFilter::AllMeshes) && IsMapGeometryProgram(program);
+
+        if (!isMap) {
+            switch (sf) {
+                case ShaderFilter::BodyBonesAuto: {
+                    // Priority 1: GPU Skinning Bone Matrices (Characters with skeletal rig)
+                    if (HasBoneSkinning(program)) {
+                        shouldRender = true;
+                        break;
+                    }
+                    // Priority 2: Character detail shaders (Normal Map / BumpMap, Specular Shininess, Emission)
+                    if (glGetUniformLocation(program, "_BumpMap") != -1 ||
+                        glGetUniformLocation(program, "_Shininess") != -1 ||
+                        glGetUniformLocation(program, "_EmisColor") != -1 ||
+                        glGetUniformLocation(program, "_Cutoff") != -1) {
+                        shouldRender = true;
+                        break;
+                    }
+                    // Priority 3: Dynamic entity Color or MainTex that is strictly NON-MAP
+                    if (glGetUniformLocation(program, "_Color") != -1 ||
+                        glGetUniformLocation(program, "_MainTex") != -1) {
+                        shouldRender = true;
+                        break;
+                    }
+                    break;
+                }
+
+                case ShaderFilter::BonesGPU: {
+                    shouldRender = HasBoneSkinning(program);
+                    break;
+                }
+
+                case ShaderFilter::BumpMap: {
+                    shouldRender = (glGetUniformLocation(program, "_BumpMap") != -1);
+                    break;
+                }
+
+                case ShaderFilter::Shininess: {
+                    shouldRender = (glGetUniformLocation(program, "_Shininess") != -1);
+                    break;
+                }
+
+                case ShaderFilter::EmisColor: {
+                    shouldRender = (glGetUniformLocation(program, "_EmisColor") != -1);
+                    break;
+                }
+
+                case ShaderFilter::ColorNonMap: {
+                    shouldRender = (glGetUniformLocation(program, "_Color") != -1);
+                    break;
+                }
+
+                case ShaderFilter::MainTexNonMap: {
+                    shouldRender = (glGetUniformLocation(program, "_MainTex") != -1);
+                    break;
+                }
+
+                case ShaderFilter::AllMeshes:
+                default:
+                    shouldRender = true;
+                    break;
+            }
+        }
+
+        if (program < 256) {
+            s_programFilterCache[filter][program] = shouldRender ? 1 : 0;
+        }
+
+        return shouldRender;
     }
 
     static void hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
@@ -54,24 +164,23 @@ namespace Chams {
             return;
         }
 
-        // Only target 3D meshes (character models in Unity use GL_TRIANGLES with count >= 600)
-        // This prevents corrupting UI, minimap, text, and small particle elements
-        if (mode != GL_TRIANGLES || count < 600) {
+        // Only target character 3D meshes:
+        // Character body parts and dolls in Unity use GL_TRIANGLES with 1000 <= count <= 32000.
+        // Massive map terrain chunks (>32000) and small UI/particles (<1000) are skipped.
+        if (mode != GL_TRIANGLES || count < 1000 || count > 32000) {
             return;
         }
 
-        // If shader uniform filter is configured, verify program uses target uniform (e.g. _MainTex for characters)
+        // Retrieve active OpenGL ES program
+        GLint currProgram = 0;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &currProgram);
+        if (currProgram == 0) {
+            return;
+        }
+
         int filter = s_shaderFilter.load(std::memory_order_relaxed);
-        const char *uniformName = GetShaderUniformName(filter);
-        if (uniformName != nullptr) {
-            GLint currProgram = 0;
-            glGetIntegerv(GL_CURRENT_PROGRAM, &currProgram);
-            if (currProgram != 0) {
-                GLint loc = glGetUniformLocation(currProgram, uniformName);
-                if (loc == -1) {
-                    return; // Not a character/mesh shader matching the uniform
-                }
-            }
+        if (!ShouldRenderMesh(currProgram, filter)) {
+            return;
         }
 
         int currentMode = s_mode.load(std::memory_order_relaxed);
@@ -211,6 +320,8 @@ namespace Chams {
     }
 
     void Init() {
+        ClearProgramCache();
+
         void *glesHandle = dlopen("libGLESv2.so", RTLD_LAZY);
         if (!glesHandle) {
             glesHandle = dlopen("libGLESv3.so", RTLD_LAZY);
@@ -255,6 +366,7 @@ namespace Chams {
 
     void SetShaderFilter(int filter) {
         s_shaderFilter.store(filter, std::memory_order_relaxed);
+        ClearProgramCache();
         LOG_INFO("[CHAMS] Shader filter set to %d", filter);
     }
 

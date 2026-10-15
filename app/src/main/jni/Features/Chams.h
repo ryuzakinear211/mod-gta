@@ -15,10 +15,14 @@ namespace Chams {
     };
 
     enum class ShaderFilter {
-        MainTex   = 0, // _MainTex (Character models)
-        Color     = 1, // _Color
-        MainTexST = 2, // _MainTex_ST
-        All       = 3  // All shaders without uniform filter
+        BodyBonesAuto = 0, // Otomatis Body Bone (Anti-Map + Bones/BumpMap)
+        BonesGPU      = 1, // Skeletal Bones (_Bones / GPU Skinning)
+        BumpMap       = 2, // Karakter Normal Map (_BumpMap)
+        Shininess     = 3, // Specular Karakter (_Shininess)
+        EmisColor     = 4, // Emissive (_EmisColor)
+        ColorNonMap   = 5, // Karakter Warna (_Color [Anti-Map])
+        MainTexNonMap = 6, // Karakter Texture (_MainTex [Anti-Map])
+        AllMeshes     = 7  // Semua Mesh (Map & Player)
     };
 
     void Init();

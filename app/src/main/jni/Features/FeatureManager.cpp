@@ -67,7 +67,7 @@ namespace FeatureManager {
             OBFUSCATE("Category_🌈 FITUR CHAMS (RENDER THROUGH WALLS)"),
             OBFUSCATE("Toggle_Chams Master (Tembus Pandang)"), // featNum 9
             OBFUSCATE("Spinner_Mode Chams_Shading (Wallhack),Default,Wireframe,Glow,Outline,Rainbow"), // featNum 10
-            OBFUSCATE("Spinner_Filter Shader_Karakter (_MainTex),Warna (_Color),Texture (_MainTex_ST),Semua (All)"), // featNum 11
+            OBFUSCATE("Spinner_Filter Shader_Otomatis Body Bone (Anti-Map),Skeletal Bones (_Bones),Normal Map (_BumpMap),Specular (_Shininess),Emissive (_EmisColor),Karakter Warna (_Color),Karakter Texture (_MainTex),Semua Mesh (Map & Player)"), // featNum 11
             OBFUSCATE("SeekBar_Warna Merah_0_255"),            // featNum 12
             OBFUSCATE("SeekBar_Warna Hijau_0_255"),            // featNum 13
             OBFUSCATE("SeekBar_Warna Biru_0_255"),             // featNum 14
