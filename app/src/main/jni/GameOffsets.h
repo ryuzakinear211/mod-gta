@@ -76,6 +76,44 @@ namespace Offsets {
     }
 
     // ----------------------------------------------------------------------------------
+    // Humanoid Bone Hierarchy (Unity HumanBodyBones enum for Animator.GetBoneTransform)
+    // ----------------------------------------------------------------------------------
+    namespace Bones {
+        enum HumanBodyBones {
+            Hips          = 0,
+            LeftUpperLeg  = 1,
+            RightUpperLeg = 2,
+            LeftLowerLeg  = 3,
+            RightLowerLeg = 4,
+            LeftFoot      = 5,
+            RightFoot     = 6,
+            Spine         = 7,
+            Chest         = 8,
+            Neck          = 9,
+            Head          = 10,
+            LeftShoulder  = 11,
+            RightShoulder = 12,
+            UpperChest    = 54
+        };
+    }
+
+    // ----------------------------------------------------------------------------------
+    // BodyPoints (BodyPointsManager Hitboxes from dump.cs: Head=0, Chest=1, Legs=2)
+    // ----------------------------------------------------------------------------------
+    namespace BodyPoints {
+        enum PointType {
+            Head  = 0,
+            Chest = 1,
+            Legs  = 2
+        };
+        constexpr uintptr_t ArrayOffset = 0x20; // BodyPointsManager._bodyPoints array
+        constexpr uintptr_t ArrayLength = 0x18; // Il2Cpp array length
+        constexpr uintptr_t ArrayItems  = 0x20; // Il2Cpp array elements start
+        constexpr uintptr_t BPView      = 0x10; // BodyPoint.bpView
+        constexpr uintptr_t BPType      = 0x20; // BodyPointView.BodyPointType
+    }
+
+    // ----------------------------------------------------------------------------------
     // FirstPersonController (Local Player Character Controller)
     // ----------------------------------------------------------------------------------
     namespace FPC {
@@ -183,6 +221,7 @@ namespace Offsets {
         constexpr uintptr_t TargetPlace             = 0x20;      // Vector3 TargetPlace
         constexpr uintptr_t BotLookAtTransform      = 0x38;      // Transform pointer (Head Look Bone)
         constexpr uintptr_t HeadCollider            = 0x40;      // Collider pointer
+        constexpr uintptr_t BodyCollider            = 0x48;      // Collider pointer
         constexpr uintptr_t FootTransform           = 0x80;      // Transform pointer (Feet/Ground)
         constexpr uintptr_t CustomSettings          = 0x90;      // TargetibleObjectCustomSettings pointer
     }

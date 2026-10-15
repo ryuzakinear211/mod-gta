@@ -91,3 +91,7 @@ lint/tmp/
 
 # Reference templates
 esp-chams-template/
+
+# NDK build artifacts
+app/src/main/jni/libs/
+app/src/main/jni/obj/
