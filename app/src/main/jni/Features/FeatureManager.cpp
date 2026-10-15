@@ -5,6 +5,7 @@
 #include "StatusPanel.h"
 #include "FPSUnlock.h"
 #include "ESP.h"
+#include "Chams.h"
 #include "../GameOffsets.h"
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
@@ -42,6 +43,7 @@ namespace FeatureManager {
         StatusPanel::Init();
         FPSUnlock::Init();
         ESP::Init();
+        Chams::Init();
 
         // Install local player lifecycle hook
         Memory::HookRVA(Offsets::FPC::Update, reinterpret_cast<void*>(hook_FPC_Update), reinterpret_cast<void**>(&old_FPC_Update));
@@ -62,11 +64,20 @@ namespace FeatureManager {
             OBFUSCATE("Toggle_True_ESP Enemy Only (Filter Tim)"), // featNum 6
             OBFUSCATE("Toggle_True_ESP Line Tracer"),         // featNum 7
             OBFUSCATE("Toggle_True_ESP Health Bar & Info"),   // featNum 8
+            OBFUSCATE("Category_🌈 FITUR CHAMS (RENDER THROUGH WALLS)"),
+            OBFUSCATE("Toggle_Chams Master (Tembus Pandang)"), // featNum 9
+            OBFUSCATE("Spinner_Mode Chams_Shading (Wallhack),Default,Wireframe,Glow,Outline,Rainbow"), // featNum 10
+            OBFUSCATE("Spinner_Filter Shader_Karakter (_MainTex),Warna (_Color),Texture (_MainTex_ST),Semua (All)"), // featNum 11
+            OBFUSCATE("SeekBar_Warna Merah_0_255"),            // featNum 12
+            OBFUSCATE("SeekBar_Warna Hijau_0_255"),            // featNum 13
+            OBFUSCATE("SeekBar_Warna Biru_0_255"),             // featNum 14
+            OBFUSCATE("SeekBar_Tebal Garis_1_10"),             // featNum 15
             OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
             OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
                       "<font color='#FFFFFF'>"
                       "• <b>ESP Master:</b> Deteksi posisi player/bot secara visual 2D box & line.<br><br>"
+                      "• <b>Chams:</b> Tembus pandang / render karakter tembus dinding (OpenGL-ES).<br><br>"
                       "• <b>Enemy Only:</b> Otomatis memfilter dan menyembunyikan teman/tim sendiri.<br><br>"
                       "• <b>Status Panel:</b> HUD real-time counter Player & Bot.<br><br>"
                       "• <b>Big Head:</b> Memperbesar kepala Player & Bot (Client-Side).<br><br>"
@@ -168,6 +179,45 @@ namespace FeatureManager {
                 ESP::SetDistanceEnabled(boolean);
                 ESP::SetNameEnabled(boolean);
                 ModLogger::SetLastAction(boolean ? "ESP Info: ON" : "ESP Info: OFF");
+                break;
+            }
+
+            case 9: { // Chams Master (Tembus Pandang / Wallhack)
+                Chams::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "Chams: ON" : "Chams: OFF");
+                if (boolean && ctx != nullptr) {
+                    Toast(env, ctx, OBFUSCATE("Chams: ON (Tembus Pandang)"), ToastLength::LENGTH_SHORT);
+                }
+                break;
+            }
+
+            case 10: { // Mode Chams
+                Chams::SetMode(value);
+                break;
+            }
+
+            case 11: { // Filter Shader
+                Chams::SetShaderFilter(value);
+                break;
+            }
+
+            case 12: { // Warna Merah
+                Chams::SetR(value);
+                break;
+            }
+
+            case 13: { // Warna Hijau
+                Chams::SetG(value);
+                break;
+            }
+
+            case 14: { // Warna Biru
+                Chams::SetB(value);
+                break;
+            }
+
+            case 15: { // Tebal Garis
+                Chams::SetLineWidth(value > 0 ? value : 1);
                 break;
             }
 

@@ -28,6 +28,7 @@ LOCAL_SRC_FILES := Main.cpp \
 	Features/StatusPanel.cpp \
 	Features/FPSUnlock.cpp \
 	Features/ESP.cpp \
+	Features/Chams.cpp \
 	Substrate/hde64.c \
 	Substrate/SubstrateDebug.cpp \
 	Substrate/SubstrateHook.cpp \
