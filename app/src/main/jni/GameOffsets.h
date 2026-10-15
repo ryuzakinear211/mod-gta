@@ -266,6 +266,71 @@ namespace Offsets {
         constexpr uintptr_t ObscuredFloat_Implicit  = 0x3D6E4DC; // ObscuredFloat.op_Implicit(float)
     }
 
+    // ----------------------------------------------------------------------------------
+    // Reward & Currency Management (Claim Reward Booster)
+    // ----------------------------------------------------------------------------------
+    namespace Reward {
+        // Enums from dump.cs (LastLevel.Legion.Dom.Currency)
+        namespace CurrencyType {
+            constexpr int None  = 0;
+            constexpr int Soft  = 1; // Credits / Money
+            constexpr int Hard  = 2; // Gold / Gems
+        }
+
+        // RewardType enum from dump.cs (TypeDefIndex: 11421)
+        namespace RewardType {
+            constexpr int None            = -1;
+            constexpr int ArmorPlate      = 4;
+            constexpr int Grenade         = 5;
+            constexpr int UserWeapon      = 6;
+            constexpr int ItemEquip       = 7;
+            constexpr int Experience      = 8;
+            constexpr int Chest           = 9;
+            constexpr int Gadget          = 14;
+            constexpr int Camouflage      = 15;
+            constexpr int MultiplyReward  = 16;
+            constexpr int DailyChestReset = 17;
+            constexpr int BattlePass      = 18;
+            constexpr int Blueprint       = 19;
+            constexpr int Miner           = 20;
+            constexpr int ClanPoints      = 21;
+            constexpr int GameMoney       = 22; // Currency (Soft/Hard)
+            constexpr int ClanExperience  = 23;
+            constexpr int DivisionPoints  = 24;
+            constexpr int CharacterExp    = 25;
+            constexpr int MasterPoints    = 26;
+            constexpr int Character       = 27;
+            constexpr int Skill           = 28;
+            constexpr int PlusAccess      = 29;
+            constexpr int RatingStagePoints = 30;
+            constexpr int QuestPoints     = 999;
+        }
+
+        // Reward Item (dump.cs class: abbbbabbbaaabababbbbbbbbaabbbbaababababaababbbb)
+        // Fields (Offsets)
+        constexpr uintptr_t RewardItem_Type        = 0x10; // RewardType enum
+        constexpr uintptr_t RewardItem_CurrencyId  = 0x14; // Currency enum ID
+        constexpr uintptr_t RewardItem_Amount      = 0x18; // Amount int
+
+        // Methods (RVAs)
+        constexpr uintptr_t RewardItem_ctor        = 0x497D240; // RewardItem..ctor(type, id, amount, p3, p4)
+        constexpr uintptr_t RewardItem_GetAmount   = 0x497D228; // RewardItem.GetAmount() -> int
+        constexpr uintptr_t RewardItem_SetAmount   = 0x497D098; // RewardItem.SetAmount(int) -> void
+
+        // UI View Setup (dump.cs: BaseRewardElementView.Setup)
+        constexpr uintptr_t RewardView_Setup       = 0x49F9E48; // BaseRewardElementView.Setup(...)
+
+        // Currency / Wallet Manager (dump.cs class: ababaaababaabaabbbababaaaabbbbaabaababbbbaaabbb)
+        // Methods (RVAs)
+        constexpr uintptr_t Currency_AddInt1       = 0x437C304; // (Currency, int)
+        constexpr uintptr_t Currency_AddInt2       = 0x437C39C; // (Currency, int)
+        constexpr uintptr_t Currency_AddLong1      = 0x437C4EC; // (Currency, long)
+        constexpr uintptr_t Currency_AddLong2      = 0x437C6B8; // (Currency, long)
+        constexpr uintptr_t Currency_AddLong3      = 0x437C728; // (Currency, long)
+        constexpr uintptr_t Currency_AddInt3       = 0x437C7C8; // (Currency, int)
+        constexpr uintptr_t Currency_AddLong4      = 0x437C838; // (Currency, long)
+    }
+
 } // namespace Offsets
 
 #endif // GAME_OFFSETS_H
