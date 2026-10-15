@@ -387,10 +387,27 @@ namespace Offsets {
         constexpr uintptr_t PermissionScreen_OnClickNo      = 0x445E404; // OnClickNo()
         constexpr uintptr_t PermissionScreen_SetState       = 0x445E290; // babbbbabbabbabbabbaaabaabaabaabbabbaaaaabbbabbb(bool, bool)
 
+        // WindowsUi (dump.cs class: UI.Windows.WindowsUi, TypeDefIndex: 6087)
+        constexpr uintptr_t WindowsUi_GetInstance           = 0x3FECAA0; // bbbabbabababaabaaabbbbbbababbbbbbaabbbaabbaabaa() -> WindowsUi
+        constexpr uintptr_t WindowsUi_ListOffset            = 0x30;      // List<BaseWindowUi>
+        constexpr uintptr_t WindowsUi_DictOffset            = 0x28;      // Dictionary<Type, BaseWindowUi>
+
         // PushPopUpWindowUi (dump.cs: UI.Windows.Push.PushPopUpWindowUi, TypeDefIndex: 2761)
         constexpr uintptr_t PushPopUpWindowUi_ctor          = 0x4E07DB0; // .ctor()
+        constexpr uintptr_t PushPopUpWindowUi_Awake         = 0x4E073E4; // Slot 11: OnAwake()
+        constexpr uintptr_t PushPopUpWindowUi_ShowPopup     = 0x4E07D2C; // baaaaaaaabbbaabababbababbaabbbabbaaababaaaaabaa() -> void
+        constexpr uintptr_t PushPopUpWindowUi_OnShow        = 0x4E08A68; // Slot 13: OnShow(int transitionType) -> void
         constexpr uintptr_t PushPopUpWindowUi_AcceptEnable  = 0x4E080A0; // AcceptEnablePush() -> void
         constexpr uintptr_t PushPopUpWindowUi_ClosePopUp    = 0x4E08B24; // ClosePopUp() -> void
+        constexpr uintptr_t PushPopUpWindowUi_OnGranted1    = 0x4E083E4; // bbabaabababbbaabbbbaaaaaabbbabbbbbbbabbbabababb(bool)
+        constexpr uintptr_t PushPopUpWindowUi_OnGranted2    = 0x4E08680; // babbbbabbbabaaaaaabababbbbbbbbababaaabbaaabaaab(bool)
+
+        // PushPopUpWindowUi Component Fields
+        constexpr uintptr_t PushPopUp_FirstPopUp            = 0x28;      // GameObject _firstPopUp (dialog with female soldier & gold)
+        constexpr uintptr_t PushPopUp_AnyPopUp              = 0x30;      // GameObject _anyPopUp
+        constexpr uintptr_t PushPopUp_Reward                = 0x38;      // QuestRewardUiElement _reward
+        constexpr uintptr_t PushPopUp_Placeholder           = 0x40;      // Transform _rewardsPlaceholder
+        constexpr uintptr_t PushPopUp_Description           = 0x48;      // Text _description
 
         // UnityEngine.PlayerPrefs RVAs from dump.cs (TypeDefIndex: 15451)
         constexpr uintptr_t PlayerPrefs_SetInt              = 0x858FE70; // SetInt(string, int)
