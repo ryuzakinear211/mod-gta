@@ -477,6 +477,70 @@ namespace Offsets {
         constexpr uintptr_t DailyRewardContainer_Setup       = 0x45CB45C; // Setup(...) -> void
     }
 
+    // ----------------------------------------------------------------------------------
+    // Unlock Weapon (Primary Lobby Equipment & In-Game Shooting Range Logic)
+    // ----------------------------------------------------------------------------------
+    namespace UnlockWeapon {
+        // Equipment Slot Enum: 0 = Primary, 1 = Secondary, 2 = Throwable, 3 = Melee
+        namespace EquipmentSlot {
+            constexpr int Primary   = 0;
+            constexpr int Secondary = 1;
+            constexpr int Throwable = 2;
+            constexpr int Melee     = 3;
+        }
+
+        // ShopItemProfileData (dump.cs TypeDefIndex: 2517)
+        constexpr uintptr_t ShopItemProfile_IsBought            = 0x4D52074; // get_IsBought() -> bool
+        constexpr uintptr_t ShopItemProfile_IsHave              = 0x4D50F2C; // get_IsHave() -> bool
+        constexpr uintptr_t ShopItemProfile_HasAvailableToEquip = 0x4D50F50; // get_HasAvailableToEquip() -> bool
+        constexpr uintptr_t ShopItemProfile_IsAvailable         = 0x4D52120; // get_IsAvailable() -> bool
+
+        // ShopItemExtensionProfileData (dump.cs TypeDefIndex: 4255)
+        constexpr uintptr_t ShopItemExtProfile_IsBought         = 0x4254B7C; // get_IsBought() -> bool
+        constexpr uintptr_t ShopItemExtProfile_HasAvailableToEquip = 0x4254F58; // get_HasAvailableToEquip() -> bool
+        constexpr uintptr_t ShopItemExtProfile_IsHave           = 0x4254F7C; // get_IsHave() -> bool
+
+        // ShopItemBase (dump.cs TypeDefIndex: 185)
+        constexpr uintptr_t ShopItemBase_IsLevelReached         = 0x4BB780C; // get_IsActualRequiredLevelReached() -> bool
+        constexpr uintptr_t ShopItemBase_GetKey                 = 0x4BB7C3C; // get_Key() -> int
+        constexpr uintptr_t ShopItemBase_GetName                = 0x4BB7C14; // get_Name() -> string
+        constexpr uintptr_t ShopItemBase_GetTranslatedName      = 0x4BB6740; // get_TranslatedName() -> string
+
+        // Slot 24 virtual isBought implementations
+        constexpr uintptr_t ShopItem_IsBoughtSlot               = 0x4103330; // ShopItem Slot 24
+        constexpr uintptr_t ShopItemExt_IsBoughtSlot            = 0x50CA4BC; // ShopItemExtension Slot 24
+
+        // UiShopEquipButtonView (dump.cs TypeDefIndex: 6732)
+        constexpr uintptr_t UiShopEquipButton_CanEquip          = 0x4138AE8; // babbbbbbaaabaaaaaabbabababbbbbabbaabbabbaaaaaaa() -> bool
+
+        // UiEquipLockView (dump.cs TypeDefIndex: 5546)
+        constexpr uintptr_t UiEquipLockView_UpdateView          = 0x3EEF948; // UpdateView(context) -> void
+        constexpr uintptr_t UiEquipLockView_LockContainer       = 0x20;      // GameObject _customizationLockContainer
+
+        // WeaponCustomizationController (dump.cs TypeDefIndex: 6961)
+        constexpr uintptr_t WeaponCustomization_SelectWeapon    = 0x41A3CE4; // abbbbababaaabaaaabbababbaababbbaaaabbabaaaaaaaa(int id)
+        constexpr uintptr_t WeaponCustomization_GetInstance     = 0x41A0470; // bbbaabaaaabababbbaabbaabbaaabbbaababbbbaaabbbaa() -> instance
+        constexpr uintptr_t WeaponCustomization_ShopItemField   = 0xC8;      // ShopItemBase
+        constexpr uintptr_t WeaponCustomization_WeaponIdField   = 0xD4;      // int weaponId
+
+        // UiShopGoToShootingRangeButtonView (dump.cs TypeDefIndex: 2966)
+        constexpr uintptr_t ShootingRangeButton_WeaponIdField   = 0x38;      // int weaponId
+
+        // Match Weapon Config (Shooting Range Mode Weapon Override Logic)
+        constexpr uintptr_t MatchConfig1_GetWeaponId            = 0x3E97924; // TypeDefIndex: 28 -> int
+        constexpr uintptr_t MatchConfig2_GetWeaponId            = 0x44577FC; // TypeDefIndex: 8313 -> int
+
+        // Loadout & Inventory Weapon Resolution
+        constexpr uintptr_t LoadoutManager_GetWeaponId1         = 0x3F164EC; // aabbbabaaabaabaaaabaababbabbaaaaaabaaaabbbbbbba(int, Slot) -> int
+        constexpr uintptr_t LoadoutManager_GetWeaponId2         = 0x3F16DD4; // babaaababbaaababbbaaababbabaabaabbabbabbbbbabab(int, Slot) -> int
+        constexpr uintptr_t LoadoutManager_EquipWeapon          = 0x3F16258; // aabababbabbabaaaaaaaaabbbbaaaaaaaabbabbbabbaabb(int, int, int, bool)
+        constexpr uintptr_t FPC_GetSlotWeaponId                 = 0x408DB4C; // bbaaababbbbbaaababbbabbabbbabaabaaabbaaabababab(Slot) -> int
+        constexpr uintptr_t UserKit_GetSlot                     = 0x460D710; // bbbbaabbabbbaaaabbabbbbbbbbababaabbaabbbbbaaaba(Slot) -> UserKitSlot*
+        constexpr uintptr_t UserKitSlot_GetItemId               = 0x42AADDC; // aabbabaabbaabbabbbaababbaabaaabaaabaabbbbabbbba() -> int
+        constexpr uintptr_t UserKitSlot_ItemIdField             = 0x10;      // int ItemId
+        constexpr uintptr_t UserKitSlot_SlotField               = 0x28;      // EquipmentSlot
+    }
+
 } // namespace Offsets
 
 #endif // GAME_OFFSETS_H

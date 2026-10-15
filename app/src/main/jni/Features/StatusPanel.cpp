@@ -3,6 +3,7 @@
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
 #include "BigHead.h"
+#include "UnlockWeapon.h"
 #include <vector>
 #include <mutex>
 #include <unordered_map>
@@ -142,10 +143,12 @@ namespace StatusPanel {
 
     std::string GetFormattedStatus() {
         Stats s = GetStats();
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s;%d;%d;%d",
+        std::string weaponStatus = UnlockWeapon::GetOverlayStatus();
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s;%d;%d;%d;%s",
                  s.inGame ? "IN_GAME" : "LOBBY",
-                 s.realPlayerCount, s.botCount, s.totalEntities);
+                 s.realPlayerCount, s.botCount, s.totalEntities,
+                 weaponStatus.c_str());
         return std::string(buf);
     }
 

@@ -570,12 +570,18 @@ public class Menu {
                 int totalCount = Integer.parseInt(parts[3]);
 
                 String statusStr = inGame ? "<font color='#00FF7F'>&#9679; IN GAME</font>" : "<font color='#FFAA00'>&#9679; LOBBY / MENUNGGU</font>";
+                String weaponInfo = (parts.length >= 5 && parts[4] != null && !parts[4].isEmpty() && !"DISABLED".equals(parts[4]))
+                        ? parts[4]
+                        : null;
 
                 if (mStatusHudText != null) {
                     String hudHtml = "<b>Status:</b> " + statusStr + "<br>" +
                             "<font color='#00FF00'>Player: <b>" + realCount + "</b></font> | " +
                             "<font color='#FF5252'>Bot: <b>" + botCount + "</b></font><br>" +
                             "<font color='#FFFF00'>Total: <b>" + totalCount + "</b></font>";
+                    if (weaponInfo != null) {
+                        hudHtml += "<br><font color='#00E5FF'>🔫 Senjata: <b>" + weaponInfo + "</b></font>";
+                    }
                     mStatusHudText.setText(Html.fromHtml(hudHtml));
                 }
 
@@ -583,6 +589,9 @@ public class Menu {
                     String subHtml = inGame
                             ? "<b><font color='#00FF7F'>[IN GAME]</font> <font color='#00FF00'>Player: " + realCount + "</font> | <font color='#FF5252'>Bot: " + botCount + "</font> | <font color='#FFFF00'>Total: " + totalCount + "</font></b>"
                             : "<b><font color='#FFAA00'>[LOBBY]</font> <font color='#82CAFD'>Menunggu pemain & bot masuk match...</font></b>";
+                    if (weaponInfo != null) {
+                        subHtml += " <font color='#00E5FF'>[🔫 " + weaponInfo + "]</font>";
+                    }
                     subTitleRef.setText(Html.fromHtml(subHtml));
                 }
             }

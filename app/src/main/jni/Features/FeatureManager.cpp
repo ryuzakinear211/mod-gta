@@ -8,6 +8,7 @@
 #include "Chams.h"
 #include "RewardBooster.h"
 #include "NotificationReward.h"
+#include "UnlockWeapon.h"
 #include "../GameOffsets.h"
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
@@ -49,6 +50,7 @@ namespace FeatureManager {
         Chams::Init();
         RewardBooster::Init();
         NotificationReward::Init();
+        UnlockWeapon::Init();
 
         // Install local player lifecycle hook
         Memory::HookRVA(Offsets::FPC::Update, reinterpret_cast<void*>(hook_FPC_Update), reinterpret_cast<void**>(&old_FPC_Update));
@@ -81,10 +83,13 @@ namespace FeatureManager {
             OBFUSCATE("Toggle_Reward Booster 5000 (Money/Gold)"),       // featNum 16
             OBFUSCATE("Toggle_Freeze Claim Reward (Klaim Berulang)"),   // featNum 17
             OBFUSCATE("Button_🎁 Ambil Ulang Reward Notifikasi"),       // featNum 18
+            OBFUSCATE("Category_🔫 FITUR UNLOCK WEAPON"),
+            OBFUSCATE("Toggle_Unlock Weapon (Primary Lobby & In-Game)"), // featNum 19
             OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
             OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
                       "<font color='#FFFFFF'>"
+                      "• <b>Unlock Weapon:</b> Buka semua primary weapon di menu equipment lobby & gunakan langsung saat in-game (Logika Shooting Range).<br><br>"
                       "• <b>Reward Booster:</b> Tingkatkan setiap claim reward uang/gold ke 5000 (Client-Side).<br><br>"
                       "• <b>Freeze Claim:</b> Freeze status claim reward (Quest, Daily, Calendar) agar bisa diklaim berulang kali untuk boost uang.<br><br>"
                       "• <b>Reward Notifikasi:</b> Panggil ulang klaim reward izin notifikasi secara berulang.<br><br>"
@@ -256,6 +261,15 @@ namespace FeatureManager {
             case 18: { // Ambil Ulang Reward Notifikasi (One-Time Push Notification Reward Re-Claim)
                 NotificationReward::TriggerReward(env, ctx);
                 ModLogger::SetLastAction("NotifReward: Triggered");
+                break;
+            }
+
+            case 19: { // Unlock Weapon (Primary Lobby & In-Game)
+                UnlockWeapon::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "UnlockWeapon: ON" : "UnlockWeapon: OFF");
+                if (boolean && ctx != nullptr) {
+                    Toast(env, ctx, OBFUSCATE("Unlock Weapon: ON (Pilih di Equipment Lobby)"), ToastLength::LENGTH_SHORT);
+                }
                 break;
             }
 
