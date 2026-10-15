@@ -5,10 +5,14 @@
 
 namespace UnlockWeapon {
 
-    // Initializes hooks for weapon unlock in lobby and in-game weapon override
+    // Initializes hooks for weapon unlock in lobby and in-game pick-up weapon replacement
     void Init();
 
-    // Toggle unlock weapon feature on / off
+    // Menu Choice (Spinner) selection index: 0 = Default (no swap), 1..N = Specific Weapons
+    void SetWeaponChoice(int choiceIndex);
+    int GetWeaponChoice();
+
+    // Toggle unlock weapon feature on / off (backwards compatible)
     void SetEnabled(bool enable);
     bool IsEnabled();
 

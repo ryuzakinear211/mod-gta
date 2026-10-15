@@ -554,6 +554,43 @@ namespace Offsets {
         constexpr uintptr_t SimpleInventorySlot_SlotField       = 0x3C;      // EquipmentSlot _slot
         constexpr uintptr_t SimpleInventorySlot_TextNameField   = 0x48;      // Text _slotNameText
         constexpr uintptr_t BaseInventorySlot_ItemIdField       = 0x38;      // int ItemId
+
+        // ----------------------------------------------------------------------
+        // In-Game Weapon Pick-Up Swap (DropObject, DropManager, Inventory, TemplateProvider)
+        // ----------------------------------------------------------------------
+        // DropObject (dump.cs TypeDefIndex: 3145)
+        constexpr uintptr_t DropObject_OnPickup                 = 0x4EA50C8; // Slot 39: baabaabbbbbbbabaaaabbbbaabbbbaabbaabbbabbbbbabb(long userId) -> void
+        constexpr uintptr_t DropObject_GetItemId                = 0x4EA6360; // Slot 31: bbaaabbbbaaabbaaaababaababbbaabbaaababbbbaaabab() -> int
+        constexpr uintptr_t DropObject_DropDataField            = 0x90;      // babaabbbbbbaabaaabbababbabbbbaaabbbabbabbabaaab
+        constexpr uintptr_t DropObject_ContainerField           = 0x98;      // baabbbbabbaabaabaabbbbbbbaaababbbabbbaabbaaaabb (Weapon container)
+
+        // DropObject Weapon Container (dump.cs TypeDefIndex: 3152)
+        constexpr uintptr_t DropWeaponContainer_TemplateField   = 0x50;      // baaabaaabbaaaabbabbabbbaaabaabababaaabbaababbbb (WeaponTemplate)
+        constexpr uintptr_t DropWeaponContainer_ProfileField    = 0x60;      // WeaponProfile
+        constexpr uintptr_t DropWeaponContainer_GetItemId       = 0x51F6598; // Slot 19: bbaaabbbbaaabbaaaababaababbbaabbaaababbbbaaabab() -> int
+
+        // DropManager (dump.cs TypeDefIndex: 2646)
+        constexpr uintptr_t DropManager_OnPickup                = 0x4DBEB14; // baabababaaabbbbaabbbabbaaabaaaabbababaaaaababaa(Pickable, long userId)
+
+        // DropPickupHandler (dump.cs TypeDefIndex: 4795)
+        constexpr uintptr_t DropPickupHandler_PickupDropObj1    = 0x51C72E0; // aaabababaaaabaabaabbabaabbaaabbaabbbbaaabaaabba(DropObject, long)
+        constexpr uintptr_t DropPickupHandler_PickupDropObj2    = 0x51C7C5C; // aabaabbbbaabababbabaaaaaaabbbbababbababaabbbaab(DropObject, long)
+        constexpr uintptr_t DropPickupHandler_CanPickup         = 0x51C7178; // aaaaaababbabaababbbbbbabaaabbabbababbbbbbbbbaaa(drop, long) -> bool
+
+        // WeaponProfile (dump.cs TypeDefIndex: 10092)
+        constexpr uintptr_t WeaponProfile_ItemIdField           = 0x10;      // int ItemId / get_Key() (0x478D910)
+        constexpr uintptr_t WeaponProfile_WeaponIdField         = 0x38;      // ObscuredInt WeaponId
+
+        // TemplateProvider (dump.cs TypeDefIndex: 5465)
+        constexpr uintptr_t TemplateProvider_Ctor               = 0x531E8FC; // .ctor()
+        constexpr uintptr_t TemplateProvider_GetWeaponTemplate  = 0x531ECA4; // ababbaaaaabbaaabaaabbbbaaaababaabbbbbbaaabbbaba(int itemId) -> WeaponTemplate*
+
+        // InventoryBehaviour (dump.cs TypeDefIndex: 5225)
+        constexpr uintptr_t InventoryBehaviour_AddWeapon        = 0x52B6090; // abaaaaababbbbabbababaaaaaabaaababbaaabaabbabbaa(template, profile, slot, cb)
+        constexpr uintptr_t InventoryBehaviour_CreateWeapon     = 0x52B6568; // baababababababaaaaaabaaabbaabbbbaabbaaaaababbbb(profile, slot)
+
+        // FirstPersonController (Local Player Character Controller)
+        constexpr uintptr_t FPC_WieldWeapon                     = 0x4097C90; // aaaaaabbaabbbbbabaababababbababbbbaaaabbaaabaab(slot, template, profile, wield)
     }
 
 } // namespace Offsets

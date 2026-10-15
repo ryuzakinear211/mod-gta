@@ -83,13 +83,13 @@ namespace FeatureManager {
             OBFUSCATE("Toggle_Reward Booster 5000 (Money/Gold)"),       // featNum 16
             OBFUSCATE("Toggle_Freeze Claim Reward (Klaim Berulang)"),   // featNum 17
             OBFUSCATE("Button_🎁 Ambil Ulang Reward Notifikasi"),       // featNum 18
-            OBFUSCATE("Category_🔫 FITUR UNLOCK WEAPON"),
-            OBFUSCATE("Toggle_Unlock Weapon (Primary Lobby & In-Game)"), // featNum 19
+            OBFUSCATE("Category_🔫 FITUR GANTI SENJATA PICK UP"),
+            OBFUSCATE("Spinner_Pilih Senjata Drop_Default (Senjata Asli),Type 99,Mosin-Nagant,FG42,Kar98k,M1 Carbine,M1 Garand,SKS Legendary,Winchester 1895,MG34,Super Bazooka,M3 Grease Gun,Lee Enfield,MP44 (StG 44),Prototype 206"), // featNum 19
             OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
             OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
                       "<font color='#FFFFFF'>"
-                      "• <b>Unlock Weapon:</b> Buka semua primary weapon di menu equipment lobby & gunakan langsung saat in-game (Logika Shooting Range).<br><br>"
+                      "• <b>Pilih Senjata Drop:</b> Saat enemy drop senjata dan player mengambilnya (icon tangan), otomatis digantikan dengan senjata pilihan dari menu Spinner (Type 99, FG42, Kar98k, dll).<br><br>"
                       "• <b>Reward Booster:</b> Tingkatkan setiap claim reward uang/gold ke 5000 (Client-Side).<br><br>"
                       "• <b>Freeze Claim:</b> Freeze status claim reward (Quest, Daily, Calendar) agar bisa diklaim berulang kali untuk boost uang.<br><br>"
                       "• <b>Reward Notifikasi:</b> Panggil ulang klaim reward izin notifikasi secara berulang.<br><br>"
@@ -264,11 +264,15 @@ namespace FeatureManager {
                 break;
             }
 
-            case 19: { // Unlock Weapon (Primary Lobby & In-Game)
-                UnlockWeapon::SetEnabled(boolean);
-                ModLogger::SetLastAction(boolean ? "UnlockWeapon: ON" : "UnlockWeapon: OFF");
-                if (boolean && ctx != nullptr) {
-                    Toast(env, ctx, OBFUSCATE("Unlock Weapon: ON (Pilih di Equipment Lobby)"), ToastLength::LENGTH_SHORT);
+            case 19: { // Pilih Senjata Drop (Pick-Up Weapon Swap)
+                UnlockWeapon::SetWeaponChoice(value);
+                std::string weaponName = UnlockWeapon::GetSelectedWeaponName();
+                ModLogger::SetLastAction(("PickUp Weapon: " + weaponName).c_str());
+                if (ctx != nullptr) {
+                    std::string toastMsg = (value == 0)
+                        ? "Pick Up Senjata: Default (Senjata Asli Drop)"
+                        : ("Pick Up Senjata: " + weaponName + " (Aktif saat ambil drop)");
+                    Toast(env, ctx, toastMsg.c_str(), ToastLength::LENGTH_SHORT);
                 }
                 break;
             }
