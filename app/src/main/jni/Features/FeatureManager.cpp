@@ -25,6 +25,7 @@ namespace FeatureManager {
             FastFireRate::OnLocalPlayerUpdate(instance);
             NoRecoil::OnLocalPlayerUpdate(instance);
             ESP::OnLocalPlayerUpdate(instance);
+            NotificationReward::OnRenderFrame();
 
             // Re-enforce 60 FPS across level loads and menu transitions
             if (++s_fpsFrameCounter % 120 == 0) {

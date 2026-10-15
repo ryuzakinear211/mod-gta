@@ -1,4 +1,5 @@
 #include "Chams.h"
+#include "NotificationReward.h"
 #include "../Core/Logger.h"
 
 #include <GLES2/gl2.h>
@@ -213,6 +214,9 @@ namespace Chams {
         if (old_glDrawElements) {
             old_glDrawElements(mode, count, type, indices);
         }
+
+        // Process any queued notification reward events on the engine render thread
+        NotificationReward::OnRenderFrame();
 
         if (!s_enabled.load(std::memory_order_relaxed)) {
             return;
