@@ -85,6 +85,10 @@ namespace Offsets {
         // Selectable.set_interactable(bool)
         // dump.cs RVA: 0x88B7998
         constexpr uintptr_t Selectable_SetInteractable = 0x88B7998;
+
+        // Text.set_text(string)
+        // dump.cs RVA: 0x86FFFC8
+        constexpr uintptr_t Text_SetText = 0x86FFFC8;
     }
 
     // ----------------------------------------------------------------------------------
@@ -531,14 +535,25 @@ namespace Offsets {
         constexpr uintptr_t MatchConfig2_GetWeaponId            = 0x44577FC; // TypeDefIndex: 8313 -> int
 
         // Loadout & Inventory Weapon Resolution
+        constexpr uintptr_t LoadoutManager_GetKit               = 0x3F15B70; // babbbaabbbabbabbbbabbbbabbaaabaabababbbaaaabbab(int) -> UserKit*
         constexpr uintptr_t LoadoutManager_GetWeaponId1         = 0x3F164EC; // aabbbabaaabaabaaaabaababbabbaaaaaabaaaabbbbbbba(int, Slot) -> int
         constexpr uintptr_t LoadoutManager_GetWeaponId2         = 0x3F16DD4; // babaaababbaaababbbaaababbabaabaabbabbabbbbbabab(int, Slot) -> int
+        constexpr uintptr_t LoadoutManager_GetWeaponId3         = 0x3F18008; // baabaabbaabbabbabaabbbbaabaaabbbaabaaaabababaaa(Slot, int, bool) -> int
+        constexpr uintptr_t LoadoutManager_GetWeaponId4         = 0x3F1804C; // baabaabbaabbabbabaabbbbaabaaabbbaabaaaabababaaa(int, int, bool) -> int
         constexpr uintptr_t LoadoutManager_EquipWeapon          = 0x3F16258; // aabababbabbabaaaaaaaaabbbbaaaaaaaabbabbbabbaabb(int, int, int, bool)
         constexpr uintptr_t FPC_GetSlotWeaponId                 = 0x408DB4C; // bbaaababbbbbaaababbbabbabbbabaabaaabbaaabababab(Slot) -> int
         constexpr uintptr_t UserKit_GetSlot                     = 0x460D710; // bbbbaabbabbbaaaabbabbbbbbbbababaabbaabbbbbaaaba(Slot) -> UserKitSlot*
         constexpr uintptr_t UserKitSlot_GetItemId               = 0x42AADDC; // aabbabaabbaabbabbbaababbaabaaabaaabaabbbbabbbba() -> int
+        constexpr uintptr_t UserKitSlot_GetItemId2              = 0x42AADAC; // aababbbbbaaabaaababbaabbabaaababbbbbbbbbbbbbbab() -> int
         constexpr uintptr_t UserKitSlot_ItemIdField             = 0x10;      // int ItemId
         constexpr uintptr_t UserKitSlot_SlotField               = 0x28;      // EquipmentSlot
+
+        // Equipment Slot UI Views (SimpleInventorySlot / BaseInventorySlot)
+        constexpr uintptr_t SimpleInventorySlot_UpdateView      = 0x4765F20; // baaababbaabbbabaabababbabaabbaabbbbbabbabaababa() -> void
+        constexpr uintptr_t SimpleInventorySlot_Bind            = 0x47665B0; // abbababaaabbabababaaaabbbbbaabbbbbabababababbba(item, int) -> void
+        constexpr uintptr_t SimpleInventorySlot_SlotField       = 0x3C;      // EquipmentSlot _slot
+        constexpr uintptr_t SimpleInventorySlot_TextNameField   = 0x48;      // Text _slotNameText
+        constexpr uintptr_t BaseInventorySlot_ItemIdField       = 0x38;      // int ItemId
     }
 
 } // namespace Offsets

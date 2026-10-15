@@ -4,6 +4,7 @@
 #include "../Core/Logger.h"
 #include "../Includes/obfuscate.h"
 
+#include <dlfcn.h>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -28,6 +29,27 @@ namespace UnlockWeapon {
             Memory::GetRVA(Offsets::Unity::GameObject_SetActive)
         );
         if (pfnSetActive) pfnSetActive(go, active);
+    }
+
+    // Il2Cpp runtime exports
+    typedef void* (*il2cpp_string_new_t)(const char *str);
+    static il2cpp_string_new_t s_pfnStringNew = nullptr;
+
+    static void SetUnityText(void *textComponent, const char *str) {
+        if (!Memory::IsValidPtr(textComponent) || !str) return;
+        if (!s_pfnStringNew) {
+            void *hLib = dlopen(Offsets::TargetLib::Name, RTLD_NOLOAD);
+            if (hLib) {
+                s_pfnStringNew = reinterpret_cast<il2cpp_string_new_t>(dlsym(hLib, "il2cpp_string_new"));
+            }
+        }
+        if (!s_pfnStringNew) return;
+        void *managedStr = s_pfnStringNew(str);
+        if (!managedStr) return;
+        static auto pfnSetText = reinterpret_cast<void (*)(void*, void*)>(
+            Memory::GetRVA(Offsets::Unity::Text_SetText)
+        );
+        if (pfnSetText) pfnSetText(textComponent, managedStr);
     }
 
     // Read IL2CPP managed string (UTF-16) safely into std::string
@@ -139,9 +161,19 @@ namespace UnlockWeapon {
     static int  (*old_MatchConfig2_GetWeaponId)(void *instance) = nullptr;
     static int  (*old_LoadoutManager_GetWeaponId1)(void *instance, int kitIndex, int slot) = nullptr;
     static int  (*old_LoadoutManager_GetWeaponId2)(void *instance, int kitIndex, int slot) = nullptr;
+    static int  (*old_LoadoutManager_GetWeaponId3)(void *instance, int slot, int kitIndex, bool unk) = nullptr;
+    static int  (*old_LoadoutManager_GetWeaponId4)(void *instance, int slot, int kitIndex, bool unk) = nullptr;
+    static void*(*old_LoadoutManager_GetKit)(void *instance, int kitIndex) = nullptr;
+    static void (*old_LoadoutManager_EquipWeapon)(void *instance, int itemId, int slot, int kitIndex, bool sendToServer) = nullptr;
+
     static int  (*old_FPC_GetSlotWeaponId)(void *instance, int slot) = nullptr;
     static void*(*old_UserKit_GetSlot)(void *instance, int slot) = nullptr;
     static int  (*old_UserKitSlot_GetItemId)(void *instance) = nullptr;
+    static int  (*old_UserKitSlot_GetItemId2)(void *instance) = nullptr;
+
+    // Equipment Slot UI View Hooks
+    static void (*old_SimpleInventorySlot_UpdateView)(void *instance) = nullptr;
+    static void (*old_SimpleInventorySlot_Bind)(void *instance, void *item, int kitIndex) = nullptr;
 
     // -------------------------------------------------------------------------
     // Hook Implementations
@@ -289,7 +321,62 @@ namespace UnlockWeapon {
         return old_LoadoutManager_GetWeaponId2 ? old_LoadoutManager_GetWeaponId2(instance, kitIndex, slot) : 0;
     }
 
-    // 18. FirstPersonController::GetSlotWeaponId (RVA: 0x408DB4C)
+    // 18. LoadoutManager::GetWeaponId3 (RVA: 0x3F18008)
+    static int hook_LoadoutManager_GetWeaponId3(void *instance, int slot, int kitIndex, bool unk) {
+        int targetId = s_selectedWeaponId.load();
+        if (s_enabled.load() && slot == Offsets::UnlockWeapon::EquipmentSlot::Primary && targetId > 0) {
+            return targetId;
+        }
+        return old_LoadoutManager_GetWeaponId3 ? old_LoadoutManager_GetWeaponId3(instance, slot, kitIndex, unk) : 0;
+    }
+
+    // 19. LoadoutManager::GetWeaponId4 (RVA: 0x3F1804C)
+    static int hook_LoadoutManager_GetWeaponId4(void *instance, int slot, int kitIndex, bool unk) {
+        int targetId = s_selectedWeaponId.load();
+        if (s_enabled.load() && slot == Offsets::UnlockWeapon::EquipmentSlot::Primary && targetId > 0) {
+            return targetId;
+        }
+        return old_LoadoutManager_GetWeaponId4 ? old_LoadoutManager_GetWeaponId4(instance, slot, kitIndex, unk) : 0;
+    }
+
+    // 20. LoadoutManager::GetKit (RVA: 0x3F15B70)
+    // Ensures the UserKit slot 0 always contains the unlocked weapon ID
+    static void* hook_UserLoadoutManager_GetKit(void *instance, int kitIndex) {
+        void *userKit = old_LoadoutManager_GetKit ? old_LoadoutManager_GetKit(instance, kitIndex) : nullptr;
+        if (s_enabled.load() && userKit && Memory::IsValidPtr(userKit)) {
+            int targetId = s_selectedWeaponId.load();
+            if (targetId > 0) {
+                static auto pfnGetSlot = reinterpret_cast<void* (*)(void*, int)>(
+                    Memory::GetRVA(Offsets::UnlockWeapon::UserKit_GetSlot)
+                );
+                if (pfnGetSlot) {
+                    void *slotObj = pfnGetSlot(userKit, Offsets::UnlockWeapon::EquipmentSlot::Primary);
+                    if (slotObj && Memory::IsValidPtr(slotObj)) {
+                        Memory::WriteField<int>(slotObj, Offsets::UnlockWeapon::UserKitSlot_ItemIdField, targetId);
+                    }
+                }
+            }
+        }
+        return userKit;
+    }
+
+    // 21. LoadoutManager::EquipWeapon (RVA: 0x3F16258)
+    // Enforces client-sided equip without sending rejection RPC to server
+    static void hook_LoadoutManager_EquipWeapon(void *instance, int itemId, int slot, int kitIndex, bool sendToServer) {
+        if (s_enabled.load() && slot == Offsets::UnlockWeapon::EquipmentSlot::Primary) {
+            s_selectedWeaponId.store(itemId);
+            LOG_INFO("[UNLOCK_WEAPON] Intercepted EquipWeapon Primary: ID %d, kitIndex %d (forcing client-side equip)", itemId, kitIndex);
+            if (old_LoadoutManager_EquipWeapon) {
+                old_LoadoutManager_EquipWeapon(instance, itemId, slot, kitIndex, false);
+            }
+            return;
+        }
+        if (old_LoadoutManager_EquipWeapon) {
+            old_LoadoutManager_EquipWeapon(instance, itemId, slot, kitIndex, sendToServer);
+        }
+    }
+
+    // 22. FirstPersonController::GetSlotWeaponId (RVA: 0x408DB4C)
     // In-game local player weapon ID query for Primary Weapon Slot (0)
     static int hook_FPC_GetSlotWeaponId(void *instance, int slot) {
         int targetId = s_selectedWeaponId.load();
@@ -299,7 +386,7 @@ namespace UnlockWeapon {
         return old_FPC_GetSlotWeaponId ? old_FPC_GetSlotWeaponId(instance, slot) : 0;
     }
 
-    // 19. UserKit::GetSlot (RVA: 0x460D710)
+    // 23. UserKit::GetSlot (RVA: 0x460D710)
     // Overrides UserKitSlot ItemId field (0x10) when primary weapon is queried
     static void* hook_UserKit_GetSlot(void *instance, int slot) {
         void *slotObj = old_UserKit_GetSlot ? old_UserKit_GetSlot(instance, slot) : nullptr;
@@ -312,8 +399,7 @@ namespace UnlockWeapon {
         return slotObj;
     }
 
-    // 20. UserKitSlot::GetItemId (RVA: 0x42AADDC)
-    // Property getter on UserKitSlot
+    // 24. UserKitSlot::GetItemId (RVA: 0x42AADDC)
     static int hook_UserKitSlot_GetItemId(void *instance) {
         int targetId = s_selectedWeaponId.load();
         if (s_enabled.load() && targetId > 0 && instance && Memory::IsValidPtr(instance)) {
@@ -323,6 +409,65 @@ namespace UnlockWeapon {
             }
         }
         return old_UserKitSlot_GetItemId ? old_UserKitSlot_GetItemId(instance) : 0;
+    }
+
+    // 25. UserKitSlot::GetItemId2 (RVA: 0x42AADAC)
+    static int hook_UserKitSlot_GetItemId2(void *instance) {
+        int targetId = s_selectedWeaponId.load();
+        if (s_enabled.load() && targetId > 0 && instance && Memory::IsValidPtr(instance)) {
+            int slotType = Memory::ReadField<int>(instance, Offsets::UnlockWeapon::UserKitSlot_SlotField);
+            if (slotType == Offsets::UnlockWeapon::EquipmentSlot::Primary) {
+                return targetId;
+            }
+        }
+        return old_UserKitSlot_GetItemId2 ? old_UserKitSlot_GetItemId2(instance) : 0;
+    }
+
+    // 26. SimpleInventorySlot::UpdateView (RVA: 0x4765F20)
+    // Forces the equipment UI card to display the unlocked weapon name and ItemId
+    static void hook_SimpleInventorySlot_UpdateView(void *instance) {
+        if (old_SimpleInventorySlot_UpdateView) {
+            old_SimpleInventorySlot_UpdateView(instance);
+        }
+        if (s_enabled.load() && instance && Memory::IsValidPtr(instance)) {
+            int slot = Memory::ReadField<int>(instance, Offsets::UnlockWeapon::SimpleInventorySlot_SlotField);
+            if (slot == Offsets::UnlockWeapon::EquipmentSlot::Primary) {
+                int targetId = s_selectedWeaponId.load();
+                if (targetId > 0) {
+                    Memory::WriteField<int>(instance, Offsets::UnlockWeapon::BaseInventorySlot_ItemIdField, targetId);
+                    void *nameText = Memory::ReadField<void*>(instance, Offsets::UnlockWeapon::SimpleInventorySlot_TextNameField);
+                    if (nameText && Memory::IsValidPtr(nameText)) {
+                        std::string weaponName = GetSelectedWeaponName();
+                        if (!weaponName.empty()) {
+                            SetUnityText(nameText, weaponName.c_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 27. SimpleInventorySlot::Bind (RVA: 0x47665B0)
+    static void hook_SimpleInventorySlot_Bind(void *instance, void *item, int kitIndex) {
+        if (old_SimpleInventorySlot_Bind) {
+            old_SimpleInventorySlot_Bind(instance, item, kitIndex);
+        }
+        if (s_enabled.load() && instance && Memory::IsValidPtr(instance)) {
+            int slot = Memory::ReadField<int>(instance, Offsets::UnlockWeapon::SimpleInventorySlot_SlotField);
+            if (slot == Offsets::UnlockWeapon::EquipmentSlot::Primary) {
+                int targetId = s_selectedWeaponId.load();
+                if (targetId > 0) {
+                    Memory::WriteField<int>(instance, Offsets::UnlockWeapon::BaseInventorySlot_ItemIdField, targetId);
+                    void *nameText = Memory::ReadField<void*>(instance, Offsets::UnlockWeapon::SimpleInventorySlot_TextNameField);
+                    if (nameText && Memory::IsValidPtr(nameText)) {
+                        std::string weaponName = GetSelectedWeaponName();
+                        if (!weaponName.empty()) {
+                            SetUnityText(nameText, weaponName.c_str());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -403,6 +548,22 @@ namespace UnlockWeapon {
                         reinterpret_cast<void*>(hook_LoadoutManager_GetWeaponId2),
                         reinterpret_cast<void**>(&old_LoadoutManager_GetWeaponId2));
 
+        Memory::HookRVA(Offsets::UnlockWeapon::LoadoutManager_GetWeaponId3,
+                        reinterpret_cast<void*>(hook_LoadoutManager_GetWeaponId3),
+                        reinterpret_cast<void**>(&old_LoadoutManager_GetWeaponId3));
+
+        Memory::HookRVA(Offsets::UnlockWeapon::LoadoutManager_GetWeaponId4,
+                        reinterpret_cast<void*>(hook_LoadoutManager_GetWeaponId4),
+                        reinterpret_cast<void**>(&old_LoadoutManager_GetWeaponId4));
+
+        Memory::HookRVA(Offsets::UnlockWeapon::LoadoutManager_GetKit,
+                        reinterpret_cast<void*>(hook_UserLoadoutManager_GetKit),
+                        reinterpret_cast<void**>(&old_LoadoutManager_GetKit));
+
+        Memory::HookRVA(Offsets::UnlockWeapon::LoadoutManager_EquipWeapon,
+                        reinterpret_cast<void*>(hook_LoadoutManager_EquipWeapon),
+                        reinterpret_cast<void**>(&old_LoadoutManager_EquipWeapon));
+
         Memory::HookRVA(Offsets::UnlockWeapon::FPC_GetSlotWeaponId,
                         reinterpret_cast<void*>(hook_FPC_GetSlotWeaponId),
                         reinterpret_cast<void**>(&old_FPC_GetSlotWeaponId));
@@ -414,6 +575,19 @@ namespace UnlockWeapon {
         Memory::HookRVA(Offsets::UnlockWeapon::UserKitSlot_GetItemId,
                         reinterpret_cast<void*>(hook_UserKitSlot_GetItemId),
                         reinterpret_cast<void**>(&old_UserKitSlot_GetItemId));
+
+        Memory::HookRVA(Offsets::UnlockWeapon::UserKitSlot_GetItemId2,
+                        reinterpret_cast<void*>(hook_UserKitSlot_GetItemId2),
+                        reinterpret_cast<void**>(&old_UserKitSlot_GetItemId2));
+
+        // 4. Hook Equipment Slot UI Views
+        Memory::HookRVA(Offsets::UnlockWeapon::SimpleInventorySlot_UpdateView,
+                        reinterpret_cast<void*>(hook_SimpleInventorySlot_UpdateView),
+                        reinterpret_cast<void**>(&old_SimpleInventorySlot_UpdateView));
+
+        Memory::HookRVA(Offsets::UnlockWeapon::SimpleInventorySlot_Bind,
+                        reinterpret_cast<void*>(hook_SimpleInventorySlot_Bind),
+                        reinterpret_cast<void**>(&old_SimpleInventorySlot_Bind));
 
         LOG_INFO("[UNLOCK_WEAPON] All Unlock Weapon hooks installed successfully.");
     }
