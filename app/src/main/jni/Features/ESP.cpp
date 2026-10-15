@@ -49,6 +49,9 @@ namespace ESP {
     static Vector3 (*Camera_WorldToScreenPoint)(void *, Vector3) = nullptr;
     static void*   (*GetBoneTransform)(void *, int) = nullptr;
     static bool    (*Behaviour_get_isActiveAndEnabled)(void *) = nullptr;
+    static bool    (*TargetibleCustomSettings_get_IsAutoAimAllowed)(void *) = nullptr;
+    static bool    (*TargetibleCustomSettings_get_AllyObjectToogle)(void *) = nullptr;
+    static int     (*BotPlayer_GetTeam)(void *) = nullptr;
 
     static inline uint64_t GetCurrentTimeMs() {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -73,38 +76,21 @@ namespace ESP {
     static int GetBotTeam(void *botPlayer) {
         if (!botPlayer || !Memory::IsValidPtr(botPlayer)) return -1;
 
-        // 1. Direct team backing field at 0xE0 (<abbabaabbabbaabaaaabbbaababbaaaabaabbbaabbbaaaa>k__BackingField)
+        // 1. Native method getter call if resolved
+        if (BotPlayer_GetTeam) {
+            int t = BotPlayer_GetTeam(botPlayer);
+            if (t == 0 || t == 1) return t;
+        }
+
+        // 2. Direct team backing field at 0xE0 (<abbabaabbabbaabaaaabbbaababbaaaabaabbbaabbbaaaa>k__BackingField)
         int t0 = Memory::ReadField<int>(botPlayer, 0xE0);
         if (t0 == 0 || t0 == 1) return t0;
 
-        // 2. Direct NetworkPlayer at 0x50 -> TargetInfo at 0xC0 -> team at 0x30
-        void *netPlayer = Memory::ReadField<void*>(botPlayer, Offsets::BotPlayer::NetPlayer);
-        if (netPlayer && Memory::IsValidPtr(netPlayer)) {
-            void *targetInfo = Memory::ReadField<void*>(netPlayer, Offsets::NetworkPlayer::TargetInfo);
-            if (targetInfo && Memory::IsValidPtr(targetInfo)) {
-                int tNet = Memory::ReadField<int>(targetInfo, 0x30);
-                if (tNet == 0 || tNet == 1) return tNet;
-            }
-        }
-
-        // 3. TargetibleObject at 0x60 -> NetworkPlayer at 0xD8 -> TargetInfo at 0xC0 -> team at 0x30
-        void *tObj = Memory::ReadField<void*>(botPlayer, Offsets::BotPlayer::TargetibleObject);
-        if (tObj && Memory::IsValidPtr(tObj)) {
-            void *netPlayer2 = Memory::ReadField<void*>(tObj, 0xD8);
-            if (netPlayer2 && Memory::IsValidPtr(netPlayer2)) {
-                void *targetInfo2 = Memory::ReadField<void*>(netPlayer2, Offsets::NetworkPlayer::TargetInfo);
-                if (targetInfo2 && Memory::IsValidPtr(targetInfo2)) {
-                    int tNet2 = Memory::ReadField<int>(targetInfo2, 0x30);
-                    if (tNet2 == 0 || tNet2 == 1) return tNet2;
-                }
-            }
-        }
-
-        // 4. Secondary team field at 0xE4
+        // 3. Secondary team field at 0xE4
         int t1 = Memory::ReadField<int>(botPlayer, 0xE4);
         if (t1 == 0 || t1 == 1) return t1;
 
-        // 5. PlayerSpawnPoint at 0xB0 -> _team at 0x38
+        // 4. PlayerSpawnPoint at 0xB0 -> _team at 0x38
         void *spawnPoint = Memory::ReadField<void*>(botPlayer, 0xB0);
         if (spawnPoint && Memory::IsValidPtr(spawnPoint)) {
             int t2 = Memory::ReadField<int>(spawnPoint, 0x38);
@@ -114,79 +100,46 @@ namespace ESP {
         return -1;
     }
 
-    // Helper: Check if a bot has explicit ally flags set
-    static bool IsBotAllyFlag(void *botPlayer) {
-        if (!botPlayer || !Memory::IsValidPtr(botPlayer)) return false;
+    // Helper: Check if an entity's CustomSettings designates it as an ally or enemy
+    // Returns:
+    //  1: Confirmed Enemy (Auto-aim allowed)
+    // -1: Confirmed Ally (Ally toggle active)
+    //  0: Inconclusive
+    static int CheckCustomSettingsAffiliation(void *tObj) {
+        if (!tObj || !Memory::IsValidPtr(tObj)) return 0;
+        void *customSettings = Memory::ReadField<void*>(tObj, Offsets::Targetible::CustomSettings);
+        if (!customSettings || !Memory::IsValidPtr(customSettings)) return 0;
 
-        // 1. Direct NetworkPlayer at 0x50 -> TargetInfo at 0xC0 -> bool isAlly at 0x34
-        void *netPlayer = Memory::ReadField<void*>(botPlayer, Offsets::BotPlayer::NetPlayer);
-        if (netPlayer && Memory::IsValidPtr(netPlayer)) {
-            void *targetInfo = Memory::ReadField<void*>(netPlayer, Offsets::NetworkPlayer::TargetInfo);
-            if (targetInfo && Memory::IsValidPtr(targetInfo)) {
-                if (Memory::ReadField<bool>(targetInfo, 0x34)) return true;
-            }
+        bool isAutoAim = false;
+        if (TargetibleCustomSettings_get_IsAutoAimAllowed) {
+            isAutoAim = TargetibleCustomSettings_get_IsAutoAimAllowed(customSettings);
         }
 
-        // 2. TargetibleObject at 0x60 -> NetworkPlayer at 0xD8 -> TargetInfo at 0xC0 -> bool isAlly at 0x34
-        void *tObj = Memory::ReadField<void*>(botPlayer, Offsets::BotPlayer::TargetibleObject);
-        if (tObj && Memory::IsValidPtr(tObj)) {
-            void *netPlayer2 = Memory::ReadField<void*>(tObj, 0xD8);
-            if (netPlayer2 && Memory::IsValidPtr(netPlayer2)) {
-                void *targetInfo2 = Memory::ReadField<void*>(netPlayer2, Offsets::NetworkPlayer::TargetInfo);
-                if (targetInfo2 && Memory::IsValidPtr(targetInfo2)) {
-                    if (Memory::ReadField<bool>(targetInfo2, 0x34)) return true;
-                }
-            }
-
-            // 3. TargetibleObject at 0x60 -> CustomSettings at 0x90 -> bool AllyObjectToogle at 0x20
-            void *customSettings = Memory::ReadField<void*>(tObj, Offsets::Targetible::CustomSettings);
-            if (customSettings && Memory::IsValidPtr(customSettings)) {
-                if (Memory::ReadField<bool>(customSettings, Offsets::CustomSettings::IsAllyToggle)) {
-                    return true;
-                }
-            }
+        bool isAlly = false;
+        if (TargetibleCustomSettings_get_AllyObjectToogle) {
+            isAlly = TargetibleCustomSettings_get_AllyObjectToogle(customSettings);
+        } else {
+            isAlly = Memory::ReadField<bool>(customSettings, Offsets::CustomSettings::IsAllyToggle);
         }
 
-        return false;
+        if (isAutoAim && !isAlly) {
+            return 1; // Confirmed Enemy!
+        }
+        if (isAlly && !isAutoAim) {
+            return -1; // Confirmed Ally/Teammate!
+        }
+        if (isAlly) {
+            return -1; // Ally Toggle on
+        }
+
+        return 0;
     }
 
     // Helper: Resolve local player's team (-1 if unresolved, 0 for TeamA, 1 for TeamB)
     static int ResolveLocalPlayerTeam(void *localFpc) {
         int current = s_localPlayerTeam.load(std::memory_order_relaxed);
         if (current == 0 || current == 1) return current;
-
-        if (localFpc && Memory::IsValidPtr(localFpc)) {
-            // 1. localFpc -> TargetibleObject at 0x120 -> NetworkPlayer at 0xD8 -> TargetInfo at 0xC0 -> team at 0x30
-            void *tObj = Memory::ReadField<void*>(localFpc, Offsets::FPC::TargetibleObject);
-            if (tObj && Memory::IsValidPtr(tObj)) {
-                void *netPlayer = Memory::ReadField<void*>(tObj, 0xD8);
-                if (netPlayer && Memory::IsValidPtr(netPlayer)) {
-                    void *targetInfo = Memory::ReadField<void*>(netPlayer, Offsets::NetworkPlayer::TargetInfo);
-                    if (targetInfo && Memory::IsValidPtr(targetInfo)) {
-                        int teamVal = Memory::ReadField<int>(targetInfo, 0x30);
-                        if (teamVal == 0 || teamVal == 1) {
-                            s_localPlayerTeam.store(teamVal, std::memory_order_relaxed);
-                            return teamVal;
-                        }
-                    }
-                }
-            }
-
-            // 2. localFpc -> NetworkPlayer at 0x1F0 -> TargetInfo at 0xC0 -> team at 0x30
-            void *netPlayer2 = Memory::ReadField<void*>(localFpc, 0x1F0);
-            if (netPlayer2 && Memory::IsValidPtr(netPlayer2)) {
-                void *targetInfo2 = Memory::ReadField<void*>(netPlayer2, Offsets::NetworkPlayer::TargetInfo);
-                if (targetInfo2 && Memory::IsValidPtr(targetInfo2)) {
-                    int teamVal2 = Memory::ReadField<int>(targetInfo2, 0x30);
-                    if (teamVal2 == 0 || teamVal2 == 1) {
-                        s_localPlayerTeam.store(teamVal2, std::memory_order_relaxed);
-                        return teamVal2;
-                    }
-                }
-            }
-        }
-
-        return -1;
+        return current;
     }
 
     // Classify entity affiliation:
@@ -201,61 +154,57 @@ namespace ESP {
         if (localFpc && entityObj == localFpc) return -1;
 
         if (isBot) {
-            // 2. Check direct ally flag on bot
-            if (IsBotAllyFlag(entityObj)) {
-                int bTeam = GetBotTeam(entityObj);
-                if (bTeam == 0 || bTeam == 1) {
-                    s_localPlayerTeam.store(bTeam, std::memory_order_relaxed);
+            // Check TargetibleObject on the BotPlayer
+            void *tObj = Memory::ReadField<void*>(entityObj, Offsets::BotPlayer::TargetibleObject);
+            int settingAffil = CheckCustomSettingsAffiliation(tObj);
+            int botTeam = GetBotTeam(entityObj);
+
+            if (settingAffil == 1) {
+                // Confirmed enemy! Local player team is the opposing team
+                if (botTeam == 0 || botTeam == 1) {
+                    s_localPlayerTeam.store(1 - botTeam, std::memory_order_relaxed);
+                }
+                return 1; // Enemy!
+            } else if (settingAffil == -1) {
+                // Confirmed teammate! Local player team is the same team
+                if (botTeam == 0 || botTeam == 1) {
+                    s_localPlayerTeam.store(botTeam, std::memory_order_relaxed);
                 }
                 return -1; // Teammate!
             }
 
-            int botTeam = GetBotTeam(entityObj);
+            // Fallback: If CustomSettings was inconclusive, use team enum comparison
             int myTeam = s_localPlayerTeam.load(std::memory_order_relaxed);
             if (myTeam < 0) {
                 myTeam = ResolveLocalPlayerTeam(localFpc);
             }
-            if (myTeam < 0) {
-                // Default local player team to 0 (Team A)
-                myTeam = 0;
-            }
 
-            if (botTeam >= 0) {
-                // If bot is on same team as local player -> Teammate (-1)
-                // If bot is on opposing team -> Enemy (+1)
+            if ((botTeam == 0 || botTeam == 1) && (myTeam == 0 || myTeam == 1)) {
                 return (botTeam == myTeam) ? -1 : 1;
             }
 
-            // Fallback: Check TargetibleObject & CustomSettings
-            void *tObj = Memory::ReadField<void*>(entityObj, Offsets::BotPlayer::TargetibleObject);
-            if (tObj && IsUnityObjectAlive(tObj)) {
-                void *customSettings = Memory::ReadField<void*>(tObj, Offsets::Targetible::CustomSettings);
-                if (customSettings && Memory::IsValidPtr(customSettings)) {
-                    bool isAlly = *reinterpret_cast<const bool*>(
-                        reinterpret_cast<uintptr_t>(customSettings) + Offsets::CustomSettings::IsAllyToggle
-                    );
-                    if (isAlly) return -1;
-                }
-            }
-
-            // Default for bots if inconclusive: Enemy (+1)
+            // Inconclusive fallback for bots: Enemy
             return 1;
         } else {
             // NetworkPlayer (Human Player)
-            void *targetInfo = Memory::ReadField<void*>(entityObj, Offsets::NetworkPlayer::TargetInfo);
-            if (targetInfo && Memory::IsValidPtr(targetInfo)) {
-                bool isAlly = Memory::ReadField<bool>(targetInfo, 0x34);
-                if (isAlly) return -1;
+            void *netObj = entityObj;
+            if (netPlayer && Memory::IsValidPtr(netPlayer)) {
+                netObj = netPlayer;
+            }
 
+            int myTeam = s_localPlayerTeam.load(std::memory_order_relaxed);
+            if (myTeam < 0) {
+                myTeam = ResolveLocalPlayerTeam(localFpc);
+            }
+
+            void *targetInfo = Memory::ReadField<void*>(netObj, Offsets::NetworkPlayer::TargetInfo);
+            if (targetInfo && Memory::IsValidPtr(targetInfo)) {
                 int teamVal = Memory::ReadField<int>(targetInfo, 0x30);
-                int myTeam = s_localPlayerTeam.load(std::memory_order_relaxed);
-                if (myTeam < 0) {
-                    myTeam = ResolveLocalPlayerTeam(localFpc);
-                }
-                if (myTeam >= 0 && (teamVal == 0 || teamVal == 1)) {
+                if ((teamVal == 0 || teamVal == 1) && (myTeam == 0 || myTeam == 1)) {
                     return (teamVal == myTeam) ? -1 : 1;
                 }
             }
+
             return 1;
         }
     }
@@ -278,7 +227,7 @@ namespace ESP {
             return;
         }
 
-        // Calibrate local player team if uncalibrated using FPC or scanning bot ally flags
+        // Calibrate local player team if uncalibrated by scanning bots with confirmed settings
         if (s_localPlayerTeam.load(std::memory_order_relaxed) < 0) {
             void *localFpc = s_localPlayerFPC.load(std::memory_order_relaxed);
             ResolveLocalPlayerTeam(localFpc);
@@ -286,20 +235,22 @@ namespace ESP {
             if (s_localPlayerTeam.load(std::memory_order_relaxed) < 0) {
                 for (const auto &item : entities) {
                     if (item.isBot && item.object && Memory::IsValidPtr(item.object)) {
-                        if (IsBotAllyFlag(item.object)) {
-                            int allyTeam = GetBotTeam(item.object);
-                            if (allyTeam == 0 || allyTeam == 1) {
-                                s_localPlayerTeam.store(allyTeam, std::memory_order_relaxed);
+                        void *tObj = Memory::ReadField<void*>(item.object, Offsets::BotPlayer::TargetibleObject);
+                        int affil = CheckCustomSettingsAffiliation(tObj);
+                        int bTeam = GetBotTeam(item.object);
+                        if (bTeam == 0 || bTeam == 1) {
+                            if (affil == 1) {
+                                // Confirmed enemy! Local player team is the opposing team
+                                s_localPlayerTeam.store(1 - bTeam, std::memory_order_relaxed);
+                                break;
+                            } else if (affil == -1) {
+                                // Confirmed teammate! Local player team is this team
+                                s_localPlayerTeam.store(bTeam, std::memory_order_relaxed);
                                 break;
                             }
                         }
                     }
                 }
-            }
-
-            // Default to Team A (0) if still unresolved
-            if (s_localPlayerTeam.load(std::memory_order_relaxed) < 0) {
-                s_localPlayerTeam.store(0, std::memory_order_relaxed);
             }
         }
 
@@ -516,6 +467,11 @@ namespace ESP {
         Camera_WorldToScreenPoint = reinterpret_cast<Vector3(*)(void*, Vector3)>(Memory::GetRVA(Offsets::Unity::CameraWorldToScreenPoint));
         GetBoneTransform = reinterpret_cast<void*(*)(void*, int)>(Memory::GetRVA(Offsets::Unity::GetBoneTransform));
         Behaviour_get_isActiveAndEnabled = reinterpret_cast<bool(*)(void*)>(Memory::GetRVA(Offsets::Unity::BehaviourGetIsActive));
+
+        // Resolve TargetibleCustomSettings & BotPlayer team functions from dump.cs
+        TargetibleCustomSettings_get_IsAutoAimAllowed = reinterpret_cast<bool(*)(void*)>(Memory::GetRVA(Offsets::CustomSettings::GetIsAutoAimAllowed));
+        TargetibleCustomSettings_get_AllyObjectToogle = reinterpret_cast<bool(*)(void*)>(Memory::GetRVA(Offsets::CustomSettings::GetAllyObjectToggle));
+        BotPlayer_GetTeam = reinterpret_cast<int(*)(void*)>(Memory::GetRVA(Offsets::BotPlayer::GetTeam));
 
         // Hook AimingControl.Update
         Memory::HookRVA(Offsets::AimingControl::Update, reinterpret_cast<void*>(hook_AimingControl_Update), reinterpret_cast<void**>(&old_AimingControl_Update));

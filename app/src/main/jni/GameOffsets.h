@@ -166,6 +166,7 @@ namespace Offsets {
         constexpr uintptr_t Start                   = 0x44493F4; // BotPlayer.Start()
         constexpr uintptr_t Update                  = 0x444A310; // BotPlayer.Update()
         constexpr uintptr_t OnDestroy               = 0x4449EB0; // BotPlayer.OnDestroy()
+        constexpr uintptr_t GetTeam                 = 0x4449610; // BotPlayer.GetTeam() -> int (0 = TeamA, 1 = TeamB)
 
         // Fields (Offsets)
         constexpr uintptr_t BotLook                 = 0x28;      // BotPlayerLook pointer (Head Look Bone at +0x28)
@@ -187,6 +188,11 @@ namespace Offsets {
     }
 
     namespace CustomSettings {
+        // Methods (RVAs)
+        constexpr uintptr_t GetIsAutoAimAllowed     = 0x4DED124; // TargetibleObjectCustomSettings.get_IsAutoAimAllowed() -> bool
+        constexpr uintptr_t GetAllyObjectToggle     = 0x4DED164; // TargetibleObjectCustomSettings.get_AllyObjectToogle() -> bool
+
+        // Fields (Offsets)
         constexpr uintptr_t IsAllyToggle            = 0x20;      // bool AllyObjectToogle
         constexpr uintptr_t EnemyData               = 0x28;      // TargetibleObjectCustomSettingsData*
         constexpr uintptr_t AllyData                = 0x30;      // TargetibleObjectCustomSettingsData*
