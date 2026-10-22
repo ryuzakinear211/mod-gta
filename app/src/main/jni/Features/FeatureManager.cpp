@@ -82,13 +82,12 @@ namespace FeatureManager {
 
     static void hook_FPC_Update(void *instance) {
         if (instance) {
-            // Ketika player baru spawn atau match baru dimulai: bersihkan cache match sebelumnya
+            // Ketika player baru spawn / respawn: update instance dan bersihkan cache render Chams
             if (instance != s_lastFpcInstance) {
                 s_lastFpcInstance = instance;
                 Chams::ClearProgramCache();
                 Chams::ClearTeammatePositions();
                 Chams::ClearVehiclePositions();
-                StatusPanel::OnMatchFinished();
             }
 
             FastFireRate::OnLocalPlayerUpdate(instance);

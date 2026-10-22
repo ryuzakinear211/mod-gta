@@ -693,10 +693,13 @@ public class Menu {
                         name = name.trim();
                         if (name.isEmpty()) continue;
                         blueCount++;
-                        if (name.contains("[BOT]")) {
+                        if (name.contains("[BOT]") || name.toLowerCase().contains("(bot)")) {
                             String clean = name.replace("[BOT]", "").trim();
+                            if (!clean.toLowerCase().contains("(bot)")) {
+                                clean = clean + " (bot)";
+                            }
                             blueHtml.append("<font color='#FFAA00'>🤖 ").append(clean).append("</font><br>");
-                        } else if (name.contains("(You)")) {
+                        } else if (name.contains("(You)") || name.equals("You")) {
                             blueHtml.append("<font color='#00E5FF'>★ <b>").append(name).append("</b></font><br>");
                         } else {
                             blueHtml.append("<font color='#E0F7FA'>👤 ").append(name).append("</font><br>");
@@ -716,10 +719,13 @@ public class Menu {
                         name = name.trim();
                         if (name.isEmpty()) continue;
                         redCount++;
-                        if (name.contains("[BOT]")) {
+                        if (name.contains("[BOT]") || name.toLowerCase().contains("(bot)")) {
                             String clean = name.replace("[BOT]", "").trim();
+                            if (!clean.toLowerCase().contains("(bot)")) {
+                                clean = clean + " (bot)";
+                            }
                             redHtml.append("<font color='#FFAA00'>🤖 ").append(clean).append("</font><br>");
-                        } else if (name.contains("(You)")) {
+                        } else if (name.contains("(You)") || name.equals("You")) {
                             redHtml.append("<font color='#FF8A80'>★ <b>").append(name).append("</b></font><br>");
                         } else {
                             redHtml.append("<font color='#FFEBEE'>👤 ").append(name).append("</font><br>");

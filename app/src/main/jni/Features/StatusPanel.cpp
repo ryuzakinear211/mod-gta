@@ -32,6 +32,7 @@ namespace StatusPanel {
 
     // Local player tracking
     static void *s_localPlayerFPC = nullptr;
+    static void *s_localPlayerNet = nullptr;
     static std::string s_localPlayerName = "";
     static int s_localPlayerTeam = 0; // Default TeamA (Blue)
 
@@ -95,12 +96,72 @@ namespace StatusPanel {
     // Helper: Verify name is an actual player username and not a generic class/prefab name
     static inline bool IsValidCustomName(const std::string &name) {
         if (name.empty()) return false;
-        if (name == "NetworkPlayer" || name == "BotPlayer" || 
-            name == "FirstPersonController" || name == "ThirdPersonController" ||
-            name == "Player" || name == "GameObject" || name == "Default") {
+        std::string lower;
+        lower.reserve(name.size());
+        for (char c : name) lower += static_cast<char>(tolower(c));
+
+        // Exact matches
+        if (lower == "networkplayer" || lower == "botplayer" || 
+            lower == "firstpersoncontroller" || lower == "thirdpersoncontroller" ||
+            lower == "player" || lower == "bot" || lower == "gameobject" || lower == "default" ||
+            lower == "firstpersondoll" || lower == "thirdpersondoll" ||
+            lower == "botdollmanager" || lower == "botdoll" ||
+            lower == "network fps player" || lower == "networkfpsplayer" ||
+            lower == "fps player" || lower == "fpsplayer") {
             return false;
         }
+
+        // Substring checks for engine / prefab names
+        if (lower.find("doll") != std::string::npos || 
+            lower.find("network fps") != std::string::npos ||
+            lower.find("networkfps") != std::string::npos ||
+            lower.find("fps player") != std::string::npos ||
+            lower.find("botdoll") != std::string::npos ||
+            lower.find("controller") != std::string::npos) {
+            return false;
+        }
+
         return true;
+    }
+
+    // Helper: Detect whether a NetworkPlayer belongs to the local player
+    static inline bool IsLocalNetworkPlayer(void *netPlayer) {
+        if (!netPlayer || !Memory::IsValidPtr(netPlayer)) return false;
+        if (s_localPlayerNet && netPlayer == s_localPlayerNet) return true;
+
+        // 1. Check DollsManager.FirstPersonController (offset 0x40)
+        void *dolls = Memory::ReadField<void*>(netPlayer, Offsets::NetworkPlayer::DollsManager);
+        if (dolls && Memory::IsValidPtr(dolls)) {
+            void *fpc = Memory::ReadField<void*>(dolls, 0x40);
+            if (fpc && Memory::IsValidPtr(fpc)) {
+                s_localPlayerFPC = fpc;
+                return true;
+            }
+        }
+
+        // 2. Check GameObject name: local player's network GameObject is named "network fps player"
+        if (Component_GetGameObject && Object_GetName) {
+            try {
+                void *go = Component_GetGameObject(netPlayer);
+                if (go && Memory::IsValidPtr(go)) {
+                    void *strPtr = Object_GetName(go);
+                    if (strPtr && Memory::IsValidPtr(strPtr)) {
+                        std::string n = Il2CppStringToStdString(strPtr);
+                        std::string lower;
+                        lower.reserve(n.size());
+                        for (char c : n) lower += static_cast<char>(tolower(c));
+                        if (lower.find("network fps") != std::string::npos || 
+                            lower.find("networkfps") != std::string::npos ||
+                            lower.find("fps player") != std::string::npos ||
+                            lower.find("firstpersondoll") != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+
+        return false;
     }
 
     // Resolve real in-game username from IL2CPP object hierarchy
@@ -273,19 +334,6 @@ namespace StatusPanel {
                     s_localPlayerName = n;
                 }
             }
-
-            if ((s_localPlayerName.empty() || s_localPlayerName == "You") && Object_GetName) {
-                try {
-                    void *strPtr = Object_GetName(instance);
-                    if (strPtr && Memory::IsValidPtr(strPtr)) {
-                        std::string n = Il2CppStringToStdString(strPtr);
-                        CleanEntityName(n);
-                        if (IsValidCustomName(n)) {
-                            s_localPlayerName = n;
-                        }
-                    }
-                } catch (...) {}
-            }
         }
     }
 
@@ -294,6 +342,19 @@ namespace StatusPanel {
 
         // BigHead check (runs directly on render thread)
         BigHead::OnNetworkPlayerUpdate(instance);
+
+        // Check if this NetworkPlayer belongs to the local player!
+        if (IsLocalNetworkPlayer(instance)) {
+            s_localPlayerNet = instance;
+            int team = GetPlayerTeam(instance);
+            if (team == 0 || team == 1) {
+                s_localPlayerTeam = team;
+            }
+            std::lock_guard<std::mutex> lock(s_entityMutex);
+            s_networkPlayers.erase(instance);
+            s_trackedEntities.erase(instance);
+            return; // CRITICAL: NEVER register local player as a remote entity!
+        }
 
         uint64_t now = GetCurrentTimeMs();
         std::lock_guard<std::mutex> lock(s_entityMutex);
@@ -316,10 +377,12 @@ namespace StatusPanel {
                     int t = GetPlayerTeam(instance);
                     if (t == 0 || t == 1) trackIt->second.team = t;
                 }
-                // If name is currently fallback "Player_#" or empty, attempt re-resolving real username
-                if (trackIt->second.name.empty() || trackIt->second.name.rfind("Player_", 0) == 0) {
+                // If name is currently fallback "Player_#" or invalid, attempt re-resolving real username
+                if (trackIt->second.name.empty() || 
+                    trackIt->second.name.rfind("Player_", 0) == 0 || 
+                    !IsValidCustomName(trackIt->second.name)) {
                     std::string newName = ResolvePlayerName(instance, false);
-                    if (!newName.empty()) {
+                    if (!newName.empty() && IsValidCustomName(newName)) {
                         trackIt->second.name = newName;
                     }
                 }
@@ -329,6 +392,9 @@ namespace StatusPanel {
 
     void OnNetworkPlayerDestroy(void *instance) {
         if (!instance) return;
+        if (instance == s_localPlayerNet) {
+            s_localPlayerNet = nullptr;
+        }
         std::lock_guard<std::mutex> lock(s_entityMutex);
         s_networkPlayers.erase(instance);
         s_trackedEntities.erase(instance);
@@ -386,10 +452,12 @@ namespace StatusPanel {
                     int t = GetBotTeam(instance);
                     if (t == 0 || t == 1) trackIt->second.team = t;
                 }
-                // If name is currently fallback "Bot_#" or empty, attempt re-resolving name
-                if (trackIt->second.name.empty() || trackIt->second.name.rfind("Bot_", 0) == 0) {
+                // If name is currently fallback "Bot_#" or invalid, keep re-resolving every heartbeat!
+                if (trackIt->second.name.empty() || 
+                    trackIt->second.name.rfind("Bot_", 0) == 0 || 
+                    !IsValidCustomName(trackIt->second.name)) {
                     std::string newName = ResolvePlayerName(instance, true);
-                    if (!newName.empty()) {
+                    if (!newName.empty() && IsValidCustomName(newName)) {
                         trackIt->second.name = newName;
                     }
                 }
@@ -427,6 +495,13 @@ namespace StatusPanel {
         int totalNetPlayers = 0;
         int realCount = 0;
         for (auto it = s_networkPlayers.begin(); it != s_networkPlayers.end(); ) {
+            // Safety: if local player somehow got into s_networkPlayers, purge it
+            if (it->first == s_localPlayerNet || IsLocalNetworkPlayer(it->first)) {
+                s_trackedEntities.erase(it->first);
+                it = s_networkPlayers.erase(it);
+                continue;
+            }
+
             if (now - it->second > TIMEOUT_MS) {
                 s_trackedEntities.erase(it->first);
                 it = s_networkPlayers.erase(it);
@@ -439,8 +514,12 @@ namespace StatusPanel {
             }
         }
 
-        // Clean stale tracked entities
+        // Clean stale tracked entities and any local player entity
         for (auto it = s_trackedEntities.begin(); it != s_trackedEntities.end(); ) {
+            if (it->first == s_localPlayerNet || it->first == s_localPlayerFPC || IsLocalNetworkPlayer(it->first)) {
+                it = s_trackedEntities.erase(it);
+                continue;
+            }
             if (now - it->second.lastSeen > TIMEOUT_MS) {
                 it = s_trackedEntities.erase(it);
             } else {
@@ -450,8 +529,8 @@ namespace StatusPanel {
 
         int botCount = static_cast<int>(s_botPlayers.size());
 
-        // When there are no remote network players and no bots, match is inactive / in lobby
-        if (totalNetPlayers == 0 && botCount == 0) {
+        // When there are no remote network players, no bots, AND no local player FPC: match is inactive / in lobby
+        if (!s_localPlayerFPC && totalNetPlayers == 0 && botCount == 0) {
             Stats stats;
             stats.realPlayerCount = 0;
             stats.botCount = 0;
@@ -462,32 +541,26 @@ namespace StatusPanel {
             return stats;
         }
 
-        if (totalNetPlayers >= botCount) {
-            if (realCount == 0 && totalNetPlayers > botCount) {
-                realCount = totalNetPlayers - botCount;
-            }
-        } else {
-            if (realCount < 0) realCount = 0;
-        }
-
         // Build Blue Team (0) and Red Team (1) lists
         std::vector<MemberInfo> blueList;
         std::vector<MemberInfo> redList;
         std::vector<MemberInfo> unassigned;
 
-        bool localPlayerFound = false;
-
         for (const auto &pair : s_trackedEntities) {
             void *entityObj = pair.first;
             const TrackedEntityInfo &info = pair.second;
 
-            // Avoid double counting bots registered under NetworkPlayer
-            if (!info.isBot && activeBotNets.find(entityObj) != activeBotNets.end()) {
+            // Extra safety: skip local player and invalid entity names
+            if (entityObj == s_localPlayerNet || entityObj == s_localPlayerFPC || IsLocalNetworkPlayer(entityObj)) {
+                continue;
+            }
+            if (!info.isBot && !IsValidCustomName(info.name)) {
                 continue;
             }
 
-            if (s_localPlayerFPC && entityObj == s_localPlayerFPC) {
-                localPlayerFound = true;
+            // Avoid double counting bots registered under NetworkPlayer
+            if (!info.isBot && activeBotNets.find(entityObj) != activeBotNets.end()) {
+                continue;
             }
 
             MemberInfo m(info.name, info.isBot, info.team);
@@ -509,9 +582,9 @@ namespace StatusPanel {
             }
         }
 
-        // Include local player if in game but not in remote network players
-        if (s_localPlayerFPC && !localPlayerFound) {
-            std::string myName = s_localPlayerName.empty() ? "You" : (s_localPlayerName + " (You)");
+        // Include local player exactly once
+        if (s_localPlayerFPC) {
+            std::string myName = (s_localPlayerName.empty() || !IsValidCustomName(s_localPlayerName)) ? "You" : (s_localPlayerName + " (You)");
             MemberInfo myMember(myName, false, s_localPlayerTeam);
             if (s_localPlayerTeam == 1) {
                 redList.insert(redList.begin(), myMember);
@@ -521,13 +594,13 @@ namespace StatusPanel {
             realCount++;
         }
 
-        int total = (totalNetPlayers > botCount) ? totalNetPlayers : (realCount + botCount);
+        int total = realCount + botCount;
 
         Stats stats;
         stats.realPlayerCount = realCount;
         stats.botCount = botCount;
         stats.totalEntities = total;
-        stats.inGame = (total > 0);
+        stats.inGame = (total > 0 || s_localPlayerFPC != nullptr);
         stats.blueTeam = blueList;
         stats.redTeam = redList;
         return stats;
@@ -543,20 +616,28 @@ namespace StatusPanel {
         std::string blueStr;
         for (size_t i = 0; i < s.blueTeam.size(); ++i) {
             if (i > 0) blueStr += ",";
-            blueStr += s.blueTeam[i].name;
+            std::string n = s.blueTeam[i].name;
             if (s.blueTeam[i].isBot) {
-                blueStr += " [BOT]";
+                if (n.find("(bot)") == std::string::npos && n.find("(Bot)") == std::string::npos) {
+                    n += " (bot)";
+                }
+                n += " [BOT]";
             }
+            blueStr += n;
         }
 
         // Build red team member string: "name1,name2,name3"
         std::string redStr;
         for (size_t i = 0; i < s.redTeam.size(); ++i) {
             if (i > 0) redStr += ",";
-            redStr += s.redTeam[i].name;
+            std::string n = s.redTeam[i].name;
             if (s.redTeam[i].isBot) {
-                redStr += " [BOT]";
+                if (n.find("(bot)") == std::string::npos && n.find("(Bot)") == std::string::npos) {
+                    n += " (bot)";
+                }
+                n += " [BOT]";
             }
+            redStr += n;
         }
 
         char header[256];
@@ -606,6 +687,10 @@ namespace StatusPanel {
         }
 
         for (auto it = s_networkPlayers.begin(); it != s_networkPlayers.end(); ) {
+            if (it->first == s_localPlayerNet || IsLocalNetworkPlayer(it->first)) {
+                it = s_networkPlayers.erase(it);
+                continue;
+            }
             if (now - it->second > TIMEOUT_MS) {
                 s_trackedEntities.erase(it->first);
                 it = s_networkPlayers.erase(it);
@@ -635,6 +720,9 @@ namespace StatusPanel {
         s_botNetPlayers.clear();
         s_trackedEntities.clear();
         s_localPlayerFPC = nullptr;
+        s_localPlayerNet = nullptr;
+        s_localPlayerName = "";
+        s_localPlayerTeam = 0;
         LOG_INFO("[STATS] Match finished / scene change: entity cache and local player reset.");
     }
 
@@ -642,11 +730,7 @@ namespace StatusPanel {
         std::lock_guard<std::mutex> lock(s_entityMutex);
         if (s_localPlayerFPC == instance || instance == nullptr) {
             s_localPlayerFPC = nullptr;
-            s_networkPlayers.clear();
-            s_botPlayers.clear();
-            s_botNetPlayers.clear();
-            s_trackedEntities.clear();
-            LOG_INFO("[STATS] Local player destroyed: match ended.");
+            LOG_INFO("[STATS] Local player FPC destroyed (death/respawn).");
         }
     }
 
@@ -657,6 +741,9 @@ namespace StatusPanel {
         s_botNetPlayers.clear();
         s_trackedEntities.clear();
         s_localPlayerFPC = nullptr;
+        s_localPlayerNet = nullptr;
+        s_localPlayerName = "";
+        s_localPlayerTeam = 0;
         LOG_INFO("[STATS] Entity counters and team tracking manually reset.");
     }
 
