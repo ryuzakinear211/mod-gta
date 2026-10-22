@@ -56,6 +56,14 @@ namespace StatusPanel {
     void OnMatchFinished();
     void OnLocalPlayerDestroy(void *instance);
 
+    // Affiliation and team queries for ESP and Chams
+    int GetLocalPlayerTeam();
+    void SetLocalPlayerTeam(int team);
+    bool IsLocalPlayer(void *entity);
+    bool IsEnemy(int entityTeam);
+    bool IsEnemyEntity(void *entity, bool isBot = false, void *netPlayer = nullptr);
+    bool IsTeammateEntity(void *entity, bool isBot = false, void *netPlayer = nullptr);
+
 } // namespace StatusPanel
 
 #endif // FEATURE_STATUS_PANEL_H

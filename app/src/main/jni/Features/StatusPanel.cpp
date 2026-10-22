@@ -34,7 +34,7 @@ namespace StatusPanel {
     static void *s_localPlayerFPC = nullptr;
     static void *s_localPlayerNet = nullptr;
     static std::string s_localPlayerName = "";
-    static int s_localPlayerTeam = 0; // Default TeamA (Blue)
+    static std::atomic<int> s_localPlayerTeam{0}; // Default TeamA (Blue)
 
     // Unity function pointers resolved from libil2cpp.so
     static void* (*Object_GetName)(void*) = nullptr;
@@ -303,9 +303,10 @@ namespace StatusPanel {
             isAlly = Memory::ReadField<bool>(customSettings, Offsets::CustomSettings::IsAllyToggle);
         }
 
+        int myTeam = s_localPlayerTeam.load(std::memory_order_relaxed);
         // If local player is Blue (0): Ally is 0 (Blue), Enemy is 1 (Red)
         // If local player is Red (1): Ally is 1 (Red), Enemy is 0 (Blue)
-        return isAlly ? s_localPlayerTeam : (s_localPlayerTeam == 0 ? 1 : 0);
+        return isAlly ? myTeam : (myTeam == 0 ? 1 : 0);
     }
 
     // Helper: Read bot's true team enum (0 = TeamA/Blue, 1 = TeamB/Red, -1 = Unknown)
@@ -422,7 +423,7 @@ namespace StatusPanel {
             s_localPlayerNet = instance;
             int team = GetPlayerTeam(instance);
             if (team == 0 || team == 1) {
-                s_localPlayerTeam = team;
+                s_localPlayerTeam.store(team, std::memory_order_relaxed);
             }
             std::lock_guard<std::mutex> lock(s_entityMutex);
             s_networkPlayers.erase(instance);
@@ -447,9 +448,12 @@ namespace StatusPanel {
                 s_trackedEntities[instance] = info;
             } else {
                 trackIt->second.lastSeen = now;
-                int t = GetPlayerTeam(instance);
-                if (t == 0 || t == 1) {
-                    trackIt->second.team = t;
+                // Optimization: Only query team if not yet resolved!
+                if (trackIt->second.team != 0 && trackIt->second.team != 1) {
+                    int t = GetPlayerTeam(instance);
+                    if (t == 0 || t == 1) {
+                        trackIt->second.team = t;
+                    }
                 }
                 // If name is currently fallback "Player_#" or invalid, attempt re-resolving real username
                 if (trackIt->second.name.empty() || 
@@ -522,9 +526,12 @@ namespace StatusPanel {
                 s_trackedEntities[instance] = info;
             } else {
                 trackIt->second.lastSeen = now;
-                int t = GetBotTeam(instance);
-                if (t == 0 || t == 1) {
-                    trackIt->second.team = t;
+                // Optimization: Only query team if not yet resolved!
+                if (trackIt->second.team != 0 && trackIt->second.team != 1) {
+                    int t = GetBotTeam(instance);
+                    if (t == 0 || t == 1) {
+                        trackIt->second.team = t;
+                    }
                 }
                 // If name is currently fallback "Bot_#" or invalid, keep re-resolving every heartbeat!
                 if (trackIt->second.name.empty() || 
@@ -648,7 +655,8 @@ namespace StatusPanel {
                 redList.push_back(MemberInfo(info.name, info.isBot, 1));
             } else {
                 // If STILL unknown after all 6 resolution methods, place on enemy team relative to local player
-                int enemyTeam = (s_localPlayerTeam == 0) ? 1 : 0;
+                int myTeam = s_localPlayerTeam.load(std::memory_order_relaxed);
+                int enemyTeam = (myTeam == 0) ? 1 : 0;
                 if (enemyTeam == 1) {
                     redList.push_back(MemberInfo(info.name, info.isBot, 1));
                 } else {
@@ -659,9 +667,10 @@ namespace StatusPanel {
 
         // Include local player exactly once
         if (s_localPlayerFPC) {
+            int myTeam = s_localPlayerTeam.load(std::memory_order_relaxed);
             std::string myName = (s_localPlayerName.empty() || !IsValidCustomName(s_localPlayerName)) ? "You" : (s_localPlayerName + " (You)");
-            MemberInfo myMember(myName, false, s_localPlayerTeam);
-            if (s_localPlayerTeam == 1) {
+            MemberInfo myMember(myName, false, myTeam);
+            if (myTeam == 1) {
                 redList.insert(redList.begin(), myMember);
             } else {
                 blueList.insert(blueList.begin(), myMember);
@@ -726,6 +735,7 @@ namespace StatusPanel {
     std::vector<EntitySnapshot> GetActiveEntities() {
         std::vector<EntitySnapshot> result;
         std::lock_guard<std::mutex> lock(s_entityMutex);
+        result.reserve(s_botPlayers.size() + s_networkPlayers.size());
         uint64_t now = GetCurrentTimeMs();
 
         std::set<void*> activeBotNets;
@@ -797,7 +807,7 @@ namespace StatusPanel {
         s_localPlayerFPC = nullptr;
         s_localPlayerNet = nullptr;
         s_localPlayerName = "";
-        s_localPlayerTeam = 0;
+        s_localPlayerTeam.store(0, std::memory_order_relaxed);
         LOG_INFO("[STATS] Match finished / scene change: entity cache and local player reset.");
     }
 
@@ -818,7 +828,7 @@ namespace StatusPanel {
         s_localPlayerFPC = nullptr;
         s_localPlayerNet = nullptr;
         s_localPlayerName = "";
-        s_localPlayerTeam = 0;
+        s_localPlayerTeam.store(0, std::memory_order_relaxed);
         LOG_INFO("[STATS] Entity counters and team tracking manually reset.");
     }
 
@@ -897,6 +907,83 @@ namespace StatusPanel {
 
     bool IsEnabled() {
         return s_enabled.load(std::memory_order_relaxed);
+    }
+
+    int GetLocalPlayerTeam() {
+        return s_localPlayerTeam.load(std::memory_order_relaxed);
+    }
+
+    void SetLocalPlayerTeam(int team) {
+        if (team == 0 || team == 1) {
+            s_localPlayerTeam.store(team, std::memory_order_relaxed);
+        }
+    }
+
+    bool IsLocalPlayer(void *entity) {
+        if (!entity) return false;
+        if (entity == s_localPlayerNet || entity == s_localPlayerFPC) return true;
+        return IsLocalNetworkPlayer(entity);
+    }
+
+    bool IsEnemy(int entityTeam) {
+        if (entityTeam != 0 && entityTeam != 1) return true; // Inconclusive: treat as enemy
+        return entityTeam != s_localPlayerTeam.load(std::memory_order_relaxed);
+    }
+
+    bool IsEnemyEntity(void *entity, bool isBot, void *netPlayer) {
+        if (!entity) return false;
+        if (IsLocalPlayer(entity)) return false;
+        if (netPlayer && IsLocalPlayer(netPlayer)) return false;
+
+        int myTeam = s_localPlayerTeam.load(std::memory_order_relaxed);
+
+        // 1. Fast cache lookup
+        {
+            std::lock_guard<std::mutex> lock(s_entityMutex);
+            auto it = s_trackedEntities.find(entity);
+            if (it != s_trackedEntities.end()) {
+                int t = it->second.team;
+                if (t == 0 || t == 1) {
+                    return t != myTeam;
+                }
+            }
+            if (netPlayer) {
+                auto netIt = s_trackedEntities.find(netPlayer);
+                if (netIt != s_trackedEntities.end()) {
+                    int t = netIt->second.team;
+                    if (t == 0 || t == 1) {
+                        return t != myTeam;
+                    }
+                }
+            }
+        }
+
+        // 2. Direct team resolution
+        int team = isBot ? GetBotTeam(entity) : GetPlayerTeam(netPlayer ? netPlayer : entity);
+        if (team == 0 || team == 1) {
+            return team != myTeam;
+        }
+
+        // 3. TargetibleObject fallback
+        void *targetObj = nullptr;
+        if (isBot) {
+            targetObj = Memory::ReadField<void*>(entity, Offsets::BotPlayer::TargetibleObject);
+        }
+        if (targetObj && Memory::IsValidPtr(targetObj)) {
+            int t = GetTeamFromTargetibleObject(targetObj);
+            if (t == 0 || t == 1) {
+                return t != myTeam;
+            }
+        }
+
+        return true;
+    }
+
+    bool IsTeammateEntity(void *entity, bool isBot, void *netPlayer) {
+        if (!entity) return false;
+        if (IsLocalPlayer(entity)) return true;
+        if (netPlayer && IsLocalPlayer(netPlayer)) return true;
+        return !IsEnemyEntity(entity, isBot, netPlayer);
     }
 
 } // namespace StatusPanel

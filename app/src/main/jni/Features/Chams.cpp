@@ -63,9 +63,13 @@ namespace Chams {
     // Classification cache for GLES programs: -1 = uncomputed, 0 = reject, 1 = allow
     static constexpr int CACHE_SIZE = 2048;
     static int8_t s_programFilterCache[8][CACHE_SIZE];
+    static int16_t s_objToWorldLocCache[CACHE_SIZE];
 
     void ClearProgramCache() {
         memset(s_programFilterCache, -1, sizeof(s_programFilterCache));
+        for (int i = 0; i < CACHE_SIZE; ++i) {
+            s_objToWorldLocCache[i] = -2;
+        }
     }
 
     void ClearTeammatePositions() {
@@ -97,6 +101,14 @@ namespace Chams {
 
         uint64_t now = GetCurrentTimeMs();
         std::lock_guard<std::mutex> lock(s_vehicleMutex);
+
+        for (auto it = s_vehiclePositions.begin(); it != s_vehiclePositions.end(); ) {
+            if (now - it->lastSeenMs > 3000) {
+                it = s_vehiclePositions.erase(it);
+            } else {
+                ++it;
+            }
+        }
 
         for (auto &v : s_vehiclePositions) {
             float dx = v.position.x - pos.x;
@@ -301,102 +313,35 @@ namespace Chams {
         return shouldRender;
     }
 
-    // Check if the currently drawn mesh belongs to an active vehicle (tank, car, etc.)
-    static inline bool IsCurrentMeshVehicle(GLint currProgram) {
-        if (currProgram <= 0) return false;
-
+    // Check if the 3D position is near an active vehicle (tank, car, etc.)
+    static inline bool IsPositionNearVehicle(float cx1, float cy1, float cz1, float cx2, float cy2, float cz2) {
         std::lock_guard<std::mutex> lock(s_vehicleMutex);
         if (s_vehiclePositions.empty()) return false;
 
-        uint64_t now = GetCurrentTimeMs();
-        for (auto it = s_vehiclePositions.begin(); it != s_vehiclePositions.end(); ) {
-            if (now - it->lastSeenMs > 3000) {
-                it = s_vehiclePositions.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        if (s_vehiclePositions.empty()) return false;
-
-        GLint loc = glGetUniformLocation(currProgram, "hlslcc_mtx4x4unity_ObjectToWorld[0]");
-        if (loc == -1) {
-            loc = glGetUniformLocation(currProgram, "unity_ObjectToWorld");
-        }
-        if (loc == -1) return false;
-
-        GLfloat m[16];
-        glGetUniformfv(currProgram, loc, m);
-
-        float cx1 = m[12], cy1 = m[13], cz1 = m[14];
-        float cx2 = m[3],  cy2 = m[7],  cz2 = m[11];
-
-        // Radius ~6.5m reliably covers full tank chassis, tracks, turret, and barrel
         constexpr float VEHICLE_RADIUS_SQ = 6.5f * 6.5f;
-
         for (const auto &v : s_vehiclePositions) {
-            float dx1 = cx1 - v.position.x;
-            float dy1 = cy1 - v.position.y;
-            float dz1 = cz1 - v.position.z;
-            if ((dx1 * dx1 + dy1 * dy1 + dz1 * dz1) <= VEHICLE_RADIUS_SQ) {
-                return true;
-            }
+            float dx1 = cx1 - v.position.x, dy1 = cy1 - v.position.y, dz1 = cz1 - v.position.z;
+            if ((dx1 * dx1 + dy1 * dy1 + dz1 * dz1) <= VEHICLE_RADIUS_SQ) return true;
 
-            float dx2 = cx2 - v.position.x;
-            float dy2 = cy2 - v.position.y;
-            float dz2 = cz2 - v.position.z;
-            if ((dx2 * dx2 + dy2 * dy2 + dz2 * dz2) <= VEHICLE_RADIUS_SQ) {
-                return true;
-            }
+            float dx2 = cx2 - v.position.x, dy2 = cy2 - v.position.y, dz2 = cz2 - v.position.z;
+            if ((dx2 * dx2 + dy2 * dy2 + dz2 * dz2) <= VEHICLE_RADIUS_SQ) return true;
         }
-
         return false;
     }
 
-    // Check if the currently drawn mesh belongs to a teammate or local player
-    static inline bool IsCurrentMeshTeammate(GLint currProgram) {
-        if (!s_enemyOnly.load(std::memory_order_relaxed)) {
-            return false;
-        }
-
+    // Check if the 3D position belongs to a teammate or local player
+    static inline bool IsPositionNearTeammate(float cx1, float cy1, float cz1, float cx2, float cy2, float cz2) {
         std::lock_guard<std::mutex> lock(s_teammatesMutex);
-        if (s_teammatePositions.empty()) {
-            return false;
-        }
-
-        GLint loc = glGetUniformLocation(currProgram, "hlslcc_mtx4x4unity_ObjectToWorld[0]");
-        if (loc == -1) {
-            loc = glGetUniformLocation(currProgram, "unity_ObjectToWorld");
-        }
-        if (loc == -1) {
-            return false;
-        }
-
-        GLfloat m[16];
-        glGetUniformfv(currProgram, loc, m);
-
-        // Candidate 1: Column-major translation (m[12], m[13], m[14])
-        float cx1 = m[12], cy1 = m[13], cz1 = m[14];
-        // Candidate 2: Row-major translation (m[3], m[7], m[11])
-        float cx2 = m[3], cy2 = m[7], cz2 = m[11];
+        if (s_teammatePositions.empty()) return false;
 
         constexpr float MAX_DIST_SQ = 2.8f * 2.8f; // ~2.8m radius to account for character bone offsets
-
         for (const auto &tp : s_teammatePositions) {
-            float dx1 = cx1 - tp.x;
-            float dy1 = cy1 - tp.y;
-            float dz1 = cz1 - tp.z;
-            if ((dx1 * dx1 + dy1 * dy1 + dz1 * dz1) <= MAX_DIST_SQ) {
-                return true;
-            }
+            float dx1 = cx1 - tp.x, dy1 = cy1 - tp.y, dz1 = cz1 - tp.z;
+            if ((dx1 * dx1 + dy1 * dy1 + dz1 * dz1) <= MAX_DIST_SQ) return true;
 
-            float dx2 = cx2 - tp.x;
-            float dy2 = cy2 - tp.y;
-            float dz2 = cz2 - tp.z;
-            if ((dx2 * dx2 + dy2 * dy2 + dz2 * dz2) <= MAX_DIST_SQ) {
-                return true;
-            }
+            float dx2 = cx2 - tp.x, dy2 = cy2 - tp.y, dz2 = cz2 - tp.z;
+            if ((dx2 * dx2 + dy2 * dy2 + dz2 * dz2) <= MAX_DIST_SQ) return true;
         }
-
         return false;
     }
 
@@ -429,14 +374,49 @@ namespace Chams {
             return;
         }
 
-        // Filter out vehicle geometry (tank, car, etc.) so vehicles are never rendered in Chams
-        if (IsCurrentMeshVehicle(currProgram)) {
-            return;
+        // Spatial matrix checks: filter out vehicle meshes, and filter out friendly teammates / local player
+        bool checkTeammates = s_enemyOnly.load(std::memory_order_relaxed);
+        bool hasVehicles = false;
+        {
+            std::lock_guard<std::mutex> lock(s_vehicleMutex);
+            hasVehicles = !s_vehiclePositions.empty();
         }
 
-        // Filter out teammates and local player so only enemies are rendered in Chams
-        if (IsCurrentMeshTeammate(currProgram)) {
-            return;
+        if (checkTeammates || hasVehicles) {
+            GLint objLoc = -1;
+            if (currProgram < CACHE_SIZE) {
+                objLoc = s_objToWorldLocCache[currProgram];
+                if (objLoc == -2) {
+                    objLoc = glGetUniformLocation(currProgram, "hlslcc_mtx4x4unity_ObjectToWorld[0]");
+                    if (objLoc == -1) {
+                        objLoc = glGetUniformLocation(currProgram, "unity_ObjectToWorld");
+                    }
+                    s_objToWorldLocCache[currProgram] = static_cast<int16_t>(objLoc);
+                }
+            } else {
+                objLoc = glGetUniformLocation(currProgram, "hlslcc_mtx4x4unity_ObjectToWorld[0]");
+                if (objLoc == -1) {
+                    objLoc = glGetUniformLocation(currProgram, "unity_ObjectToWorld");
+                }
+            }
+
+            if (objLoc != -1) {
+                GLfloat m[16];
+                glGetUniformfv(currProgram, objLoc, m);
+
+                float cx1 = m[12], cy1 = m[13], cz1 = m[14];
+                float cx2 = m[3],  cy2 = m[7],  cz2 = m[11];
+
+                // 1. Filter out vehicles (tanks, cars, etc.)
+                if (hasVehicles && IsPositionNearVehicle(cx1, cy1, cz1, cx2, cy2, cz2)) {
+                    return;
+                }
+
+                // 2. Filter out teammates & local player (enemy-only Chams filtering)
+                if (checkTeammates && IsPositionNearTeammate(cx1, cy1, cz1, cx2, cy2, cz2)) {
+                    return;
+                }
+            }
         }
 
         int currentMode = s_mode.load(std::memory_order_relaxed);
