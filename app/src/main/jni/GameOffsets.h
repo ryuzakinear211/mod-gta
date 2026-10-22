@@ -286,22 +286,11 @@ namespace Offsets {
     // Free Reward & Timer Reset (Free Gold / Daily Reward Cooldown Bypass: 1h 57m -> 0s)
     // ----------------------------------------------------------------------------------
     namespace FreeReward {
-        // FreeDailyRewardItemView (dump.cs class: Dom.FreeDailyReward.View.FreeDailyRewardItemView, TypeDefIndex: 836)
-        constexpr uintptr_t View_UpdateTimer       = 0x43F1288; // aababaabbbabbabbaaaababbbabaabbabaabababbababab(long seconds)
-        constexpr uintptr_t View_SetAvailable      = 0x43F1400; // ababaaabbabbbaaababbbababbbaabaabaaaaabaaaabaab(bool available)
-        constexpr uintptr_t View_OnTimerTick       = 0x43F24AC; // bbaabbaabaabbababaabbbbbbbabbbbbbbaaaababaaabba(long seconds)
-        constexpr uintptr_t View_OnEnable          = 0x43F1E94; // OnEnable()
-
         // FreeDailyReward Presenter (dump.cs class: baaaaababbababababbbabaabbbbbbbbbbaaabbbabbbbbb, TypeDefIndex: 10474)
-        constexpr uintptr_t Presenter_CanTake      = 0x4849B84; // babbbababaabbbbbaaabbabbbaaabaabbbbbaaaababbabb() -> bool
-        constexpr uintptr_t Presenter_GetRemainSec = 0x4849C80; // babbbabbbabbbbabaabababbabbbbaaaabaaabaababbbab() -> int
-        constexpr uintptr_t Presenter_GetCooldown  = 0x484A2EC; // bbabaababaaabaabbbabbbabbbabbbbbaabbababbababbb() -> int
-        constexpr uintptr_t Presenter_IsAvailable  = 0x484A374; // abaaabaaabaababbabbaaaaaabababbbbabbbbbbabbbaab() -> bool
-        constexpr uintptr_t Presenter_IsReady      = 0x484A7B8; // aaaababbaaaababaabaaaababbaaaabbabbbabbabbbbbab() -> bool
-
-        // ChestBuyTimer (dump.cs class: LastLevel.Legion.UI.ChestBuyTimer, TypeDefIndex: 8161)
-        constexpr uintptr_t ChestTimer_SetTime     = 0x440D248; // aaabaabbbabbabbbababaabbbaababaabbabaabbbabaaba(long seconds)
-        constexpr uintptr_t ChestTimer_CanClaim    = 0x440D494; // aabbbbaaaaabbabaabbbaabbabaabbabbabbabbbabbbaaa() -> bool
+        // All selected functions have body lengths >= 68 bytes, ensuring 100% safety with 20-byte inline hooks
+        constexpr uintptr_t Presenter_CanTake      = 0x4849B84; // babbbababaabbbbbaaabbabbbaaabaabbbbbaaaababbabb() -> bool (Length: 68 bytes)
+        constexpr uintptr_t Presenter_GetRemainSec = 0x4849C80; // babbbabbbabbbbabaabababbabbbbaaaabaaabaababbbab() -> int (Length: 124 bytes)
+        constexpr uintptr_t Presenter_GetCooldown  = 0x484A2EC; // bbabaababaaabaabbbabbbabbbabbbbbaabbababbababbb() -> int (Length: 124 bytes)
     }
 
     // Unity SceneManager Native Bindings (dump.cs)

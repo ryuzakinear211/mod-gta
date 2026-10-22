@@ -75,6 +75,7 @@ namespace ModLogger {
         // 2. Write to single active log file (if available)
         if (s_activeFd >= 0) {
             write(s_activeFd, buffer, len);
+            fsync(s_activeFd);
         }
     }
 
@@ -105,6 +106,7 @@ namespace ModLogger {
             int lineLen = snprintf(lineBuf, sizeof(lineBuf), "[%s] %s\n", timeStr, msgBuf);
             if (lineLen > 0) {
                 write(s_activeFd, lineBuf, static_cast<size_t>(lineLen));
+                fsync(s_activeFd);
             }
         }
     }
