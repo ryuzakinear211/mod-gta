@@ -110,6 +110,12 @@ public class Menu {
     public static Menu instance;
     public LinearLayout mStatusHud;
     public TextView mStatusHudText;
+    public TextView mStatusBlueHeader;
+    public TextView mStatusBlueText;
+    public TextView mStatusRedHeader;
+    public TextView mStatusRedText;
+    public TextView mStatusHudFooter;
+    public TextView hudTitle;
     public TextView subTitleRef;
     public WindowManager.LayoutParams hudParams;
     public boolean showStatusHud = false;
@@ -475,28 +481,102 @@ public class Menu {
         mStatusHud = new LinearLayout(context);
         mStatusHud.setOrientation(LinearLayout.VERTICAL);
         mStatusHud.setVisibility(View.GONE);
-        mStatusHud.setPadding(dp(12), dp(8), dp(12), dp(8));
+        mStatusHud.setPadding(dp(10), dp(8), dp(10), dp(8));
 
         GradientDrawable gdHud = new GradientDrawable();
         gdHud.setCornerRadius(dp(8));
-        gdHud.setColor(Color.parseColor("#EE101A24")); // Dark slate background
+        gdHud.setColor(Color.parseColor("#EE101A24")); // Dark slate semi-transparent background
         gdHud.setStroke(dp(1), Color.parseColor("#00E5FF")); // Glowing cyan border
         mStatusHud.setBackground(gdHud);
 
-        TextView hudTitle = new TextView(context);
-        hudTitle.setText(Html.fromHtml("<b><font color='#00FF7F'>🎮 GTA SA FPS</font> <font color='#82CAFD'>| STATUS</font></b>"));
+        hudTitle = new TextView(context);
+        hudTitle.setText(Html.fromHtml("<b><font color='#00FF7F'>🎮 GTA SA FPS</font> <font color='#82CAFD'>| STATUS</font> <font color='#FFAA00'>&#9679; LOBBY</font></b>"));
         hudTitle.setTextSize(11f);
         hudTitle.setTextColor(Color.WHITE);
         hudTitle.setGravity(Gravity.CENTER);
         mStatusHud.addView(hudTitle);
 
+        // Header divider
+        View div1 = new View(context);
+        div1.setBackgroundColor(Color.parseColor("#332A3B4C"));
+        LinearLayout.LayoutParams div1Params = new LinearLayout.LayoutParams(MATCH_PARENT, dp(1));
+        div1Params.setMargins(0, dp(4), 0, dp(5));
+        div1.setLayoutParams(div1Params);
+        mStatusHud.addView(div1);
+
+        // Team container (Two columns side-by-side)
+        LinearLayout teamsLayout = new LinearLayout(context);
+        teamsLayout.setOrientation(LinearLayout.HORIZONTAL);
+        teamsLayout.setMinimumWidth(dp(220));
+        teamsLayout.setLayoutParams(new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+
+        // Blue Column
+        LinearLayout blueCol = new LinearLayout(context);
+        blueCol.setOrientation(LinearLayout.VERTICAL);
+        blueCol.setLayoutParams(new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.0f));
+
+        mStatusBlueHeader = new TextView(context);
+        mStatusBlueHeader.setText(Html.fromHtml("<b><font color='#00E5FF'>🟦 BLUE TIM:</font></b>"));
+        mStatusBlueHeader.setTextSize(10f);
+        mStatusBlueHeader.setTypeface(null, Typeface.BOLD);
+        blueCol.addView(mStatusBlueHeader);
+
+        mStatusBlueText = new TextView(context);
+        mStatusBlueText.setText(Html.fromHtml("<font color='#64748B'><i>-</i></font>"));
+        mStatusBlueText.setTextSize(9.5f);
+        mStatusBlueText.setTextColor(Color.WHITE);
+        mStatusBlueText.setPadding(0, dp(2), dp(2), dp(2));
+        blueCol.addView(mStatusBlueText);
+        teamsLayout.addView(blueCol);
+
+        // Vertical divider between teams
+        View teamDiv = new View(context);
+        teamDiv.setBackgroundColor(Color.parseColor("#4400E5FF"));
+        LinearLayout.LayoutParams teamDivParams = new LinearLayout.LayoutParams(dp(1), MATCH_PARENT);
+        teamDivParams.setMargins(dp(4), dp(2), dp(4), dp(2));
+        teamDiv.setLayoutParams(teamDivParams);
+        teamsLayout.addView(teamDiv);
+
+        // Red Column
+        LinearLayout redCol = new LinearLayout(context);
+        redCol.setOrientation(LinearLayout.VERTICAL);
+        redCol.setLayoutParams(new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1.0f));
+
+        mStatusRedHeader = new TextView(context);
+        mStatusRedHeader.setText(Html.fromHtml("<b><font color='#FF5252'>🟥 RED TIM:</font></b>"));
+        mStatusRedHeader.setTextSize(10f);
+        mStatusRedHeader.setTypeface(null, Typeface.BOLD);
+        redCol.addView(mStatusRedHeader);
+
+        mStatusRedText = new TextView(context);
+        mStatusRedText.setText(Html.fromHtml("<font color='#64748B'><i>-</i></font>"));
+        mStatusRedText.setTextSize(9.5f);
+        mStatusRedText.setTextColor(Color.WHITE);
+        mStatusRedText.setPadding(dp(2), dp(2), 0, dp(2));
+        redCol.addView(mStatusRedText);
+        teamsLayout.addView(redCol);
+
+        mStatusHud.addView(teamsLayout);
+
+        // Footer divider
+        View div2 = new View(context);
+        div2.setBackgroundColor(Color.parseColor("#332A3B4C"));
+        LinearLayout.LayoutParams div2Params = new LinearLayout.LayoutParams(MATCH_PARENT, dp(1));
+        div2Params.setMargins(0, dp(5), 0, dp(4));
+        div2.setLayoutParams(div2Params);
+        mStatusHud.addView(div2);
+
+        // Footer TextView (player: X | bot: Y)
+        mStatusHudFooter = new TextView(context);
+        mStatusHudFooter.setText(Html.fromHtml("<font color='#00FF7F'><b>player: 0</b></font> | <font color='#FF5252'><b>bot: 0</b></font>"));
+        mStatusHudFooter.setTextSize(10f);
+        mStatusHudFooter.setTextColor(Color.WHITE);
+        mStatusHudFooter.setGravity(Gravity.CENTER);
+        mStatusHud.addView(mStatusHudFooter);
+
+        // Invisible legacy text view for backwards compatibility
         mStatusHudText = new TextView(context);
-        mStatusHudText.setText(Html.fromHtml("<b>Status:</b> <font color='#FFAA00'>&#9679; LOBBY / MENUNGGU</font><br>" +
-                "<font color='#00FF00'>Player: <b>0</b></font> | <font color='#FF5252'>Bot: <b>0</b></font><br>" +
-                "<font color='#FFFF00'>Total: <b>0</b></font>"));
-        mStatusHudText.setTextSize(10f);
-        mStatusHudText.setTextColor(Color.WHITE);
-        mStatusHudText.setPadding(0, dp(4), 0, 0);
+        mStatusHudText.setVisibility(View.GONE);
         mStatusHud.addView(mStatusHudText);
 
         mStatusHud.setOnTouchListener(new View.OnTouchListener() {
@@ -562,32 +642,105 @@ public class Menu {
             String rawStatus = GetPlayerBotStatus();
             if (rawStatus == null || rawStatus.isEmpty()) return;
 
-            String[] parts = rawStatus.split(";");
+            String[] parts = rawStatus.split(";", -1);
             if (parts.length >= 4) {
                 boolean inGame = "IN_GAME".equals(parts[0]);
                 int realCount = Integer.parseInt(parts[1]);
                 int botCount = Integer.parseInt(parts[2]);
                 int totalCount = Integer.parseInt(parts[3]);
 
-                String statusStr = inGame ? "<font color='#00FF7F'>&#9679; IN GAME</font>" : "<font color='#FFAA00'>&#9679; LOBBY / MENUNGGU</font>";
                 String weaponInfo = (parts.length >= 5 && parts[4] != null && !parts[4].isEmpty() && !"DISABLED".equals(parts[4]))
                         ? parts[4]
                         : null;
 
-                if (mStatusHudText != null) {
-                    String hudHtml = "<b>Status:</b> " + statusStr + "<br>" +
-                            "<font color='#00FF00'>Player: <b>" + realCount + "</b></font> | " +
-                            "<font color='#FF5252'>Bot: <b>" + botCount + "</b></font><br>" +
-                            "<font color='#FFFF00'>Total: <b>" + totalCount + "</b></font>";
-                    if (weaponInfo != null) {
-                        hudHtml += "<br><font color='#00E5FF'>🔫 Senjata: <b>" + weaponInfo + "</b></font>";
+                String blueRaw = (parts.length >= 6) ? parts[5] : "";
+                String redRaw = (parts.length >= 7) ? parts[6] : "";
+
+                // Format Blue Team names
+                StringBuilder blueHtml = new StringBuilder();
+                int blueCount = 0;
+                if (!blueRaw.trim().isEmpty()) {
+                    String[] blueNames = blueRaw.split(",");
+                    for (String name : blueNames) {
+                        name = name.trim();
+                        if (name.isEmpty()) continue;
+                        blueCount++;
+                        if (name.contains("[BOT]")) {
+                            String clean = name.replace("[BOT]", "").trim();
+                            blueHtml.append("<font color='#FFAA00'>🤖 ").append(clean).append("</font><br>");
+                        } else if (name.contains("(You)")) {
+                            blueHtml.append("<font color='#00E5FF'>★ <b>").append(name).append("</b></font><br>");
+                        } else {
+                            blueHtml.append("<font color='#E0F7FA'>👤 ").append(name).append("</font><br>");
+                        }
                     }
+                }
+                if (blueHtml.length() == 0) {
+                    blueHtml.append("<font color='#64748B'><i>-</i></font>");
+                }
+
+                // Format Red Team names
+                StringBuilder redHtml = new StringBuilder();
+                int redCount = 0;
+                if (!redRaw.trim().isEmpty()) {
+                    String[] redNames = redRaw.split(",");
+                    for (String name : redNames) {
+                        name = name.trim();
+                        if (name.isEmpty()) continue;
+                        redCount++;
+                        if (name.contains("[BOT]")) {
+                            String clean = name.replace("[BOT]", "").trim();
+                            redHtml.append("<font color='#FFAA00'>🤖 ").append(clean).append("</font><br>");
+                        } else if (name.contains("(You)")) {
+                            redHtml.append("<font color='#FF8A80'>★ <b>").append(name).append("</b></font><br>");
+                        } else {
+                            redHtml.append("<font color='#FFEBEE'>👤 ").append(name).append("</font><br>");
+                        }
+                    }
+                }
+                if (redHtml.length() == 0) {
+                    redHtml.append("<font color='#64748B'><i>-</i></font>");
+                }
+
+                if (mStatusBlueHeader != null) {
+                    mStatusBlueHeader.setText(Html.fromHtml("<b><font color='#00E5FF'>🟦 BLUE TIM: (" + blueCount + ")</font></b>"));
+                }
+                if (mStatusRedHeader != null) {
+                    mStatusRedHeader.setText(Html.fromHtml("<b><font color='#FF5252'>🟥 RED TIM: (" + redCount + ")</font></b>"));
+                }
+
+                if (mStatusBlueText != null) {
+                    mStatusBlueText.setText(Html.fromHtml(blueHtml.toString()));
+                }
+                if (mStatusRedText != null) {
+                    mStatusRedText.setText(Html.fromHtml(redHtml.toString()));
+                }
+
+                if (mStatusHudFooter != null) {
+                    String footerHtml = "<font color='#00FF7F'><b>player: " + realCount + "</b></font> | " +
+                            "<font color='#FF5252'><b>bot: " + botCount + "</b></font>";
+                    if (weaponInfo != null) {
+                        footerHtml += " | <font color='#00E5FF'>🔫 " + weaponInfo + "</font>";
+                    }
+                    mStatusHudFooter.setText(Html.fromHtml(footerHtml));
+                }
+
+                if (hudTitle != null) {
+                    String statusDot = inGame ? "<font color='#00FF7F'>&#9679; IN GAME</font>" : "<font color='#FFAA00'>&#9679; LOBBY</font>";
+                    hudTitle.setText(Html.fromHtml("<b><font color='#00FF7F'>🎮 GTA SA FPS</font> <font color='#82CAFD'>| STATUS</font> " + statusDot + "</b>"));
+                }
+
+                if (mStatusHudText != null) {
+                    String statusStr = inGame ? "<font color='#00FF7F'>&#9679; IN GAME</font>" : "<font color='#FFAA00'>&#9679; LOBBY</font>";
+                    String hudHtml = "<b>Status:</b> " + statusStr + "<br>" +
+                            "<font color='#00FF00'>player: <b>" + realCount + "</b></font> | " +
+                            "<font color='#FF5252'>bot: <b>" + botCount + "</b></font>";
                     mStatusHudText.setText(Html.fromHtml(hudHtml));
                 }
 
                 if (subTitleRef != null) {
                     String subHtml = inGame
-                            ? "<b><font color='#00FF7F'>[IN GAME]</font> <font color='#00FF00'>Player: " + realCount + "</font> | <font color='#FF5252'>Bot: " + botCount + "</font> | <font color='#FFFF00'>Total: " + totalCount + "</font></b>"
+                            ? "<b><font color='#00FF7F'>[IN GAME]</font> <font color='#00E5FF'>Blue: " + blueCount + "</font> | <font color='#FF5252'>Red: " + redCount + "</font> | <font color='#00FF00'>Player: " + realCount + "</font> | <font color='#FF5252'>Bot: " + botCount + "</font></b>"
                             : "<b><font color='#FFAA00'>[LOBBY]</font> <font color='#82CAFD'>Menunggu pemain & bot masuk match...</font></b>";
                     if (weaponInfo != null) {
                         subHtml += " <font color='#00E5FF'>[🔫 " + weaponInfo + "]</font>";

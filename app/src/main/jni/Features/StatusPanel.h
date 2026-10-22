@@ -6,16 +6,29 @@
 
 namespace StatusPanel {
 
+    struct MemberInfo {
+        std::string name;
+        bool isBot;
+        int team; // 0 = TeamA (Blue), 1 = TeamB (Red), -1 = Unknown
+        MemberInfo(const std::string &n = "", bool bot = false, int t = -1)
+            : name(n), isBot(bot), team(t) {}
+    };
+
     struct Stats {
         int realPlayerCount;
         int botCount;
         int totalEntities;
         bool inGame;
+        std::vector<MemberInfo> blueTeam;
+        std::vector<MemberInfo> redTeam;
     };
 
     void Init();
     void SetEnabled(bool enable);
     bool IsEnabled();
+
+    // Local player hook
+    void OnLocalPlayerUpdate(void *instance);
 
     // Player lifecycle callbacks
     void OnNetworkPlayerUpdate(void *instance);
@@ -29,8 +42,10 @@ namespace StatusPanel {
         void *object;
         bool isBot;
         void *netPlayer;
-        EntitySnapshot(void *obj = nullptr, bool bot = false, void *net = nullptr)
-            : object(obj), isBot(bot), netPlayer(net) {}
+        int team;
+        std::string name;
+        EntitySnapshot(void *obj = nullptr, bool bot = false, void *net = nullptr, int t = -1, const std::string &n = "")
+            : object(obj), isBot(bot), netPlayer(net), team(t), name(n) {}
     };
 
     // Stats and active entity queries

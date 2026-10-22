@@ -82,6 +82,10 @@ namespace Offsets {
         // dump.cs RVA: 0x8597D00
         constexpr uintptr_t Component_GetGameObject = 0x8597D00;
 
+        // Object.get_name() -> string
+        // dump.cs RVA: 0x85A392C
+        constexpr uintptr_t Object_GetName = 0x85A392C;
+
         // Selectable.set_interactable(bool)
         // dump.cs RVA: 0x88B7998
         constexpr uintptr_t Selectable_SetInteractable = 0x88B7998;
