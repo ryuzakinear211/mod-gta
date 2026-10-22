@@ -1,5 +1,7 @@
 #include "Chams.h"
 #include "../Core/Logger.h"
+#include "../GameOffsets.h"
+#include "../Core/MemoryHelper.h"
 
 #include <GLES2/gl2.h>
 #include <dlfcn.h>
@@ -8,6 +10,7 @@
 #include <algorithm>
 #include <vector>
 #include <mutex>
+#include <chrono>
 
 #if defined(__aarch64__)
 #include "../And64InlineHook/And64InlineHook.hpp"
@@ -25,6 +28,23 @@ namespace Chams {
     static std::mutex           s_teammatesMutex;
     static std::vector<Vector3> s_teammatePositions;
 
+    // Vehicle tracking structure (Tanks, Cars & Armored Vehicles)
+    struct VehicleTrackInfo {
+        Vector3 position;
+        uint64_t lastSeenMs;
+    };
+    static std::mutex                   s_vehicleMutex;
+    static std::vector<VehicleTrackInfo> s_vehiclePositions;
+
+    static void*   (*s_get_transform)(void *) = nullptr;
+    static Vector3 (*s_Transform_get_position)(void *) = nullptr;
+
+    static inline uint64_t GetCurrentTimeMs() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count());
+    }
+
     static std::atomic<float> s_r{255.0f}; // Default vibrant crimson red
     static std::atomic<float> s_g{42.0f};
     static std::atomic<float> s_b{85.0f};
@@ -41,7 +61,6 @@ namespace Chams {
     static void (*old_glDrawElements)(GLenum mode, GLsizei count, GLenum type, const void *indices) = nullptr;
 
     // Classification cache for GLES programs: -1 = uncomputed, 0 = reject, 1 = allow
-    // Enlarge cache from 256 to 2048 to prevent per-frame uniform lookups on higher program IDs
     static constexpr int CACHE_SIZE = 2048;
     static int8_t s_programFilterCache[8][CACHE_SIZE];
 
@@ -54,6 +73,44 @@ namespace Chams {
         s_teammatePositions.clear();
     }
 
+    void ClearVehiclePositions() {
+        std::lock_guard<std::mutex> lock(s_vehicleMutex);
+        s_vehiclePositions.clear();
+    }
+
+    void RegisterVehicleInstance(void *instance) {
+        if (!instance || !Memory::IsValidPtr(instance)) return;
+
+        if (!s_get_transform) {
+            s_get_transform = reinterpret_cast<void*(*)(void*)>(Memory::GetRVA(Offsets::Unity::GetTransform));
+        }
+        if (!s_Transform_get_position) {
+            s_Transform_get_position = reinterpret_cast<Vector3(*)(void*)>(Memory::GetRVA(Offsets::Unity::TransformGetPosition));
+        }
+        if (!s_get_transform || !s_Transform_get_position) return;
+
+        void *trans = s_get_transform(instance);
+        if (!trans || !Memory::IsValidPtr(trans)) return;
+
+        Vector3 pos = s_Transform_get_position(trans);
+        if (pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f) return;
+
+        uint64_t now = GetCurrentTimeMs();
+        std::lock_guard<std::mutex> lock(s_vehicleMutex);
+
+        for (auto &v : s_vehiclePositions) {
+            float dx = v.position.x - pos.x;
+            float dy = v.position.y - pos.y;
+            float dz = v.position.z - pos.z;
+            if ((dx * dx + dy * dy + dz * dz) < 4.0f) {
+                v.position = pos;
+                v.lastSeenMs = now;
+                return;
+            }
+        }
+        s_vehiclePositions.push_back({pos, now});
+    }
+
     void ResetGLState() {
         glDepthRangef(0.5f, 1.0f);
         glDepthFunc(GL_LESS);
@@ -64,91 +121,40 @@ namespace Chams {
     void OnMatchFinished() {
         ClearProgramCache();
         ClearTeammatePositions();
+        ClearVehiclePositions();
         ResetGLState();
     }
 
     // Check if the GL program belongs to static world/map/terrain geometry
     static inline bool IsMapGeometryProgram(GLint program) {
         if (program <= 0) return false;
-        // 1. Static map/terrain in Unity uses baked lightmapping or splat maps
+        // Static map/terrain in Unity uses baked lightmapping or splat maps
         if (glGetUniformLocation(program, "unity_Lightmap") != -1) return true;
         if (glGetUniformLocation(program, "unity_LightmapST") != -1) return true;
-        if (glGetUniformLocation(program, "unity_Lightmap_ST") != -1) return true;
         if (glGetUniformLocation(program, "unity_Lightmaps[0]") != -1) return true;
         if (glGetUniformLocation(program, "unity_LightmapsInd[0]") != -1) return true;
         if (glGetUniformLocation(program, "unity_DynamicLightmap") != -1) return true;
-        if (glGetUniformLocation(program, "unity_DynamicLightmapST") != -1) return true;
-
-        // 2. Terrain & splat maps
         if (glGetUniformLocation(program, "_Control") != -1) return true;
         if (glGetUniformLocation(program, "_TerrainHolesTexture") != -1) return true;
         if (glGetUniformLocation(program, "_Splat0") != -1) return true;
-        if (glGetUniformLocation(program, "_Splat1") != -1) return true;
-        if (glGetUniformLocation(program, "_Splat2") != -1) return true;
-        if (glGetUniformLocation(program, "_Splat3") != -1) return true;
-        if (glGetUniformLocation(program, "_Normal0") != -1) return true;
-        if (glGetUniformLocation(program, "_Normal1") != -1) return true;
-
-        // 3. Static world reflection cubemap probes
-        if (glGetUniformLocation(program, "unity_SpecCube0") != -1) return true;
-        if (glGetUniformLocation(program, "unity_SpecCube1") != -1) return true;
-
-        // 4. Map foliage, trees & wind
-        if (glGetUniformLocation(program, "_TreeInstanceColor") != -1) return true;
-        if (glGetUniformLocation(program, "_TreeInstanceScale") != -1) return true;
-        if (glGetUniformLocation(program, "_SquashAmount") != -1) return true;
-        if (glGetUniformLocation(program, "_WavingTint") != -1) return true;
-        if (glGetUniformLocation(program, "_WaveAndDistance") != -1) return true;
-
-        // 5. Sky & Water
-        if (glGetUniformLocation(program, "_SkyBox") != -1) return true;
-        if (glGetUniformLocation(program, "_SunColor") != -1) return true;
-        if (glGetUniformLocation(program, "_WaterTileSize") != -1) return true;
-        if (glGetUniformLocation(program, "_HorizonColor") != -1) return true;
-
-        // 6. Map Detail & Decals
-        if (glGetUniformLocation(program, "_Detail") != -1) return true;
-        if (glGetUniformLocation(program, "_DetailMask") != -1) return true;
-        if (glGetUniformLocation(program, "_DetailAlbedoMap") != -1) return true;
-        if (glGetUniformLocation(program, "_DecalTex") != -1) return true;
-
         return false;
     }
 
-    // Check if the GL program belongs to vehicles (tanks, etc.), supply crates, ammo boxes, or interactive world props
-    static inline bool IsVehicleOrPropProgram(GLint program) {
+    // Check if the GL program belongs specifically to vehicle track/tread/wheel materials
+    static inline bool IsVehicleProgram(GLint program) {
         if (program <= 0) return false;
-
-        // 1. Vehicles, Tanks, Turrets, Treads & Parts
+        // Strict vehicle-exclusive uniforms (never present on character or weapon shaders)
         if (glGetUniformLocation(program, "_Tread") != -1) return true;
         if (glGetUniformLocation(program, "_Treads") != -1) return true;
-        if (glGetUniformLocation(program, "_Track") != -1) return true;
-        if (glGetUniformLocation(program, "_Tracks") != -1) return true;
-        if (glGetUniformLocation(program, "_Wheel") != -1) return true;
-        if (glGetUniformLocation(program, "_Wheels") != -1) return true;
-        if (glGetUniformLocation(program, "_Tank") != -1) return true;
-        if (glGetUniformLocation(program, "_Vehicle") != -1) return true;
-        if (glGetUniformLocation(program, "_Turret") != -1) return true;
-        if (glGetUniformLocation(program, "_Barrel") != -1) return true;
-        if (glGetUniformLocation(program, "_Armor") != -1) return true;
-        if (glGetUniformLocation(program, "_Hull") != -1) return true;
-        if (glGetUniformLocation(program, "_Camo") != -1) return true;
-        if (glGetUniformLocation(program, "_Camouflage") != -1) return true;
-
-        // 2. Supply Crates, Ammo Boxes, Pickups & Drops
-        if (glGetUniformLocation(program, "_Crate") != -1) return true;
-        if (glGetUniformLocation(program, "_Box") != -1) return true;
-        if (glGetUniformLocation(program, "_Ammo") != -1) return true;
-        if (glGetUniformLocation(program, "_Supply") != -1) return true;
-        if (glGetUniformLocation(program, "_Pickup") != -1) return true;
-        if (glGetUniformLocation(program, "_Drop") != -1) return true;
-        if (glGetUniformLocation(program, "_Item") != -1) return true;
-
-        // 3. World / Pickup highlight, pulse, and fresnel effects
-        if (glGetUniformLocation(program, "_HighlightColor") != -1) return true;
-        if (glGetUniformLocation(program, "_FresnelColor") != -1) return true;
-        if (glGetUniformLocation(program, "_PulseColor") != -1) return true;
-
+        if (glGetUniformLocation(program, "_TrackSpeed") != -1) return true;
+        if (glGetUniformLocation(program, "_TrackOffset") != -1) return true;
+        if (glGetUniformLocation(program, "_TreadOffset") != -1) return true;
+        if (glGetUniformLocation(program, "_TrackTex") != -1) return true;
+        if (glGetUniformLocation(program, "_TrackTexture") != -1) return true;
+        if (glGetUniformLocation(program, "_WheelRadius") != -1) return true;
+        if (glGetUniformLocation(program, "_WheelRotation") != -1) return true;
+        if (glGetUniformLocation(program, "_Skidmark") != -1) return true;
+        if (glGetUniformLocation(program, "_SkidmarkTex") != -1) return true;
         return false;
     }
 
@@ -202,17 +208,31 @@ namespace Chams {
         ShaderFilter sf = static_cast<ShaderFilter>(filter);
         bool shouldRender = false;
 
-        // Anti-map & Anti-vehicle/prop rule:
-        // Never render lightmapped map geometry, vehicles, tanks, supply crates, or ammo boxes unless explicitly in AllMeshes mode
-        bool isMapOrProp = (sf != ShaderFilter::AllMeshes) && (IsMapGeometryProgram(program) || IsVehicleOrPropProgram(program));
+        // Anti-map & Anti-vehicle shader rule:
+        bool isMap = (sf != ShaderFilter::AllMeshes) && IsMapGeometryProgram(program);
+        bool isVehicle = (sf != ShaderFilter::AllMeshes) && IsVehicleProgram(program);
 
-        if (!isMapOrProp) {
+        if (!isMap && !isVehicle) {
             switch (sf) {
                 case ShaderFilter::BodyBonesAuto: {
-                    // Strictly match skeletal bone skinning (Player & Bot character bodies)
-                    // This guarantees vehicle tanks, supply crates, ammo boxes, and static props are NEVER rendered.
+                    // Priority 1: GPU Skinning Bone Matrices (Characters with skeletal rig)
                     if (HasBoneSkinning(program)) {
                         shouldRender = true;
+                        break;
+                    }
+                    // Priority 2: Character detail shaders (Normal Map / BumpMap, Specular Shininess, Emission)
+                    if (glGetUniformLocation(program, "_BumpMap") != -1 ||
+                        glGetUniformLocation(program, "_Shininess") != -1 ||
+                        glGetUniformLocation(program, "_EmisColor") != -1 ||
+                        glGetUniformLocation(program, "_Cutoff") != -1) {
+                        shouldRender = true;
+                        break;
+                    }
+                    // Priority 3: Dynamic entity Color or MainTex that is strictly NON-MAP
+                    if (glGetUniformLocation(program, "_Color") != -1 ||
+                        glGetUniformLocation(program, "_MainTex") != -1) {
+                        shouldRender = true;
+                        break;
                     }
                     break;
                 }
@@ -259,6 +279,57 @@ namespace Chams {
         }
 
         return shouldRender;
+    }
+
+    // Check if the currently drawn mesh belongs to an active vehicle (tank, car, etc.)
+    static inline bool IsCurrentMeshVehicle(GLint currProgram) {
+        if (currProgram <= 0) return false;
+
+        std::lock_guard<std::mutex> lock(s_vehicleMutex);
+        if (s_vehiclePositions.empty()) return false;
+
+        uint64_t now = GetCurrentTimeMs();
+        for (auto it = s_vehiclePositions.begin(); it != s_vehiclePositions.end(); ) {
+            if (now - it->lastSeenMs > 3000) {
+                it = s_vehiclePositions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (s_vehiclePositions.empty()) return false;
+
+        GLint loc = glGetUniformLocation(currProgram, "hlslcc_mtx4x4unity_ObjectToWorld[0]");
+        if (loc == -1) {
+            loc = glGetUniformLocation(currProgram, "unity_ObjectToWorld");
+        }
+        if (loc == -1) return false;
+
+        GLfloat m[16];
+        glGetUniformfv(currProgram, loc, m);
+
+        float cx1 = m[12], cy1 = m[13], cz1 = m[14];
+        float cx2 = m[3],  cy2 = m[7],  cz2 = m[11];
+
+        // Radius ~6.5m reliably covers full tank chassis, tracks, turret, and barrel
+        constexpr float VEHICLE_RADIUS_SQ = 6.5f * 6.5f;
+
+        for (const auto &v : s_vehiclePositions) {
+            float dx1 = cx1 - v.position.x;
+            float dy1 = cy1 - v.position.y;
+            float dz1 = cz1 - v.position.z;
+            if ((dx1 * dx1 + dy1 * dy1 + dz1 * dz1) <= VEHICLE_RADIUS_SQ) {
+                return true;
+            }
+
+            float dx2 = cx2 - v.position.x;
+            float dy2 = cy2 - v.position.y;
+            float dz2 = cz2 - v.position.z;
+            if ((dx2 * dx2 + dy2 * dy2 + dz2 * dz2) <= VEHICLE_RADIUS_SQ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // Check if the currently drawn mesh belongs to a teammate or local player
@@ -335,6 +406,11 @@ namespace Chams {
 
         int filter = s_shaderFilter.load(std::memory_order_relaxed);
         if (!ShouldRenderMesh(currProgram, filter)) {
+            return;
+        }
+
+        // Filter out vehicle geometry (tank, car, etc.) so vehicles are never rendered in Chams
+        if (IsCurrentMeshVehicle(currProgram)) {
             return;
         }
 

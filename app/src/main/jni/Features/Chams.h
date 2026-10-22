@@ -55,6 +55,8 @@ namespace Chams {
     // Pembersihan & optimisasi real-time saat selesai match / ganti match
     void ClearProgramCache();
     void ClearTeammatePositions();
+    void ClearVehiclePositions();
+    void RegisterVehicleInstance(void *vehicleComponent);
     void ResetGLState();
     void OnMatchFinished();
 

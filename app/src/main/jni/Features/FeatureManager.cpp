@@ -31,6 +31,31 @@ namespace FeatureManager {
         return nullptr;
     }
 
+    // Vehicle lifecycle hooks to dynamically filter tank & vehicle meshes in Chams
+    static void (*old_RTC_Tank_Update)(void *instance) = nullptr;
+    static void hook_RTC_Tank_Update(void *instance) {
+        if (instance) {
+            Chams::RegisterVehicleInstance(instance);
+        }
+        if (old_RTC_Tank_Update) old_RTC_Tank_Update(instance);
+    }
+
+    static void (*old_RCC_Car_FixedUpdate)(void *instance) = nullptr;
+    static void hook_RCC_Car_FixedUpdate(void *instance) {
+        if (instance) {
+            Chams::RegisterVehicleInstance(instance);
+        }
+        if (old_RCC_Car_FixedUpdate) old_RCC_Car_FixedUpdate(instance);
+    }
+
+    static void (*old_RaidTank_Update)(void *instance) = nullptr;
+    static void hook_RaidTank_Update(void *instance) {
+        if (instance) {
+            Chams::RegisterVehicleInstance(instance);
+        }
+        if (old_RaidTank_Update) old_RaidTank_Update(instance);
+    }
+
     static void hook_FPC_Update(void *instance) {
         if (instance) {
             // Ketika player baru spawn atau match baru dimulai: bersihkan cache shader match sebelumnya
@@ -38,6 +63,7 @@ namespace FeatureManager {
                 s_lastFpcInstance = instance;
                 Chams::ClearProgramCache();
                 Chams::ClearTeammatePositions();
+                Chams::ClearVehiclePositions();
             }
 
             FastFireRate::OnLocalPlayerUpdate(instance);
@@ -71,6 +97,11 @@ namespace FeatureManager {
 
         // Install scene transition hook for match-to-match cleanup
         Memory::HookRVA(Offsets::SceneManagement::LoadSceneAsync, reinterpret_cast<void*>(hook_SceneManager_LoadScene), reinterpret_cast<void**>(&old_SceneManager_LoadScene));
+
+        // Hook vehicle lifecycle functions to register real-time vehicle positions for Chams filtering
+        Memory::HookRVA(Offsets::Vehicles::RTC_TankUpdate, reinterpret_cast<void*>(hook_RTC_Tank_Update), reinterpret_cast<void**>(&old_RTC_Tank_Update));
+        Memory::HookRVA(Offsets::Vehicles::RCC_CarFixedUpdate, reinterpret_cast<void*>(hook_RCC_Car_FixedUpdate), reinterpret_cast<void**>(&old_RCC_Car_FixedUpdate));
+        Memory::HookRVA(Offsets::Vehicles::RaidTankUpdate, reinterpret_cast<void*>(hook_RaidTank_Update), reinterpret_cast<void**>(&old_RaidTank_Update));
 
         LOG_INFO("[FEATURE_MGR] All modules and core hooks initialized successfully.");
     }

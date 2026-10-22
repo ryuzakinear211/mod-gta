@@ -309,6 +309,20 @@ namespace Offsets {
         constexpr uintptr_t LoadSceneAsync = 0x85BBA90; // SceneManager.LoadSceneAsyncNameIndexInternal()
     }
 
+    // ----------------------------------------------------------------------------------
+    // Vehicles (Tanks & Cars - dump.cs)
+    // ----------------------------------------------------------------------------------
+    namespace Vehicles {
+        // RTC_TankController.Update: dump.cs RVA 0x4B2DB28
+        constexpr uintptr_t RTC_TankUpdate    = 0x4B2DB28;
+
+        // RCC_CarControllerV3.FixedUpdate: dump.cs RVA 0x51DD4D4
+        constexpr uintptr_t RCC_CarFixedUpdate = 0x51DD4D4;
+
+        // RaidTankAgent.Update: dump.cs RVA 0x3EA4FD4
+        constexpr uintptr_t RaidTankUpdate    = 0x3EA4FD4;
+    }
+
 } // namespace Offsets
 
 #endif // GAME_OFFSETS_H
