@@ -52,6 +52,12 @@ namespace Chams {
     void SetB(int b);
     void SetLineWidth(int width);
 
+    // Pembersihan & optimisasi real-time saat selesai match / ganti match
+    void ClearProgramCache();
+    void ClearTeammatePositions();
+    void ResetGLState();
+    void OnMatchFinished();
+
 } // namespace Chams
 
 #endif // FEATURE_CHAMS_H

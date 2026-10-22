@@ -1,5 +1,4 @@
 #include "Chams.h"
-#include "NotificationReward.h"
 #include "../Core/Logger.h"
 
 #include <GLES2/gl2.h>
@@ -42,35 +41,149 @@ namespace Chams {
     static void (*old_glDrawElements)(GLenum mode, GLsizei count, GLenum type, const void *indices) = nullptr;
 
     // Classification cache for GLES programs: -1 = uncomputed, 0 = reject, 1 = allow
-    static int8_t s_programFilterCache[8][256];
+    // Enlarge cache from 256 to 2048 to prevent per-frame uniform lookups on higher program IDs
+    static constexpr int CACHE_SIZE = 2048;
+    static int8_t s_programFilterCache[8][CACHE_SIZE];
 
-    static inline void ClearProgramCache() {
+    void ClearProgramCache() {
         memset(s_programFilterCache, -1, sizeof(s_programFilterCache));
+    }
+
+    void ClearTeammatePositions() {
+        std::lock_guard<std::mutex> lock(s_teammatesMutex);
+        s_teammatePositions.clear();
+    }
+
+    void ResetGLState() {
+        glDepthRangef(0.5f, 1.0f);
+        glDepthFunc(GL_LESS);
+        glColorMask(1, 1, 1, 1);
+        glDisable(GL_BLEND);
+    }
+
+    void OnMatchFinished() {
+        ClearProgramCache();
+        ClearTeammatePositions();
+        ResetGLState();
     }
 
     // Check if the GL program belongs to static world/map/terrain geometry
     static inline bool IsMapGeometryProgram(GLint program) {
         if (program <= 0) return false;
-        // Static map/terrain in Unity uses baked lightmapping or splat maps
+        // 1. Static map/terrain in Unity uses baked lightmapping or splat maps
         if (glGetUniformLocation(program, "unity_Lightmap") != -1) return true;
         if (glGetUniformLocation(program, "unity_LightmapST") != -1) return true;
+        if (glGetUniformLocation(program, "unity_Lightmap_ST") != -1) return true;
         if (glGetUniformLocation(program, "unity_Lightmaps[0]") != -1) return true;
         if (glGetUniformLocation(program, "unity_LightmapsInd[0]") != -1) return true;
         if (glGetUniformLocation(program, "unity_DynamicLightmap") != -1) return true;
+        if (glGetUniformLocation(program, "unity_DynamicLightmapST") != -1) return true;
+
+        // 2. Terrain & splat maps
         if (glGetUniformLocation(program, "_Control") != -1) return true;
         if (glGetUniformLocation(program, "_TerrainHolesTexture") != -1) return true;
         if (glGetUniformLocation(program, "_Splat0") != -1) return true;
+        if (glGetUniformLocation(program, "_Splat1") != -1) return true;
+        if (glGetUniformLocation(program, "_Splat2") != -1) return true;
+        if (glGetUniformLocation(program, "_Splat3") != -1) return true;
+        if (glGetUniformLocation(program, "_Normal0") != -1) return true;
+        if (glGetUniformLocation(program, "_Normal1") != -1) return true;
+
+        // 3. Static world reflection cubemap probes
+        if (glGetUniformLocation(program, "unity_SpecCube0") != -1) return true;
+        if (glGetUniformLocation(program, "unity_SpecCube1") != -1) return true;
+
+        // 4. Map foliage, trees & wind
+        if (glGetUniformLocation(program, "_TreeInstanceColor") != -1) return true;
+        if (glGetUniformLocation(program, "_TreeInstanceScale") != -1) return true;
+        if (glGetUniformLocation(program, "_SquashAmount") != -1) return true;
+        if (glGetUniformLocation(program, "_WavingTint") != -1) return true;
+        if (glGetUniformLocation(program, "_WaveAndDistance") != -1) return true;
+
+        // 5. Sky & Water
+        if (glGetUniformLocation(program, "_SkyBox") != -1) return true;
+        if (glGetUniformLocation(program, "_SunColor") != -1) return true;
+        if (glGetUniformLocation(program, "_WaterTileSize") != -1) return true;
+        if (glGetUniformLocation(program, "_HorizonColor") != -1) return true;
+
+        // 6. Map Detail & Decals
+        if (glGetUniformLocation(program, "_Detail") != -1) return true;
+        if (glGetUniformLocation(program, "_DetailMask") != -1) return true;
+        if (glGetUniformLocation(program, "_DetailAlbedoMap") != -1) return true;
+        if (glGetUniformLocation(program, "_DecalTex") != -1) return true;
+
         return false;
     }
 
-    // Check if the GL program uses skeletal bone matrices for GPU skinning
+    // Check if the GL program belongs to vehicles (tanks, etc.), supply crates, ammo boxes, or interactive world props
+    static inline bool IsVehicleOrPropProgram(GLint program) {
+        if (program <= 0) return false;
+
+        // 1. Vehicles, Tanks, Turrets, Treads & Parts
+        if (glGetUniformLocation(program, "_Tread") != -1) return true;
+        if (glGetUniformLocation(program, "_Treads") != -1) return true;
+        if (glGetUniformLocation(program, "_Track") != -1) return true;
+        if (glGetUniformLocation(program, "_Tracks") != -1) return true;
+        if (glGetUniformLocation(program, "_Wheel") != -1) return true;
+        if (glGetUniformLocation(program, "_Wheels") != -1) return true;
+        if (glGetUniformLocation(program, "_Tank") != -1) return true;
+        if (glGetUniformLocation(program, "_Vehicle") != -1) return true;
+        if (glGetUniformLocation(program, "_Turret") != -1) return true;
+        if (glGetUniformLocation(program, "_Barrel") != -1) return true;
+        if (glGetUniformLocation(program, "_Armor") != -1) return true;
+        if (glGetUniformLocation(program, "_Hull") != -1) return true;
+        if (glGetUniformLocation(program, "_Camo") != -1) return true;
+        if (glGetUniformLocation(program, "_Camouflage") != -1) return true;
+
+        // 2. Supply Crates, Ammo Boxes, Pickups & Drops
+        if (glGetUniformLocation(program, "_Crate") != -1) return true;
+        if (glGetUniformLocation(program, "_Box") != -1) return true;
+        if (glGetUniformLocation(program, "_Ammo") != -1) return true;
+        if (glGetUniformLocation(program, "_Supply") != -1) return true;
+        if (glGetUniformLocation(program, "_Pickup") != -1) return true;
+        if (glGetUniformLocation(program, "_Drop") != -1) return true;
+        if (glGetUniformLocation(program, "_Item") != -1) return true;
+
+        // 3. World / Pickup highlight, pulse, and fresnel effects
+        if (glGetUniformLocation(program, "_HighlightColor") != -1) return true;
+        if (glGetUniformLocation(program, "_FresnelColor") != -1) return true;
+        if (glGetUniformLocation(program, "_PulseColor") != -1) return true;
+
+        return false;
+    }
+
+    // Check if the GL program uses skeletal bone matrices for GPU skinning (Character Bot / Player)
     static inline bool HasBoneSkinning(GLint program) {
         if (program <= 0) return false;
+        // Standard Unity & HLSLcc bone matrix arrays
         if (glGetUniformLocation(program, "_Bones[0]") != -1) return true;
         if (glGetUniformLocation(program, "_Bones") != -1) return true;
         if (glGetUniformLocation(program, "hlslcc_mtx4x4_Bones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "hlslcc_mtx4x4_Bones") != -1) return true;
         if (glGetUniformLocation(program, "unity_SkinMatrices") != -1) return true;
+        if (glGetUniformLocation(program, "unity_SkinMatrices[0]") != -1) return true;
         if (glGetUniformLocation(program, "unity_BoneMatrices") != -1) return true;
+        if (glGetUniformLocation(program, "unity_BoneMatrices[0]") != -1) return true;
+        if (glGetUniformLocation(program, "hlslcc_mtx4x4unity_SkinMatrices[0]") != -1) return true;
+        if (glGetUniformLocation(program, "hlslcc_mtx4x4unity_SkinMatrices") != -1) return true;
+        if (glGetUniformLocation(program, "hlslcc_mtx4x4unity_BoneMatrices[0]") != -1) return true;
+        if (glGetUniformLocation(program, "hlslcc_mtx4x4unity_BoneMatrices") != -1) return true;
+        if (glGetUniformLocation(program, "_BoneMatrices[0]") != -1) return true;
+        if (glGetUniformLocation(program, "_BoneMatrices") != -1) return true;
+        if (glGetUniformLocation(program, "_SkinBones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "_SkinBones") != -1) return true;
+        if (glGetUniformLocation(program, "_BoneTransforms[0]") != -1) return true;
+        if (glGetUniformLocation(program, "_BoneTransforms") != -1) return true;
+        if (glGetUniformLocation(program, "_Bones4x3[0]") != -1) return true;
+        if (glGetUniformLocation(program, "_Bones4x3") != -1) return true;
+        if (glGetUniformLocation(program, "unity_Bones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "unity_Bones") != -1) return true;
+        if (glGetUniformLocation(program, "g_bones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "g_bones") != -1) return true;
+        if (glGetUniformLocation(program, "bones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "bones") != -1) return true;
+        if (glGetUniformLocation(program, "u_bones[0]") != -1) return true;
+        if (glGetUniformLocation(program, "u_bones") != -1) return true;
         return false;
     }
 
@@ -79,7 +192,7 @@ namespace Chams {
         if (program <= 0) return false;
         if (filter < 0 || filter > 7) filter = 0;
 
-        if (program < 256) {
+        if (program < CACHE_SIZE) {
             int8_t cached = s_programFilterCache[filter][program];
             if (cached != -1) {
                 return cached == 1;
@@ -89,30 +202,17 @@ namespace Chams {
         ShaderFilter sf = static_cast<ShaderFilter>(filter);
         bool shouldRender = false;
 
-        // Anti-map rule: Never render lightmapped static world objects unless explicitly in AllMeshes mode
-        bool isMap = (sf != ShaderFilter::AllMeshes) && IsMapGeometryProgram(program);
+        // Anti-map & Anti-vehicle/prop rule:
+        // Never render lightmapped map geometry, vehicles, tanks, supply crates, or ammo boxes unless explicitly in AllMeshes mode
+        bool isMapOrProp = (sf != ShaderFilter::AllMeshes) && (IsMapGeometryProgram(program) || IsVehicleOrPropProgram(program));
 
-        if (!isMap) {
+        if (!isMapOrProp) {
             switch (sf) {
                 case ShaderFilter::BodyBonesAuto: {
-                    // Priority 1: GPU Skinning Bone Matrices (Characters with skeletal rig)
+                    // Strictly match skeletal bone skinning (Player & Bot character bodies)
+                    // This guarantees vehicle tanks, supply crates, ammo boxes, and static props are NEVER rendered.
                     if (HasBoneSkinning(program)) {
                         shouldRender = true;
-                        break;
-                    }
-                    // Priority 2: Character detail shaders (Normal Map / BumpMap, Specular Shininess, Emission)
-                    if (glGetUniformLocation(program, "_BumpMap") != -1 ||
-                        glGetUniformLocation(program, "_Shininess") != -1 ||
-                        glGetUniformLocation(program, "_EmisColor") != -1 ||
-                        glGetUniformLocation(program, "_Cutoff") != -1) {
-                        shouldRender = true;
-                        break;
-                    }
-                    // Priority 3: Dynamic entity Color or MainTex that is strictly NON-MAP
-                    if (glGetUniformLocation(program, "_Color") != -1 ||
-                        glGetUniformLocation(program, "_MainTex") != -1) {
-                        shouldRender = true;
-                        break;
                     }
                     break;
                 }
@@ -154,7 +254,7 @@ namespace Chams {
             }
         }
 
-        if (program < 256) {
+        if (program < CACHE_SIZE) {
             s_programFilterCache[filter][program] = shouldRender ? 1 : 0;
         }
 
@@ -214,9 +314,6 @@ namespace Chams {
         if (old_glDrawElements) {
             old_glDrawElements(mode, count, type, indices);
         }
-
-        // Process any queued notification reward events on the engine render thread
-        NotificationReward::OnRenderFrame();
 
         if (!s_enabled.load(std::memory_order_relaxed)) {
             return;

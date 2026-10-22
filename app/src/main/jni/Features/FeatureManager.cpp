@@ -6,9 +6,7 @@
 #include "FPSUnlock.h"
 #include "ESP.h"
 #include "Chams.h"
-#include "RewardBooster.h"
-#include "NotificationReward.h"
-#include "UnlockWeapon.h"
+#include "ResetRewardTime.h"
 #include "../GameOffsets.h"
 #include "../Core/MemoryHelper.h"
 #include "../Core/Logger.h"
@@ -20,13 +18,31 @@ namespace FeatureManager {
     // Central FirstPersonController.Update Hook: RVA 0x40A1BF4
     static void (*old_FPC_Update)(void *instance) = nullptr;
     static uint32_t s_fpsFrameCounter = 0;
+    static void *s_lastFpcInstance = nullptr;
+
+    // SceneManager.LoadSceneAsyncNameIndexInternal: RVA 0x85BBA90
+    static void* (*old_SceneManager_LoadScene)(void *sceneName, int buildIndex, void *parameters, bool mustCompleteNextFrame) = nullptr;
+    static void* hook_SceneManager_LoadScene(void *sceneName, int buildIndex, void *parameters, bool mustCompleteNextFrame) {
+        // Otomatis bersihkan shader program cache dan posisi tim saat scene/map berpindah antar match
+        Chams::OnMatchFinished();
+        if (old_SceneManager_LoadScene) {
+            return old_SceneManager_LoadScene(sceneName, buildIndex, parameters, mustCompleteNextFrame);
+        }
+        return nullptr;
+    }
 
     static void hook_FPC_Update(void *instance) {
         if (instance) {
+            // Ketika player baru spawn atau match baru dimulai: bersihkan cache shader match sebelumnya
+            if (instance != s_lastFpcInstance) {
+                s_lastFpcInstance = instance;
+                Chams::ClearProgramCache();
+                Chams::ClearTeammatePositions();
+            }
+
             FastFireRate::OnLocalPlayerUpdate(instance);
             NoRecoil::OnLocalPlayerUpdate(instance);
             ESP::OnLocalPlayerUpdate(instance);
-            NotificationReward::OnRenderFrame();
 
             // Re-enforce 60 FPS across level loads and menu transitions
             if (++s_fpsFrameCounter % 120 == 0) {
@@ -48,12 +64,13 @@ namespace FeatureManager {
         FPSUnlock::Init();
         ESP::Init();
         Chams::Init();
-        RewardBooster::Init();
-        NotificationReward::Init();
-        UnlockWeapon::Init();
+        ResetRewardTime::Init();
 
         // Install local player lifecycle hook
         Memory::HookRVA(Offsets::FPC::Update, reinterpret_cast<void*>(hook_FPC_Update), reinterpret_cast<void**>(&old_FPC_Update));
+
+        // Install scene transition hook for match-to-match cleanup
+        Memory::HookRVA(Offsets::SceneManagement::LoadSceneAsync, reinterpret_cast<void*>(hook_SceneManager_LoadScene), reinterpret_cast<void**>(&old_SceneManager_LoadScene));
 
         LOG_INFO("[FEATURE_MGR] All modules and core hooks initialized successfully.");
     }
@@ -79,22 +96,15 @@ namespace FeatureManager {
             OBFUSCATE("SeekBar_Warna Hijau_0_255"),            // featNum 13
             OBFUSCATE("SeekBar_Warna Biru_0_255"),             // featNum 14
             OBFUSCATE("SeekBar_Tebal Garis_1_10"),             // featNum 15
-            OBFUSCATE("Category_💰 FITUR REWARD & CURRENCY"),
-            OBFUSCATE("Toggle_Reward Booster 5000 (Money/Gold)"),       // featNum 16
-            OBFUSCATE("Toggle_Freeze Claim Reward (Klaim Berulang)"),   // featNum 17
-            OBFUSCATE("Button_🎁 Ambil Ulang Reward Notifikasi"),       // featNum 18
-            OBFUSCATE("Category_🔫 FITUR GANTI SENJATA PICK UP"),
-            OBFUSCATE("Spinner_Pilih Senjata Drop_Default (Senjata Asli),Type 99,Mosin-Nagant,FG42,Kar98k,M1 Carbine,M1 Garand,SKS Legendary,Winchester 1895,MG34,Super Bazooka,M3 Grease Gun,Lee Enfield,MP44 (StG 44),Prototype 206"), // featNum 19
+            OBFUSCATE("Category_🎁 FITUR FREE REWARD & GOLD"),
+            OBFUSCATE("Toggle_Reset Reward Time (1h 57m -> 0s)"), // featNum 16
             OBFUSCATE("Category_📊 STATUS & DEBUG INFO"),
             OBFUSCATE("RichTextView_<div style='background-color:#16222F;padding:10px;border:1px solid #00E5FF;border-radius:6px;'>"
                       "<font color='#00FF7F'><b>[ GTA SA FPS MOD MENU (MODULAR) ]</b></font><br>"
                       "<font color='#FFFFFF'>"
-                      "• <b>Pilih Senjata Drop:</b> Saat enemy drop senjata dan player mengambilnya (icon tangan), otomatis digantikan dengan senjata pilihan dari menu Spinner (Type 99, FG42, Kar98k, dll).<br><br>"
-                      "• <b>Reward Booster:</b> Tingkatkan setiap claim reward uang/gold ke 5000 (Client-Side).<br><br>"
-                      "• <b>Freeze Claim:</b> Freeze status claim reward (Quest, Daily, Calendar) agar bisa diklaim berulang kali untuk boost uang.<br><br>"
-                      "• <b>Reward Notifikasi:</b> Panggil ulang klaim reward izin notifikasi secara berulang.<br><br>"
+                      "• <b>Reset Reward Time:</b> Reset timer cooldown 1h 57m pada Free Reward (Hadiah Gratis/Gold) menjadi 0 detik agar dapat langsung diambil berulang kali tanpa menunggu.<br><br>"
                       "• <b>ESP Master:</b> Deteksi posisi player/bot secara visual 2D box & line.<br><br>"
-                      "• <b>Chams:</b> Tembus pandang / render karakter tembus dinding (OpenGL-ES) Anti-Map.<br><br>"
+                      "• <b>Chams:</b> Tembus pandang / render karakter tembus dinding (OpenGL-ES) Anti-Map & Anti-Vehicle.<br><br>"
                       "• <b>Chams Enemy Only:</b> Filter tim aktif: hanya karakter musuh yang tembus pandang.<br><br>"
                       "• <b>Enemy Only ESP:</b> Otomatis memfilter dan menyembunyikan teman/tim sendiri pada ESP.<br><br>"
                       "• <b>Status Panel:</b> HUD real-time counter Player & Bot.<br><br>"
@@ -240,39 +250,11 @@ namespace FeatureManager {
                 break;
             }
 
-            case 16: { // Reward Booster 5000 (Money/Gold)
-                RewardBooster::SetEnabled(boolean);
-                ModLogger::SetLastAction(boolean ? "RewardBooster: ON" : "RewardBooster: OFF");
-                if (boolean && ctx != nullptr) {
-                    Toast(env, ctx, OBFUSCATE("Reward Booster 5000: ON (Money/Gold)"), ToastLength::LENGTH_SHORT);
-                }
-                break;
-            }
-
-            case 17: { // Freeze Claim Reward (Klaim Berulang)
-                RewardBooster::SetFreezeClaim(boolean);
-                ModLogger::SetLastAction(boolean ? "FreezeClaim: ON" : "FreezeClaim: OFF");
+            case 16: { // Reset Reward Time (Free Reward Cooldown Bypass: 1h 57m -> 0s)
+                ResetRewardTime::SetEnabled(boolean);
+                ModLogger::SetLastAction(boolean ? "ResetRewardTime: ON" : "ResetRewardTime: OFF");
                 if (ctx != nullptr) {
-                    Toast(env, ctx, boolean ? OBFUSCATE("Freeze Claim: ON (Klaim Berulang Aktif)") : OBFUSCATE("Freeze Claim: OFF"), ToastLength::LENGTH_SHORT);
-                }
-                break;
-            }
-
-            case 18: { // Ambil Ulang Reward Notifikasi (One-Time Push Notification Reward Re-Claim)
-                NotificationReward::TriggerReward(env, ctx);
-                ModLogger::SetLastAction("NotifReward: Triggered");
-                break;
-            }
-
-            case 19: { // Pilih Senjata Drop (Pick-Up Weapon Swap)
-                UnlockWeapon::SetWeaponChoice(value);
-                std::string weaponName = UnlockWeapon::GetSelectedWeaponName();
-                ModLogger::SetLastAction(("PickUp Weapon: " + weaponName).c_str());
-                if (ctx != nullptr) {
-                    std::string toastMsg = (value == 0)
-                        ? "Pick Up Senjata: Default (Senjata Asli Drop)"
-                        : ("Pick Up Senjata: " + weaponName + " (Aktif saat ambil drop)");
-                    Toast(env, ctx, toastMsg.c_str(), ToastLength::LENGTH_SHORT);
+                    Toast(env, ctx, boolean ? OBFUSCATE("Reset Reward Time: ON (Cooldown 1h 57m Direset)") : OBFUSCATE("Reset Reward Time: OFF"), ToastLength::LENGTH_SHORT);
                 }
                 break;
             }
