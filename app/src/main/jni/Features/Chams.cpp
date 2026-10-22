@@ -112,9 +112,11 @@ namespace Chams {
     }
 
     void ResetGLState() {
-        glDepthRangef(0.5f, 1.0f);
+        glDepthRangef(0.0f, 1.0f);
         glDepthFunc(GL_LESS);
-        glColorMask(1, 1, 1, 1);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendEquation(GL_FUNC_ADD);
         glDisable(GL_BLEND);
     }
 
@@ -137,6 +139,23 @@ namespace Chams {
         if (glGetUniformLocation(program, "_Control") != -1) return true;
         if (glGetUniformLocation(program, "_TerrainHolesTexture") != -1) return true;
         if (glGetUniformLocation(program, "_Splat0") != -1) return true;
+        return false;
+    }
+
+    // Check if the GL program belongs to 2D UI / Canvas / Text / Sprites (never render in Chams)
+    static inline bool IsUIProgram(GLint program) {
+        if (program <= 0) return false;
+        // Strict 2D UI / Canvas / TextMeshPro uniforms
+        if (glGetUniformLocation(program, "_ClipRect") != -1) return true;
+        if (glGetUniformLocation(program, "_MaskTex") != -1) return true;
+        if (glGetUniformLocation(program, "_UseUIAlphaClip") != -1) return true;
+        if (glGetUniformLocation(program, "_TextureSampleAdd") != -1) return true;
+        if (glGetUniformLocation(program, "_Stencil") != -1) return true;
+        if (glGetUniformLocation(program, "_StencilComp") != -1) return true;
+        if (glGetUniformLocation(program, "_StencilOp") != -1) return true;
+        if (glGetUniformLocation(program, "_StencilReadMask") != -1) return true;
+        if (glGetUniformLocation(program, "_StencilWriteMask") != -1) return true;
+        if (glGetUniformLocation(program, "_ColorMask") != -1) return true;
         return false;
     }
 
@@ -208,11 +227,12 @@ namespace Chams {
         ShaderFilter sf = static_cast<ShaderFilter>(filter);
         bool shouldRender = false;
 
-        // Anti-map & Anti-vehicle shader rule:
+        // Anti-map, Anti-vehicle, and Anti-UI shader rules:
         bool isMap = (sf != ShaderFilter::AllMeshes) && IsMapGeometryProgram(program);
         bool isVehicle = (sf != ShaderFilter::AllMeshes) && IsVehicleProgram(program);
+        bool isUI = (sf != ShaderFilter::AllMeshes) && IsUIProgram(program);
 
-        if (!isMap && !isVehicle) {
+        if (!isMap && !isVehicle && !isUI) {
             switch (sf) {
                 case ShaderFilter::BodyBonesAuto: {
                     // Priority 1: GPU Skinning Bone Matrices (Characters with skeletal rig)
@@ -431,6 +451,35 @@ namespace Chams {
         float bNorm = blue / 255.0f;
         float aNorm = alpha / 255.0f;
 
+        // Save complete OpenGL ES state before applying Chams styling
+        GLboolean origBlend = glIsEnabled(GL_BLEND);
+        GLboolean origDepthTest = glIsEnabled(GL_DEPTH_TEST);
+        GLboolean origCullFace = glIsEnabled(GL_CULL_FACE);
+
+        GLint origBlendSrcRGB = GL_ONE;
+        GLint origBlendDstRGB = GL_ZERO;
+        GLint origBlendSrcAlpha = GL_ONE;
+        GLint origBlendDstAlpha = GL_ZERO;
+        GLint origBlendEquationRGB = GL_FUNC_ADD;
+        GLint origBlendEquationAlpha = GL_FUNC_ADD;
+        GLint origDepthFunc = GL_LESS;
+        GLboolean origColorMask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+        GLfloat origDepthRange[2] = {0.0f, 1.0f};
+        GLfloat origBlendColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        GLfloat origLineWidth = 1.0f;
+
+        glGetIntegerv(GL_BLEND_SRC_RGB, &origBlendSrcRGB);
+        glGetIntegerv(GL_BLEND_DST_RGB, &origBlendDstRGB);
+        glGetIntegerv(GL_BLEND_SRC_ALPHA, &origBlendSrcAlpha);
+        glGetIntegerv(GL_BLEND_DST_ALPHA, &origBlendDstAlpha);
+        glGetIntegerv(GL_BLEND_EQUATION_RGB, &origBlendEquationRGB);
+        glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &origBlendEquationAlpha);
+        glGetIntegerv(GL_DEPTH_FUNC, &origDepthFunc);
+        glGetBooleanv(GL_COLOR_WRITEMASK, origColorMask);
+        glGetFloatv(GL_DEPTH_RANGE, origDepthRange);
+        glGetFloatv(GL_BLEND_COLOR, origBlendColor);
+        glGetFloatv(GL_LINE_WIDTH, &origLineWidth);
+
         // Apply OpenGL ES state configuration matching esp-chams-template
         switch (static_cast<Mode>(currentMode)) {
             case Mode::Shading: {
@@ -548,11 +597,32 @@ namespace Chams {
             }
         }
 
-        // Restore clean default OpenGL-ES state so UI, world terrain and sky are not affected
-        glDepthRangef(0.5f, 1.0f);
-        glDepthFunc(GL_LESS);
-        glColorMask(1, 1, 1, 1);
-        glDisable(GL_BLEND);
+        // Full clean restoration of all OpenGL ES states so UI, lobby viewports, world terrain and sky are 100% unaffected
+        glDepthRangef(origDepthRange[0], origDepthRange[1]);
+        glDepthFunc(origDepthFunc);
+        glColorMask(origColorMask[0], origColorMask[1], origColorMask[2], origColorMask[3]);
+        glBlendFuncSeparate(origBlendSrcRGB, origBlendDstRGB, origBlendSrcAlpha, origBlendDstAlpha);
+        glBlendEquationSeparate(origBlendEquationRGB, origBlendEquationAlpha);
+        glBlendColor(origBlendColor[0], origBlendColor[1], origBlendColor[2], origBlendColor[3]);
+        glLineWidth(origLineWidth);
+
+        if (origBlend) {
+            glEnable(GL_BLEND);
+        } else {
+            glDisable(GL_BLEND);
+        }
+
+        if (origDepthTest) {
+            glEnable(GL_DEPTH_TEST);
+        } else {
+            glDisable(GL_DEPTH_TEST);
+        }
+
+        if (origCullFace) {
+            glEnable(GL_CULL_FACE);
+        } else {
+            glDisable(GL_CULL_FACE);
+        }
     }
 
     void Init() {

@@ -287,10 +287,27 @@ namespace Offsets {
     // ----------------------------------------------------------------------------------
     namespace FreeReward {
         // FreeDailyReward Presenter (dump.cs class: baaaaababbababababbbabaabbbbbbbbbbaaabbbabbbbbb, TypeDefIndex: 10474)
-        // All selected functions have body lengths >= 68 bytes, ensuring 100% safety with 20-byte inline hooks
-        constexpr uintptr_t Presenter_CanTake      = 0x4849B84; // babbbababaabbbbbaaabbabbbaaabaabbbbbaaaababbabb() -> bool (Length: 68 bytes)
-        constexpr uintptr_t Presenter_GetRemainSec = 0x4849C80; // babbbabbbabbbbabaabababbabbbbaaaabaaabaababbbab() -> int (Length: 124 bytes)
-        constexpr uintptr_t Presenter_GetCooldown  = 0x484A2EC; // bbabaababaaabaabbbabbbabbbabbbbbaabbababbababbb() -> int (Length: 124 bytes)
+        constexpr uintptr_t Presenter_CanTake       = 0x4849B84; // bool CanTake (Length: 68 bytes)
+        constexpr uintptr_t Presenter_GetRemainSec  = 0x4849C80; // int GetRemainSec (Length: 124 bytes)
+        constexpr uintptr_t Presenter_GetCooldown   = 0x484A2EC; // int GetCooldown (Length: 124 bytes)
+        constexpr uintptr_t Presenter_GetTimer2     = 0x484A1B8; // int GetTimer2 (Length: 120 bytes)
+        constexpr uintptr_t Presenter_IsAvailable   = 0x484A374; // bool IsAvailable (Length: 68 bytes)
+        constexpr uintptr_t Presenter_TakeReward    = 0x48499B4; // void TakeReward (Length: 260 bytes)
+
+        // FreeDailyReward Service / Model (dump.cs class: aaaaaababaaaababaaababaabbbabbbabbaaabbaababaab, TypeDefIndex: 2053)
+        constexpr uintptr_t Service_CanClaim        = 0x4C7BE98; // bool CanClaim (Length: 288 bytes)
+        constexpr uintptr_t Service_IsAvailable     = 0x4C7C05C; // bool IsAvailable (Length: 288 bytes)
+
+        // FreeDailyRewardItemView (dump.cs class: Dom.FreeDailyReward.View.FreeDailyRewardItemView, TypeDefIndex: 836)
+        constexpr uintptr_t View_SetAvailableState  = 0x43F1400; // void SetAvailableState(bool) (Length: 32 bytes)
+        constexpr uintptr_t View_UpdateState1       = 0x43F15DC; // void UpdateState1() (Length: 448 bytes)
+        constexpr uintptr_t View_OnEnable           = 0x43F1E94; // void OnEnable() (Length: 728 bytes)
+
+        // Field Offsets on FreeDailyRewardItemView
+        constexpr uintptr_t View_ClaimButton        = 0x40;      // UnityEngine.UI.Button*
+        constexpr uintptr_t View_UnavailablePanel   = 0x58;      // UnityEngine.GameObject*
+        constexpr uintptr_t View_TimerText          = 0x60;      // UnityEngine.UI.Text*
+        constexpr uintptr_t View_Presenter          = 0x68;      // baaaaababbababababbbabaabbbbbbbbbbaaabbbabbbbbb*
     }
 
     // Unity SceneManager Native Bindings (dump.cs)
