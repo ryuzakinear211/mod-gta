@@ -53,6 +53,8 @@ namespace StatusPanel {
     std::string GetFormattedStatus();
     std::vector<EntitySnapshot> GetActiveEntities();
     void ResetCounters();
+    void OnMatchFinished();
+    void OnLocalPlayerDestroy(void *instance);
 
 } // namespace StatusPanel
 

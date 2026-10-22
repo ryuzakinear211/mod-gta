@@ -653,6 +653,34 @@ public class Menu {
                         ? parts[4]
                         : null;
 
+                if (!inGame || totalCount == 0) {
+                    if (mStatusBlueHeader != null) {
+                        mStatusBlueHeader.setText(Html.fromHtml("<b><font color='#00E5FF'>🟦 BLUE TIM: (0)</font></b>"));
+                    }
+                    if (mStatusRedHeader != null) {
+                        mStatusRedHeader.setText(Html.fromHtml("<b><font color='#FF5252'>🟥 RED TIM: (0)</font></b>"));
+                    }
+                    if (mStatusBlueText != null) {
+                        mStatusBlueText.setText(Html.fromHtml("<font color='#64748B'><i>- Menunggu Match -</i></font>"));
+                    }
+                    if (mStatusRedText != null) {
+                        mStatusRedText.setText(Html.fromHtml("<font color='#64748B'><i>- Menunggu Match -</i></font>"));
+                    }
+                    if (mStatusHudFooter != null) {
+                        mStatusHudFooter.setText(Html.fromHtml("<font color='#64748B'><b>player: 0</b> | <b>bot: 0</b></font>"));
+                    }
+                    if (hudTitle != null) {
+                        hudTitle.setText(Html.fromHtml("<b><font color='#00FF7F'>🎮 GTA SA FPS</font> <font color='#82CAFD'>| STATUS</font> <font color='#FFAA00'>&#9679; LOBBY</font></b>"));
+                    }
+                    if (mStatusHudText != null) {
+                        mStatusHudText.setText(Html.fromHtml("<b>Status:</b> <font color='#FFAA00'>&#9679; LOBBY</font><br><font color='#64748B'>player: <b>0</b> | bot: <b>0</b></font>"));
+                    }
+                    if (subTitleRef != null) {
+                        subTitleRef.setText(Html.fromHtml("<b><font color='#FFAA00'>[LOBBY]</font> <font color='#82CAFD'>Menunggu pemain & bot masuk match...</font></b>"));
+                    }
+                    return;
+                }
+
                 String blueRaw = (parts.length >= 6) ? parts[5] : "";
                 String redRaw = (parts.length >= 7) ? parts[6] : "";
 

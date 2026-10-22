@@ -23,8 +23,10 @@ namespace FeatureManager {
     // SceneManager.LoadSceneAsyncNameIndexInternal: RVA 0x85BBA90
     static void* (*old_SceneManager_LoadScene)(void *sceneName, int buildIndex, void *parameters, bool mustCompleteNextFrame) = nullptr;
     static void* hook_SceneManager_LoadScene(void *sceneName, int buildIndex, void *parameters, bool mustCompleteNextFrame) {
-        // Otomatis bersihkan shader program cache dan posisi tim saat scene/map berpindah antar match
+        // Otomatis bersihkan shader program cache, posisi tim, dan status player saat scene/map berpindah antar match (kembali ke lobby)
         Chams::OnMatchFinished();
+        StatusPanel::OnMatchFinished();
+        StatusPanel::ResetCounters();
         if (old_SceneManager_LoadScene) {
             return old_SceneManager_LoadScene(sceneName, buildIndex, parameters, mustCompleteNextFrame);
         }
@@ -56,14 +58,37 @@ namespace FeatureManager {
         if (old_RaidTank_Update) old_RaidTank_Update(instance);
     }
 
+    static void (*old_FPC_OnDestroy)(void *instance) = nullptr;
+    static void hook_FPC_OnDestroy(void *instance) {
+        if (instance) {
+            if (instance == s_lastFpcInstance) {
+                s_lastFpcInstance = nullptr;
+            }
+            StatusPanel::OnLocalPlayerDestroy(instance);
+        }
+        if (old_FPC_OnDestroy) old_FPC_OnDestroy(instance);
+    }
+
+    static void (*old_FPC_OnDisable)(void *instance) = nullptr;
+    static void hook_FPC_OnDisable(void *instance) {
+        if (instance) {
+            if (instance == s_lastFpcInstance) {
+                s_lastFpcInstance = nullptr;
+            }
+            StatusPanel::OnLocalPlayerDestroy(instance);
+        }
+        if (old_FPC_OnDisable) old_FPC_OnDisable(instance);
+    }
+
     static void hook_FPC_Update(void *instance) {
         if (instance) {
-            // Ketika player baru spawn atau match baru dimulai: bersihkan cache shader match sebelumnya
+            // Ketika player baru spawn atau match baru dimulai: bersihkan cache match sebelumnya
             if (instance != s_lastFpcInstance) {
                 s_lastFpcInstance = instance;
                 Chams::ClearProgramCache();
                 Chams::ClearTeammatePositions();
                 Chams::ClearVehiclePositions();
+                StatusPanel::OnMatchFinished();
             }
 
             FastFireRate::OnLocalPlayerUpdate(instance);
@@ -93,8 +118,10 @@ namespace FeatureManager {
         Chams::Init();
         ResetRewardTime::Init();
 
-        // Install local player lifecycle hook
-        Memory::HookRVA(Offsets::FPC::Update, reinterpret_cast<void*>(hook_FPC_Update), reinterpret_cast<void**>(&old_FPC_Update));
+        // Install local player lifecycle hooks
+        Memory::HookRVA(Offsets::FPC::Update,    reinterpret_cast<void*>(hook_FPC_Update),    reinterpret_cast<void**>(&old_FPC_Update));
+        Memory::HookRVA(Offsets::FPC::OnDestroy, reinterpret_cast<void*>(hook_FPC_OnDestroy), reinterpret_cast<void**>(&old_FPC_OnDestroy));
+        Memory::HookRVA(Offsets::FPC::OnDisable, reinterpret_cast<void*>(hook_FPC_OnDisable), reinterpret_cast<void**>(&old_FPC_OnDisable));
 
         // Install scene transition hook for match-to-match cleanup
         Memory::HookRVA(Offsets::SceneManagement::LoadSceneAsync, reinterpret_cast<void*>(hook_SceneManager_LoadScene), reinterpret_cast<void**>(&old_SceneManager_LoadScene));

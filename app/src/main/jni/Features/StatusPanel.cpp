@@ -39,6 +39,7 @@ namespace StatusPanel {
     static void* (*Object_GetName)(void*) = nullptr;
     static void* (*Component_GetGameObject)(void*) = nullptr;
     static int   (*BotPlayer_GetTeam)(void*) = nullptr;
+    static void* (*Text_GetText)(void*) = nullptr;
 
     static inline uint64_t GetCurrentTimeMs() {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -58,7 +59,9 @@ namespace StatusPanel {
         if (length <= 0 || length > 128) return "";
 
         const uint16_t *chars = reinterpret_cast<const uint16_t*>(reinterpret_cast<uintptr_t>(il2cppString) + 0x14);
-        if (!Memory::IsValidPtr(const_cast<uint16_t*>(chars))) return "";
+        uintptr_t cAddr = reinterpret_cast<uintptr_t>(chars);
+        // Valid user-space pointer boundary with at least 2-byte alignment for uint16_t characters
+        if (cAddr < 0x10000000ULL || cAddr > 0x00007FFFFFFFFFFFULL || (cAddr & 0x1) != 0) return "";
 
         std::string result;
         result.reserve(length * 2);
@@ -79,54 +82,146 @@ namespace StatusPanel {
         return result;
     }
 
-    // Resolve name from Unity Component / GameObject
-    static std::string ResolveEntityName(void *instance, bool isBot, int id) {
-        std::string name;
-        if (instance && Memory::IsValidPtr(instance)) {
-            // 1. Try Object.get_name(instance)
-            if (Object_GetName) {
-                try {
-                    void *strPtr = Object_GetName(instance);
-                    if (strPtr && Memory::IsValidPtr(strPtr)) {
-                        name = Il2CppStringToStdString(strPtr);
-                    }
-                } catch (...) {}
-            }
-
-            // 2. Try Component.get_gameObject() -> Object.get_name(gameObject)
-            if (name.empty() && Component_GetGameObject && Object_GetName) {
-                try {
-                    void *go = Component_GetGameObject(instance);
-                    if (go && Memory::IsValidPtr(go)) {
-                        void *strPtr = Object_GetName(go);
-                        if (strPtr && Memory::IsValidPtr(strPtr)) {
-                            name = Il2CppStringToStdString(strPtr);
-                        }
-                    }
-                } catch (...) {}
-            }
-        }
-
-        // Clean up "(Clone)" suffix if present
+    // Helper: Clean up "(Clone)" suffix and extra whitespace
+    static inline void CleanEntityName(std::string &name) {
         size_t clonePos = name.find("(Clone)");
         if (clonePos != std::string::npos) {
             name = name.substr(0, clonePos);
         }
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t' || name.back() == '\r' || name.back() == '\n')) name.pop_back();
+        while (!name.empty() && (name.front() == ' ' || name.front() == '\t' || name.front() == '\r' || name.front() == '\n')) name.erase(name.begin());
+    }
 
-        // Trim spaces
-        while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
-        while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) name.erase(name.begin());
+    // Helper: Verify name is an actual player username and not a generic class/prefab name
+    static inline bool IsValidCustomName(const std::string &name) {
+        if (name.empty()) return false;
+        if (name == "NetworkPlayer" || name == "BotPlayer" || 
+            name == "FirstPersonController" || name == "ThirdPersonController" ||
+            name == "Player" || name == "GameObject" || name == "Default") {
+            return false;
+        }
+        return true;
+    }
 
-        // Check if name is generic or empty, provide clean fallback
-        if (name.empty() || name == "NetworkPlayer" || name == "BotPlayer") {
-            if (isBot) {
-                name = "Bot_" + std::to_string(id);
-            } else {
-                name = "Player_" + std::to_string(id);
+    // Resolve real in-game username from IL2CPP object hierarchy
+    static std::string ResolvePlayerName(void *instance, bool isBot) {
+        if (!instance || !Memory::IsValidPtr(instance)) return "";
+
+        void *tpCtrl = nullptr;
+
+        if (isBot) {
+            // BotPlayer -> ThirdPersonController (0x58)
+            tpCtrl = Memory::ReadField<void*>(instance, Offsets::BotPlayer::ThirdPersonCtrl);
+            if (!tpCtrl || !Memory::IsValidPtr(tpCtrl)) {
+                void *net = Memory::ReadField<void*>(instance, Offsets::BotPlayer::NetPlayer);
+                if (net && Memory::IsValidPtr(net)) {
+                    void *dolls = Memory::ReadField<void*>(net, Offsets::NetworkPlayer::DollsManager);
+                    if (dolls && Memory::IsValidPtr(dolls)) {
+                        tpCtrl = Memory::ReadField<void*>(dolls, Offsets::Dolls::BotTPCtrl);
+                        if (!tpCtrl || !Memory::IsValidPtr(tpCtrl)) {
+                            tpCtrl = Memory::ReadField<void*>(dolls, Offsets::Dolls::RemoteTPCtrl);
+                        }
+                    }
+                }
+            }
+        } else {
+            // NetworkPlayer -> DollsManager (0x88) -> RemoteTPCtrl (0x50) / BotTPCtrl (0x60)
+            void *dolls = Memory::ReadField<void*>(instance, Offsets::NetworkPlayer::DollsManager);
+            if (dolls && Memory::IsValidPtr(dolls)) {
+                tpCtrl = Memory::ReadField<void*>(dolls, Offsets::Dolls::RemoteTPCtrl);
+                if (!tpCtrl || !Memory::IsValidPtr(tpCtrl)) {
+                    tpCtrl = Memory::ReadField<void*>(dolls, Offsets::Dolls::BotTPCtrl);
+                }
             }
         }
 
-        return name;
+        // 1. Traverse ThirdPersonController -> SceneTitle
+        if (tpCtrl && Memory::IsValidPtr(tpCtrl)) {
+            void *sceneTitle = Memory::ReadField<void*>(tpCtrl, Offsets::Dolls::SceneTitle); // 0x40
+            if (!sceneTitle || !Memory::IsValidPtr(sceneTitle)) {
+                sceneTitle = Memory::ReadField<void*>(tpCtrl, Offsets::Dolls::RaidAllySceneTitle); // 0x48
+            }
+
+            if (sceneTitle && Memory::IsValidPtr(sceneTitle)) {
+                // Method A: Direct MainData username string at sceneTitle + 0x40
+                void *nameStr = Memory::ReadField<void*>(sceneTitle, Offsets::SceneTitle::MainDataName);
+                if (nameStr && Memory::IsValidPtr(nameStr)) {
+                    std::string n = Il2CppStringToStdString(nameStr);
+                    CleanEntityName(n);
+                    if (IsValidCustomName(n)) return n;
+                }
+
+                // Method B: CanvasTitleController (0x28) -> CanvasTitleRenderer (0x20) -> Text (0x40) -> m_Text (0xE0)
+                void *canvasCtrl = Memory::ReadField<void*>(sceneTitle, Offsets::SceneTitle::CanvasTitleController);
+                if (canvasCtrl && Memory::IsValidPtr(canvasCtrl)) {
+                    void *renderer = Memory::ReadField<void*>(canvasCtrl, Offsets::SceneTitle::CanvasTitleRenderer);
+                    if (renderer && Memory::IsValidPtr(renderer)) {
+                        void *textField = Memory::ReadField<void*>(renderer, Offsets::SceneTitle::TextField);
+                        if (textField && Memory::IsValidPtr(textField)) {
+                            if (Text_GetText) {
+                                try {
+                                    void *tStr = Text_GetText(textField);
+                                    if (tStr && Memory::IsValidPtr(tStr)) {
+                                        std::string n = Il2CppStringToStdString(tStr);
+                                        CleanEntityName(n);
+                                        if (IsValidCustomName(n)) return n;
+                                    }
+                                } catch (...) {}
+                            }
+                            void *tStr = Memory::ReadField<void*>(textField, Offsets::SceneTitle::TextString);
+                            if (tStr && Memory::IsValidPtr(tStr)) {
+                                std::string n = Il2CppStringToStdString(tStr);
+                                CleanEntityName(n);
+                                if (IsValidCustomName(n)) return n;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Try Unity Object.get_name(instance)
+        if (Object_GetName) {
+            try {
+                void *strPtr = Object_GetName(instance);
+                if (strPtr && Memory::IsValidPtr(strPtr)) {
+                    std::string n = Il2CppStringToStdString(strPtr);
+                    CleanEntityName(n);
+                    if (IsValidCustomName(n)) return n;
+                }
+            } catch (...) {}
+        }
+
+        // 3. Try Component.get_gameObject() -> Object.get_name(gameObject)
+        if (Component_GetGameObject && Object_GetName) {
+            try {
+                void *go = Component_GetGameObject(instance);
+                if (go && Memory::IsValidPtr(go)) {
+                    void *strPtr = Object_GetName(go);
+                    if (strPtr && Memory::IsValidPtr(strPtr)) {
+                        std::string n = Il2CppStringToStdString(strPtr);
+                        CleanEntityName(n);
+                        if (IsValidCustomName(n)) return n;
+                    }
+                }
+            } catch (...) {}
+        }
+
+        return "";
+    }
+
+    // Resolve name with graceful numeric fallback
+    static std::string ResolveEntityName(void *instance, bool isBot, int id) {
+        std::string name = ResolvePlayerName(instance, isBot);
+        if (!name.empty()) {
+            return name;
+        }
+
+        if (isBot) {
+            return "Bot_" + std::to_string(id);
+        } else {
+            return "Player_" + std::to_string(id);
+        }
     }
 
     // Helper: Read bot's team enum (0 = TeamA/Blue, 1 = TeamB/Red, -1 = Unknown)
@@ -168,24 +263,24 @@ namespace StatusPanel {
         if (!instance) return;
         s_localPlayerFPC = instance;
 
-        if (s_localPlayerName.empty()) {
+        if (s_localPlayerName.empty() || s_localPlayerName == "You") {
             // Check string field at FirstPersonController + 0xD8
-            void *nameStr = Memory::ReadField<void*>(instance, 0xD8);
+            void *nameStr = Memory::ReadField<void*>(instance, Offsets::FPC::NameField);
             if (nameStr && Memory::IsValidPtr(nameStr)) {
                 std::string n = Il2CppStringToStdString(nameStr);
-                if (!n.empty() && n != "FirstPersonController") {
+                CleanEntityName(n);
+                if (IsValidCustomName(n)) {
                     s_localPlayerName = n;
                 }
             }
 
-            if (s_localPlayerName.empty() && Object_GetName) {
+            if ((s_localPlayerName.empty() || s_localPlayerName == "You") && Object_GetName) {
                 try {
                     void *strPtr = Object_GetName(instance);
                     if (strPtr && Memory::IsValidPtr(strPtr)) {
                         std::string n = Il2CppStringToStdString(strPtr);
-                        if (!n.empty() && n != "FirstPersonController") {
-                            size_t clonePos = n.find("(Clone)");
-                            if (clonePos != std::string::npos) n = n.substr(0, clonePos);
+                        CleanEntityName(n);
+                        if (IsValidCustomName(n)) {
                             s_localPlayerName = n;
                         }
                     }
@@ -220,6 +315,13 @@ namespace StatusPanel {
                 if (trackIt->second.team != 0 && trackIt->second.team != 1) {
                     int t = GetPlayerTeam(instance);
                     if (t == 0 || t == 1) trackIt->second.team = t;
+                }
+                // If name is currently fallback "Player_#" or empty, attempt re-resolving real username
+                if (trackIt->second.name.empty() || trackIt->second.name.rfind("Player_", 0) == 0) {
+                    std::string newName = ResolvePlayerName(instance, false);
+                    if (!newName.empty()) {
+                        trackIt->second.name = newName;
+                    }
                 }
             }
         }
@@ -284,6 +386,13 @@ namespace StatusPanel {
                     int t = GetBotTeam(instance);
                     if (t == 0 || t == 1) trackIt->second.team = t;
                 }
+                // If name is currently fallback "Bot_#" or empty, attempt re-resolving name
+                if (trackIt->second.name.empty() || trackIt->second.name.rfind("Bot_", 0) == 0) {
+                    std::string newName = ResolvePlayerName(instance, true);
+                    if (!newName.empty()) {
+                        trackIt->second.name = newName;
+                    }
+                }
             }
         }
     }
@@ -340,6 +449,19 @@ namespace StatusPanel {
         }
 
         int botCount = static_cast<int>(s_botPlayers.size());
+
+        // When there are no remote network players and no bots, match is inactive / in lobby
+        if (totalNetPlayers == 0 && botCount == 0) {
+            Stats stats;
+            stats.realPlayerCount = 0;
+            stats.botCount = 0;
+            stats.totalEntities = 0;
+            stats.inGame = false;
+            stats.blueTeam.clear();
+            stats.redTeam.clear();
+            return stats;
+        }
+
         if (totalNetPlayers >= botCount) {
             if (realCount == 0 && totalNetPlayers > botCount) {
                 realCount = totalNetPlayers - botCount;
@@ -413,6 +535,9 @@ namespace StatusPanel {
 
     std::string GetFormattedStatus() {
         Stats s = GetStats();
+        if (!s.inGame) {
+            return "LOBBY;0;0;0;DISABLED;;";
+        }
 
         // Build blue team member string: "name1,name2,name3"
         std::string blueStr;
@@ -503,12 +628,35 @@ namespace StatusPanel {
         return result;
     }
 
+    void OnMatchFinished() {
+        std::lock_guard<std::mutex> lock(s_entityMutex);
+        s_networkPlayers.clear();
+        s_botPlayers.clear();
+        s_botNetPlayers.clear();
+        s_trackedEntities.clear();
+        s_localPlayerFPC = nullptr;
+        LOG_INFO("[STATS] Match finished / scene change: entity cache and local player reset.");
+    }
+
+    void OnLocalPlayerDestroy(void *instance) {
+        std::lock_guard<std::mutex> lock(s_entityMutex);
+        if (s_localPlayerFPC == instance || instance == nullptr) {
+            s_localPlayerFPC = nullptr;
+            s_networkPlayers.clear();
+            s_botPlayers.clear();
+            s_botNetPlayers.clear();
+            s_trackedEntities.clear();
+            LOG_INFO("[STATS] Local player destroyed: match ended.");
+        }
+    }
+
     void ResetCounters() {
         std::lock_guard<std::mutex> lock(s_entityMutex);
         s_networkPlayers.clear();
         s_botPlayers.clear();
         s_botNetPlayers.clear();
         s_trackedEntities.clear();
+        s_localPlayerFPC = nullptr;
         LOG_INFO("[STATS] Entity counters and team tracking manually reset.");
     }
 
@@ -567,6 +715,7 @@ namespace StatusPanel {
             Object_GetName = reinterpret_cast<void*(*)(void*)>(libBase + Offsets::Unity::Object_GetName);
             Component_GetGameObject = reinterpret_cast<void*(*)(void*)>(libBase + Offsets::Unity::Component_GetGameObject);
             BotPlayer_GetTeam = reinterpret_cast<int(*)(void*)>(libBase + Offsets::BotPlayer::GetTeam);
+            Text_GetText = reinterpret_cast<void*(*)(void*)>(libBase + Offsets::Unity::Text_GetText);
         }
 
         Memory::HookRVA(Offsets::NetworkPlayer::Update,    reinterpret_cast<void*>(hook_NetworkPlayer_Update),    reinterpret_cast<void**>(&old_NetworkPlayer_Update));

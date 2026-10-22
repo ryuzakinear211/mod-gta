@@ -93,6 +93,10 @@ namespace Offsets {
         // Text.set_text(string)
         // dump.cs RVA: 0x86FFFC8
         constexpr uintptr_t Text_SetText = 0x86FFFC8;
+
+        // Text.get_text() -> string
+        // dump.cs RVA: 0x88BBFD4
+        constexpr uintptr_t Text_GetText = 0x88BBFD4;
     }
 
     // ----------------------------------------------------------------------------------
@@ -139,6 +143,8 @@ namespace Offsets {
     namespace FPC {
         // Methods (RVAs)
         constexpr uintptr_t Update                  = 0x40A1BF4; // Update()
+        constexpr uintptr_t OnDestroy               = 0x40A3A84; // OnDestroy()
+        constexpr uintptr_t OnDisable               = 0x40A5A50; // OnDisable()
         constexpr uintptr_t GetCurrentWeapon        = 0x408FC44; // GetCurrentWeapon() -> WeaponShooterBehaviour
         constexpr uintptr_t GetShooterBehaviour     = 0x409188C; // GetShooterBehaviour(item) -> WeaponShooterBehaviour
         constexpr uintptr_t GetShotInterval1        = 0x40906CC; // GetShotInterval1() -> ObscuredFloat
@@ -154,6 +160,7 @@ namespace Offsets {
         // Fields (Offsets)
         constexpr uintptr_t CurrentWeapon           = 0x50;      // Equipped Weapon pointer
         constexpr uintptr_t AnimController          = 0xB8;      // Animation Controller pointer
+        constexpr uintptr_t NameField               = 0xD8;      // string username field
         constexpr uintptr_t AimingControl           = 0xF0;      // AimingControl pointer
         constexpr uintptr_t TargetibleObject        = 0x120;     // Local TargetibleObject pointer
         constexpr uintptr_t FPSCamera               = 0x180;     // Camera pointer
@@ -266,7 +273,20 @@ namespace Offsets {
         constexpr uintptr_t ThirdPersonDollView     = 0x48;      // TP Doll Transform
         constexpr uintptr_t RemoteTPCtrl            = 0x50;      // Remote player ThirdPersonController
         constexpr uintptr_t BotTPCtrl               = 0x60;      // Bot player ThirdPersonController
+        constexpr uintptr_t SceneTitle              = 0x40;      // PlayerSceneTitle on ThirdPersonController
+        constexpr uintptr_t RaidAllySceneTitle      = 0x48;      // RaidAllyPlayerSceneTitle on ThirdPersonController
         constexpr uintptr_t AnimatorOffset          = 0x78;      // Animator in ThirdPersonController
+    }
+
+    // ----------------------------------------------------------------------------------
+    // SceneTitle & CanvasTitleRenderer (Player In-Game Username / Nickname)
+    // ----------------------------------------------------------------------------------
+    namespace SceneTitle {
+        constexpr uintptr_t MainDataName            = 0x40;      // Il2CppString* username (MainData.bbabaaaaaaabaaaabbbababbababbbbbabbabaabaaaaaba)
+        constexpr uintptr_t CanvasTitleController   = 0x28;      // CanvasTitleController pointer
+        constexpr uintptr_t CanvasTitleRenderer     = 0x20;      // CanvasTitleRenderer pointer on CanvasTitleController
+        constexpr uintptr_t TextField               = 0x40;      // UnityEngine.UI.Text pointer on CanvasTitleRenderer
+        constexpr uintptr_t TextString              = 0xE0;      // Il2CppString* m_Text on UnityEngine.UI.Text
     }
 
     // ----------------------------------------------------------------------------------
