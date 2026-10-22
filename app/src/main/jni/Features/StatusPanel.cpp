@@ -41,6 +41,7 @@ namespace StatusPanel {
     static void* (*Component_GetGameObject)(void*) = nullptr;
     static int   (*BotPlayer_GetTeam)(void*) = nullptr;
     static void* (*Text_GetText)(void*) = nullptr;
+    static bool  (*CustomSettings_GetAllyObjectToggle)(void*) = nullptr;
 
     static inline uint64_t GetCurrentTimeMs() {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -285,38 +286,111 @@ namespace StatusPanel {
         }
     }
 
-    // Helper: Read bot's team enum (0 = TeamA/Blue, 1 = TeamB/Red, -1 = Unknown)
+    // Helper: Determine whether an entity is an ally of local player via TargetibleObject
+    static int GetTeamFromTargetibleObject(void *targetObj) {
+        if (!targetObj || !Memory::IsValidPtr(targetObj)) return -1;
+        void *customSettings = Memory::ReadField<void*>(targetObj, Offsets::Targetible::CustomSettings);
+        if (!customSettings || !Memory::IsValidPtr(customSettings)) return -1;
+
+        bool isAlly = false;
+        if (CustomSettings_GetAllyObjectToggle) {
+            try {
+                isAlly = CustomSettings_GetAllyObjectToggle(customSettings);
+            } catch (...) {
+                isAlly = Memory::ReadField<bool>(customSettings, Offsets::CustomSettings::IsAllyToggle);
+            }
+        } else {
+            isAlly = Memory::ReadField<bool>(customSettings, Offsets::CustomSettings::IsAllyToggle);
+        }
+
+        // If local player is Blue (0): Ally is 0 (Blue), Enemy is 1 (Red)
+        // If local player is Red (1): Ally is 1 (Red), Enemy is 0 (Blue)
+        return isAlly ? s_localPlayerTeam : (s_localPlayerTeam == 0 ? 1 : 0);
+    }
+
+    // Helper: Read bot's true team enum (0 = TeamA/Blue, 1 = TeamB/Red, -1 = Unknown)
     static int GetBotTeam(void *botPlayer) {
         if (!botPlayer || !Memory::IsValidPtr(botPlayer)) return -1;
 
+        // 1. Try BotPlayer.GetTeam() (Slot 70 interface method, RVA 0x444B64C)
         if (BotPlayer_GetTeam) {
-            int t = BotPlayer_GetTeam(botPlayer);
+            try {
+                int t = BotPlayer_GetTeam(botPlayer);
+                if (t == 0 || t == 1) return t;
+            } catch (...) {}
+        }
+
+        // 2. Check BotPlayer's networkPlayer (offset 0x50) -> TargetInfo (0xC0) -> Team (0x30)
+        void *netPlayer = Memory::ReadField<void*>(botPlayer, Offsets::BotPlayer::NetPlayer);
+        if (netPlayer && Memory::IsValidPtr(netPlayer)) {
+            void *targetInfo = Memory::ReadField<void*>(netPlayer, Offsets::NetworkPlayer::TargetInfo);
+            if (targetInfo && Memory::IsValidPtr(targetInfo)) {
+                int teamVal = Memory::ReadField<int>(targetInfo, 0x30);
+                if (teamVal == 0 || teamVal == 1) return teamVal;
+            }
+        }
+
+        // 3. Check BotPlayer's PlayerSpawnPoint (offset 0xB0) -> _team (0x38)
+        void *spawnPoint = Memory::ReadField<void*>(botPlayer, 0xB0);
+        if (spawnPoint && Memory::IsValidPtr(spawnPoint)) {
+            int t = Memory::ReadField<int>(spawnPoint, 0x38);
             if (t == 0 || t == 1) return t;
         }
 
+        // 4. Check BotPlayer backing fields (0xE0 and 0xE4)
         int t0 = Memory::ReadField<int>(botPlayer, 0xE0);
         if (t0 == 0 || t0 == 1) return t0;
 
         int t1 = Memory::ReadField<int>(botPlayer, 0xE4);
         if (t1 == 0 || t1 == 1) return t1;
 
-        void *spawnPoint = Memory::ReadField<void*>(botPlayer, 0xB0);
-        if (spawnPoint && Memory::IsValidPtr(spawnPoint)) {
-            int t2 = Memory::ReadField<int>(spawnPoint, 0x38);
-            if (t2 == 0 || t2 == 1) return t2;
+        // 5. Check BotPlayer's TargetibleObject (0x60) -> CustomSettings -> IsAllyToggle (0x20)
+        void *targetObj = Memory::ReadField<void*>(botPlayer, Offsets::BotPlayer::TargetibleObject);
+        if (targetObj && Memory::IsValidPtr(targetObj)) {
+            int t = GetTeamFromTargetibleObject(targetObj);
+            if (t == 0 || t == 1) return t;
+        }
+
+        // 6. Check ThirdPersonController (0x58) -> TargetibleObject (0x88)
+        void *tpCtrl = Memory::ReadField<void*>(botPlayer, Offsets::BotPlayer::ThirdPersonCtrl);
+        if (tpCtrl && Memory::IsValidPtr(tpCtrl)) {
+            void *tpTarget = Memory::ReadField<void*>(tpCtrl, 0x88);
+            if (tpTarget && Memory::IsValidPtr(tpTarget)) {
+                int t = GetTeamFromTargetibleObject(tpTarget);
+                if (t == 0 || t == 1) return t;
+            }
         }
 
         return -1;
     }
 
-    // Helper: Read NetworkPlayer's team enum from TargetInfo (0x30)
+    // Helper: Read NetworkPlayer's team enum from TargetInfo (0x30) or TargetibleObject
     static int GetPlayerTeam(void *netPlayer) {
         if (!netPlayer || !Memory::IsValidPtr(netPlayer)) return -1;
+
+        // 1. TargetInfo (0xC0) -> team (0x30)
         void *targetInfo = Memory::ReadField<void*>(netPlayer, Offsets::NetworkPlayer::TargetInfo);
         if (targetInfo && Memory::IsValidPtr(targetInfo)) {
             int teamVal = Memory::ReadField<int>(targetInfo, 0x30);
             if (teamVal == 0 || teamVal == 1) return teamVal;
         }
+
+        // 2. DollsManager (0x88) -> ThirdPersonController (0x50/0x60) -> TargetibleObject (0x88)
+        void *dolls = Memory::ReadField<void*>(netPlayer, Offsets::NetworkPlayer::DollsManager);
+        if (dolls && Memory::IsValidPtr(dolls)) {
+            void *tpCtrl = Memory::ReadField<void*>(dolls, Offsets::Dolls::RemoteTPCtrl);
+            if (!tpCtrl || !Memory::IsValidPtr(tpCtrl)) {
+                tpCtrl = Memory::ReadField<void*>(dolls, Offsets::Dolls::BotTPCtrl);
+            }
+            if (tpCtrl && Memory::IsValidPtr(tpCtrl)) {
+                void *targetObj = Memory::ReadField<void*>(tpCtrl, 0x88);
+                if (targetObj && Memory::IsValidPtr(targetObj)) {
+                    int t = GetTeamFromTargetibleObject(targetObj);
+                    if (t == 0 || t == 1) return t;
+                }
+            }
+        }
+
         return -1;
     }
 
@@ -373,9 +447,9 @@ namespace StatusPanel {
                 s_trackedEntities[instance] = info;
             } else {
                 trackIt->second.lastSeen = now;
-                if (trackIt->second.team != 0 && trackIt->second.team != 1) {
-                    int t = GetPlayerTeam(instance);
-                    if (t == 0 || t == 1) trackIt->second.team = t;
+                int t = GetPlayerTeam(instance);
+                if (t == 0 || t == 1) {
+                    trackIt->second.team = t;
                 }
                 // If name is currently fallback "Player_#" or invalid, attempt re-resolving real username
                 if (trackIt->second.name.empty() || 
@@ -448,9 +522,9 @@ namespace StatusPanel {
                 s_trackedEntities[instance] = info;
             } else {
                 trackIt->second.lastSeen = now;
-                if (trackIt->second.team != 0 && trackIt->second.team != 1) {
-                    int t = GetBotTeam(instance);
-                    if (t == 0 || t == 1) trackIt->second.team = t;
+                int t = GetBotTeam(instance);
+                if (t == 0 || t == 1) {
+                    trackIt->second.team = t;
                 }
                 // If name is currently fallback "Bot_#" or invalid, keep re-resolving every heartbeat!
                 if (trackIt->second.name.empty() || 
@@ -544,7 +618,6 @@ namespace StatusPanel {
         // Build Blue Team (0) and Red Team (1) lists
         std::vector<MemberInfo> blueList;
         std::vector<MemberInfo> redList;
-        std::vector<MemberInfo> unassigned;
 
         for (const auto &pair : s_trackedEntities) {
             void *entityObj = pair.first;
@@ -563,22 +636,24 @@ namespace StatusPanel {
                 continue;
             }
 
-            MemberInfo m(info.name, info.isBot, info.team);
-            if (info.team == 0) {
-                blueList.push_back(m);
-            } else if (info.team == 1) {
-                redList.push_back(m);
-            } else {
-                unassigned.push_back(m);
+            int team = info.team;
+            if (team != 0 && team != 1) {
+                team = info.isBot ? GetBotTeam(entityObj) : GetPlayerTeam(entityObj);
             }
-        }
 
-        // Distribute unassigned entities evenly between teams
-        for (const auto &m : unassigned) {
-            if (blueList.size() <= redList.size()) {
-                blueList.push_back(MemberInfo(m.name, m.isBot, 0));
+            // Strictly place based on actual team: 0 = Blue, 1 = Red
+            if (team == 0) {
+                blueList.push_back(MemberInfo(info.name, info.isBot, 0));
+            } else if (team == 1) {
+                redList.push_back(MemberInfo(info.name, info.isBot, 1));
             } else {
-                redList.push_back(MemberInfo(m.name, m.isBot, 1));
+                // If STILL unknown after all 6 resolution methods, place on enemy team relative to local player
+                int enemyTeam = (s_localPlayerTeam == 0) ? 1 : 0;
+                if (enemyTeam == 1) {
+                    redList.push_back(MemberInfo(info.name, info.isBot, 1));
+                } else {
+                    blueList.push_back(MemberInfo(info.name, info.isBot, 0));
+                }
             }
         }
 
@@ -803,6 +878,7 @@ namespace StatusPanel {
             Component_GetGameObject = reinterpret_cast<void*(*)(void*)>(libBase + Offsets::Unity::Component_GetGameObject);
             BotPlayer_GetTeam = reinterpret_cast<int(*)(void*)>(libBase + Offsets::BotPlayer::GetTeam);
             Text_GetText = reinterpret_cast<void*(*)(void*)>(libBase + Offsets::Unity::Text_GetText);
+            CustomSettings_GetAllyObjectToggle = reinterpret_cast<bool(*)(void*)>(libBase + Offsets::CustomSettings::GetAllyObjectToggle);
         }
 
         Memory::HookRVA(Offsets::NetworkPlayer::Update,    reinterpret_cast<void*>(hook_NetworkPlayer_Update),    reinterpret_cast<void**>(&old_NetworkPlayer_Update));

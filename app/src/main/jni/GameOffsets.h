@@ -231,7 +231,7 @@ namespace Offsets {
         constexpr uintptr_t Start                   = 0x44493F4; // BotPlayer.Start()
         constexpr uintptr_t Update                  = 0x444A310; // BotPlayer.Update()
         constexpr uintptr_t OnDestroy               = 0x4449EB0; // BotPlayer.OnDestroy()
-        constexpr uintptr_t GetTeam                 = 0x4449610; // BotPlayer.GetTeam() -> int (0 = TeamA, 1 = TeamB)
+        constexpr uintptr_t GetTeam                 = 0x444B64C; // BotPlayer.GetTeam() (Slot 70 character interface) -> int (0 = TeamA/Blue, 1 = TeamB/Red)
 
         // Fields (Offsets)
         constexpr uintptr_t BotLook                 = 0x28;      // BotPlayerLook pointer (Head Look Bone at +0x28)
